@@ -23,7 +23,7 @@ ExternalProject_Add(
 	openMVS
 	GIT_REPOSITORY https://github.com/cdcseacave/openMVS
 	GIT_TAG 063e5cd7f1139aceaf882f9f6ae3f0de26c59138
-	CMAKE_ARGS -DVCG_ROOT=${CMAKE_BINARY_DIR}/VCG-prefix/src/VCG
+	CMAKE_ARGS -DVCG_ROOT=${CMAKE_BINARY_DIR}/VCG-prefix/src/VCG -DCMAKE_BUILD_TYPE=Release
 	DEPENDS VCG
 	INSTALL_COMMAND ""
 )
