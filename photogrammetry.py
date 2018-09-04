@@ -43,6 +43,7 @@ def main():
             'build/openMVS-prefix/src/openMVS-build/bin/RefineMesh',
             os.path.join(args.output, 'openMVS', 'scene_dense_mesh.mvs'),
             '-w', os.path.join(args.output, 'openMVS', 'working'),
+            '--use-cuda', '0',  # https://github.com/cdcseacave/openMVS/issues/230
         ],
         [
             'build/openMVS-prefix/src/openMVS-build/bin/TextureMesh',
