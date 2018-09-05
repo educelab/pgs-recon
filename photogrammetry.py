@@ -5,15 +5,17 @@ import os
 import subprocess
 
 
-OPENMVG_SFM_BIN = 'build/openMVG-prefix/src/openMVG-build/linux-x86_64-Release'
-CAMERA_SENSOR_WIDTH_DIRECTORY = 'build/openMVG-prefix/src/openMVG/src/openMVG/exif/sensor_width_database'
-OPENMVS_BIN = 'build/openMVS-prefix/src/openMVS-build/bin'
+REPO_DIR = os.path.dirname(os.path.realpath(__file__))
+OPENMVG_SFM_BIN = os.path.join(REPO_DIR, 'build/openMVG-prefix/src/openMVG-build/Linux-x86_64-Release')
+CAMERA_SENSOR_WIDTH_DIRECTORY = os.path.join(REPO_DIR, 'build/openMVG-prefix/src/openMVG/src/openMVG/exif/sensor_width_database')
+OPENMVS_BIN = os.path.join(REPO_DIR, 'build/openMVS-prefix/src/openMVS-build/bin')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('input', help='directory of input images')
     parser.add_argument('output', help='directory for output files')
+    parser.add_argument('--focal-length', '-f', type=int, default=None, help='focal length in pixels', metavar='n')
     args = parser.parse_args()
 
     mvg_dir = os.path.join(args.output, 'openMVG')
@@ -32,12 +34,21 @@ def main():
 
     commands = []
     # https://openmvg.readthedocs.io/en/latest/software/SfM/SfM/
-    commands.append([
-        os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_SfMInit_ImageListing'),
-        '-i', input_dir,
-        '-o', matches_dir,
-        '-d', camera_file_params,
-    ])
+    if args.focal_length is not None:
+        commands.append([
+            os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_SfMInit_ImageListing'),
+            '-i', args.input,
+            '-o', matches_dir,
+            '-d', camera_file_params,
+            '-f', str(args.focal_length),
+        ])
+    else:
+        commands.append([
+            os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_SfMInit_ImageListing'),
+            '-i', args.input,
+            '-o', matches_dir,
+            '-d', camera_file_params,
+        ])
     commands.append([
         os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_ComputeFeatures'),
         '-i', os.path.join(matches_dir, 'sfm_data.json'),
