@@ -3,10 +3,14 @@
 import argparse
 import os
 import subprocess
+import sys
 
 
 REPO_DIR = os.path.dirname(os.path.realpath(__file__))
-OPENMVG_SFM_BIN = os.path.join(REPO_DIR, 'build/openMVG-prefix/src/openMVG-build/Linux-x86_64-Release')
+if sys.platform == 'darwin':
+    OPENMVG_SFM_BIN = os.path.join(REPO_DIR, 'build/openMVG-prefix/src/openMVG-build/Darwin-x86_64-Release')
+else:
+    OPENMVG_SFM_BIN = os.path.join(REPO_DIR, 'build/openMVG-prefix/src/openMVG-build/Linux-x86_64-Release')
 CAMERA_SENSOR_WIDTH_DIRECTORY = os.path.join(REPO_DIR, 'build/openMVG-prefix/src/openMVG/src/openMVG/exif/sensor_width_database')
 OPENMVS_BIN = os.path.join(REPO_DIR, 'build/openMVS-prefix/src/openMVS-build/bin')
 
@@ -87,7 +91,7 @@ def main():
 
     # https://github.com/cdcseacave/openMVS/wiki/Usage
     commands.append([
-        'build/openMVG-prefix/src/openMVG-build/Linux-x86_64-Release/openMVG_main_openMVG2openMVS',
+        os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_openMVG2openMVS'),
         '-i', os.path.join(args.output, 'openMVG', 'reconstruction_global', 'sfm_data.bin'),
         '-o', os.path.join(args.output, 'openMVS', 'scene.mvs'),
         '-d', os.path.join(args.output, 'openMVG', 'undistorted_images'),
