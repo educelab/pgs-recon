@@ -17,7 +17,7 @@ ExternalProject_Add(
 	GIT_REPOSITORY https://github.com/openMVG/openMVG
 	GIT_TAG 835f1e585377a55d4143548fa9181438f5d23889
 	SOURCE_SUBDIR src
-	INSTALL_COMMAND ""
+	INSTALL_COMMAND printf "iPhone X\\\\\\\\;4.8\\nILCE-6300\\\\\\\\;23.5\\n" >> ../openMVG/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt
 )
 ExternalProject_Add(
 	openMVS
