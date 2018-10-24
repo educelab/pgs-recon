@@ -127,14 +127,32 @@ def main():
         os.path.join(output_path, 'openMVS', 'scene_dense.mvs'),
         '-w', os.path.join(output_path, 'openMVS', 'working'),
     ])
-    commands.append([
-        os.path.join(OPENMVS_BIN, 'RefineMesh'),
-        os.path.join(output_path, 'openMVS', 'scene_dense_mesh.mvs'),
-        '-w', os.path.join(output_path, 'openMVS', 'working'),
-        # TODO handle this based on build/openMVS-prefix/src/openMVS-build/CMakeCache.txt OpenMVS_USE_CUDA:BOOL=OFF
-        '--use-cuda', '0',  # https://github.com/cdcseacave/openMVS/issues/230
-	# '--resolution-level', '2',
-    ])
+
+    built_with_cuda = False
+    if os.path.isfile('build/openMVS-prefix/src/openMVS-build/CMakeCache.txt'):
+        s = None
+        with open('build/openMVS-prefix/src/openMVS-build/CMakeCache.txt') as f:
+            for line in f:
+                if 'OpenMVS_USE_CUDA:BOOL=' in line:
+                    s = line
+        if s is not None:
+            if s.endswith('ON'):
+                built_with_cuda = True
+
+    if built_with_cuda:
+        commands.append([
+            os.path.join(OPENMVS_BIN, 'RefineMesh'),
+            os.path.join(output_path, 'openMVS', 'scene_dense_mesh.mvs'),
+            '-w', os.path.join(output_path, 'openMVS', 'working'),
+            '--use-cuda', '0',  # https://github.com/cdcseacave/openMVS/issues/230
+        ])
+    else:
+        commands.append([
+            os.path.join(OPENMVS_BIN, 'RefineMesh'),
+            os.path.join(output_path, 'openMVS', 'scene_dense_mesh.mvs'),
+            '-w', os.path.join(output_path, 'openMVS', 'working'),
+        ])
+
     commands.append([
         os.path.join(OPENMVS_BIN, 'TextureMesh'),
         os.path.join(output_path, 'openMVS', 'scene_dense_mesh_refine.mvs'),
@@ -176,8 +194,7 @@ def main():
                 args.rclone_transfer_remote + ':' + os.path.join(*folders)
             ]
             print(' '.join(command))
-            subprocess.call(command)
-
+            subprocess.run(command)
 
 
 if __name__ == '__main__':
