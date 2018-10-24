@@ -20,6 +20,7 @@ def main():
     parser.add_argument('input', help='directory of input images')
     parser.add_argument('output', help='directory for output files')
     parser.add_argument('--focal-length', '-f', type=int, default=None, help='focal length in pixels', metavar='n')
+    parser.add_argument('--video-mode-matching', '-v', type=int, default=None, help='sequence matching with an overlap of X images')
     parser.add('--rclone-transfer-remote', metavar='remote', default=None,
                help='if specified, and if matches the name of one of the directories in '
                'the output path, transfer the results to that rclone remote into the '
@@ -70,12 +71,21 @@ def main():
         '-m', 'SIFT',
 	'-p', 'HIGH',  # https://openmvg.readthedocs.io/en/latest/software/SfM/GlobalSfM/?highlight=please%20use
     ])
-    commands.append([
-        os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_ComputeMatches'),
-        '-i', os.path.join(matches_dir, 'sfm_data.json'),
-        '-o', matches_dir,
-        '-g', 'e',
-    ])
+    if args.video_mode_matching is not None:
+        commands.append([
+            os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_ComputeMatches'),
+            '-i', os.path.join(matches_dir, 'sfm_data.json'),
+            '-o', matches_dir,
+            '-g', 'e',
+            '-v', args.video_mode_matching,
+        ])
+    else:
+        commands.append([
+            os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_ComputeMatches'),
+            '-i', os.path.join(matches_dir, 'sfm_data.json'),
+            '-o', matches_dir,
+            '-g', 'e',
+        ])
     commands.append([
         os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_GlobalSfM'),
         '-i', os.path.join(matches_dir, 'sfm_data.json'),
