@@ -20,12 +20,22 @@ def main():
     parser.add_argument('input', help='directory of input images')
     parser.add_argument('output', help='directory for output files')
     parser.add_argument('--focal-length', '-f', type=int, default=None, help='focal length in pixels', metavar='n')
+    parser.add('--rclone-transfer-remote', metavar='remote', default=None,
+               help='if specified, and if matches the name of one of the directories in '
+               'the output path, transfer the results to that rclone remote into the '
+               'subpath following the remote name')
     args = parser.parse_args()
 
-    mvg_dir = os.path.join(args.output, 'openMVG')
+    output_path = os.path.join(
+        args.output,
+        datetime.datetime.today().strftime('%Y-%m-%d_%H.%M.%S')
+    )
+    os.makedirs(output_path)
+
+    mvg_dir = os.path.join(output_path, 'openMVG')
     matches_dir = os.path.join(mvg_dir, 'matches')
     reconstruction_dir = os.path.join(mvg_dir, 'reconstruction_global')
-    mvs_dir = os.path.join(args.output, 'openMVS')
+    mvs_dir = os.path.join(output_path, 'openMVS')
 
     if not os.path.exists(matches_dir):
         os.makedirs(matches_dir)
@@ -93,37 +103,71 @@ def main():
     # https://github.com/cdcseacave/openMVS/wiki/Usage
     commands.append([
         os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_openMVG2openMVS'),
-        '-i', os.path.join(args.output, 'openMVG', 'reconstruction_global', 'sfm_data.bin'),
-        '-o', os.path.join(args.output, 'openMVS', 'scene.mvs'),
-        '-d', os.path.join(args.output, 'openMVG', 'undistorted_images'),
+        '-i', os.path.join(output_path, 'openMVG', 'reconstruction_global', 'sfm_data.bin'),
+        '-o', os.path.join(output_path, 'openMVS', 'scene.mvs'),
+        '-d', os.path.join(output_path, 'openMVG', 'undistorted_images'),
     ])
     commands.append([
         os.path.join(OPENMVS_BIN, 'DensifyPointCloud'),
-        os.path.join(args.output, 'openMVS', 'scene.mvs'),
-        '-w', os.path.join(args.output, 'openMVS', 'working'),
+        os.path.join(output_path, 'openMVS', 'scene.mvs'),
+        '-w', os.path.join(output_path, 'openMVS', 'working'),
     ])
     commands.append([
         os.path.join(OPENMVS_BIN, 'ReconstructMesh'),
-        os.path.join(args.output, 'openMVS', 'scene_dense.mvs'),
-        '-w', os.path.join(args.output, 'openMVS', 'working'),
+        os.path.join(output_path, 'openMVS', 'scene_dense.mvs'),
+        '-w', os.path.join(output_path, 'openMVS', 'working'),
     ])
     commands.append([
         os.path.join(OPENMVS_BIN, 'RefineMesh'),
-        os.path.join(args.output, 'openMVS', 'scene_dense_mesh.mvs'),
-        '-w', os.path.join(args.output, 'openMVS', 'working'),
+        os.path.join(output_path, 'openMVS', 'scene_dense_mesh.mvs'),
+        '-w', os.path.join(output_path, 'openMVS', 'working'),
         # TODO handle this based on build/openMVS-prefix/src/openMVS-build/CMakeCache.txt OpenMVS_USE_CUDA:BOOL=OFF
         '--use-cuda', '0',  # https://github.com/cdcseacave/openMVS/issues/230
 	# '--resolution-level', '2',
     ])
     commands.append([
         os.path.join(OPENMVS_BIN, 'TextureMesh'),
-        os.path.join(args.output, 'openMVS', 'scene_dense_mesh_refine.mvs'),
-        '-w', os.path.join(args.output, 'openMVS', 'working'),
+        os.path.join(output_path, 'openMVS', 'scene_dense_mesh_refine.mvs'),
+        '-w', os.path.join(output_path, 'openMVS', 'working'),
     ])
 
     for command in commands:
         print(' '.join(command))
         subprocess.run(command)
+
+    # Transfer via rclone if requested
+    if args.rclone_transfer_remote is not None:
+        folders = []
+        path = os.path.abspath(output_path)
+        while True:
+            path, folder = os.path.split(path)
+            if folder != "":
+                folders.append(folder)
+            else:
+                if path != "":
+                    folders.append(path)
+                break
+        folders.reverse()
+
+        if args.rclone_transfer_remote not in folders:
+            print('Provided rclone transfer remote was not a directory '
+                  'name in the output path, so it is not clear where in the '
+                  'remote to put the files. Transfer canceled.')
+        else:
+            while folders.pop(0) != args.rclone_transfer_remote:
+                continue
+
+            command = [
+                'rclone',
+                'move',
+                '-v',
+                '--delete-empty-src-dirs',
+                output_path,
+                args.rclone_transfer_remote + ':' + os.path.join(*folders)
+            ]
+            print(' '.join(command))
+            subprocess.call(command)
+
 
 
 if __name__ == '__main__':
