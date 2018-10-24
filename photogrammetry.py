@@ -1,6 +1,7 @@
 """Run the photogrammetry pipeline on a set of input images."""
 
 import argparse
+import datetime
 import os
 import subprocess
 import sys
