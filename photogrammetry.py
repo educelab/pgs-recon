@@ -58,6 +58,7 @@ def main():
         '-i', os.path.join(matches_dir, 'sfm_data.json'),
         '-o', matches_dir,
         '-m', 'SIFT',
+	'-p', 'HIGH',  # https://openmvg.readthedocs.io/en/latest/software/SfM/GlobalSfM/?highlight=please%20use
     ])
     commands.append([
         os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_ComputeMatches'),
@@ -99,7 +100,7 @@ def main():
     commands.append([
         os.path.join(OPENMVS_BIN, 'DensifyPointCloud'),
         os.path.join(args.output, 'openMVS', 'scene.mvs'),
-        '-w', os.path.join(args.output, 'openMVS', 'working')
+        '-w', os.path.join(args.output, 'openMVS', 'working'),
     ])
     commands.append([
         os.path.join(OPENMVS_BIN, 'ReconstructMesh'),
