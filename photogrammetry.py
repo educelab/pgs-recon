@@ -21,7 +21,7 @@ def main():
     parser.add_argument('input', help='directory of input images')
     parser.add_argument('output', help='directory for output files')
     parser.add_argument('--focal-length', '-f', type=int, default=None, help='focal length in pixels', metavar='n')
-    parser.add_argument('--video-mode-matching', '-v', type=int, default=None, help='sequence matching with an overlap of X images')
+    parser.add_argument('--video-mode-matching', '-v', default=None, help='sequence matching with an overlap of X images')
     parser.add_argument('--rclone-transfer-remote', metavar='remote', default=None,
                         help='if specified, and if matches the name of one of the directories in '
                         'the output path, transfer the results to that rclone remote into the '
