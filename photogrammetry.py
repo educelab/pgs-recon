@@ -111,7 +111,9 @@ def main():
         os.path.join(OPENMVS_BIN, 'RefineMesh'),
         os.path.join(args.output, 'openMVS', 'scene_dense_mesh.mvs'),
         '-w', os.path.join(args.output, 'openMVS', 'working'),
+        # TODO handle this based on build/openMVS-prefix/src/openMVS-build/CMakeCache.txt OpenMVS_USE_CUDA:BOOL=OFF
         '--use-cuda', '0',  # https://github.com/cdcseacave/openMVS/issues/230
+	# '--resolution-level', '2',
     ])
     commands.append([
         os.path.join(OPENMVS_BIN, 'TextureMesh'),
