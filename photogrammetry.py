@@ -26,6 +26,7 @@ def main():
                         help='if specified, and if matches the name of one of the directories in '
                         'the output path, transfer the results to that rclone remote into the '
                         'subpath following the remote name')
+    parser.add_argument('--incremental-sfm', '-i', action='store_true', help='use incremental SfM instead of global')
     args = parser.parse_args()
 
     output_path = os.path.join(
@@ -73,8 +74,13 @@ def main():
     ])
     if args.video_mode_matching is not None:
         commands[-1] += ['-v', str(args.video_mode_matching)]
+
+    if args.incremental_sfm:
+        sfm_binary = 'openMVG_main_IncrementalSfM'
+    else:
+        sfm_binary = 'openMVG_main_GlobalSfM'
     commands.append([
-        os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_GlobalSfM'),
+        os.path.join(OPENMVG_SFM_BIN, sfm_binary),
         '-i', os.path.join(matches_dir, 'sfm_data.json'),
         '-m', matches_dir,
         '-o', reconstruction_dir,
