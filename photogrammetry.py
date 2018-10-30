@@ -21,7 +21,7 @@ def main():
     parser.add_argument('input', help='directory of input images')
     parser.add_argument('output', help='directory for output files')
     parser.add_argument('--focal-length', '-f', type=int, default=None, help='focal length in pixels', metavar='n')
-    parser.add_argument('--video-mode-matching', '-v', default=None, help='sequence matching with an overlap of X images')
+    parser.add_argument('--video-mode-matching', '-v', type=int, default=None, help='sequence matching with an overlap of X images')
     parser.add_argument('--rclone-transfer-remote', metavar='remote', default=None,
                         help='if specified, and if matches the name of one of the directories in '
                         'the output path, transfer the results to that rclone remote into the '
@@ -50,21 +50,14 @@ def main():
 
     commands = []
     # https://openmvg.readthedocs.io/en/latest/software/SfM/SfM/
+    commands.append([
+        os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_SfMInit_ImageListing'),
+        '-i', args.input,
+        '-o', matches_dir,
+        '-d', camera_file_params,
+    ])
     if args.focal_length is not None:
-        commands.append([
-            os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_SfMInit_ImageListing'),
-            '-i', args.input,
-            '-o', matches_dir,
-            '-d', camera_file_params,
-            '-f', str(args.focal_length),
-        ])
-    else:
-        commands.append([
-            os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_SfMInit_ImageListing'),
-            '-i', args.input,
-            '-o', matches_dir,
-            '-d', camera_file_params,
-        ])
+        commands[-1] += ['-f', str(args.focal_length)]
     commands.append([
         os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_ComputeFeatures'),
         '-i', os.path.join(matches_dir, 'sfm_data.json'),
@@ -72,21 +65,14 @@ def main():
         '-m', 'SIFT',
 	'-p', 'HIGH',  # https://openmvg.readthedocs.io/en/latest/software/SfM/GlobalSfM/?highlight=please%20use
     ])
+    commands.append([
+        os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_ComputeMatches'),
+        '-i', os.path.join(matches_dir, 'sfm_data.json'),
+        '-o', matches_dir,
+        '-g', 'e',
+    ])
     if args.video_mode_matching is not None:
-        commands.append([
-            os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_ComputeMatches'),
-            '-i', os.path.join(matches_dir, 'sfm_data.json'),
-            '-o', matches_dir,
-            '-g', 'e',
-            '-v', args.video_mode_matching,
-        ])
-    else:
-        commands.append([
-            os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_ComputeMatches'),
-            '-i', os.path.join(matches_dir, 'sfm_data.json'),
-            '-o', matches_dir,
-            '-g', 'e',
-        ])
+        commands[-1] += ['-v', str(args.video_mode_matching)]
     commands.append([
         os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_GlobalSfM'),
         '-i', os.path.join(matches_dir, 'sfm_data.json'),
@@ -140,29 +126,19 @@ def main():
             if s.endswith('ON'):
                 built_with_cuda = True
 
+    commands.append([
+        os.path.join(OPENMVS_BIN, 'RefineMesh'),
+        os.path.join(output_path, 'openMVS', 'scene_dense_mesh.mvs'),
+        '-w', os.path.join(output_path, 'openMVS', 'working'),
+    ])
     if built_with_cuda:
-        commands.append([
-            os.path.join(OPENMVS_BIN, 'RefineMesh'),
-            os.path.join(output_path, 'openMVS', 'scene_dense_mesh.mvs'),
-            '-w', os.path.join(output_path, 'openMVS', 'working'),
-            '--use-cuda', '0',  # https://github.com/cdcseacave/openMVS/issues/230
-        ])
-    else:
-        commands.append([
-            os.path.join(OPENMVS_BIN, 'RefineMesh'),
-            os.path.join(output_path, 'openMVS', 'scene_dense_mesh.mvs'),
-            '-w', os.path.join(output_path, 'openMVS', 'working'),
-        ])
+        commands[-1] += ['--use-cuda', '0']  # https://github.com/cdcseacave/openMVS/issues/230
 
     commands.append([
         os.path.join(OPENMVS_BIN, 'TextureMesh'),
         os.path.join(output_path, 'openMVS', 'scene_dense_mesh_refine.mvs'),
         '-w', os.path.join(output_path, 'openMVS', 'working'),
     ])
-
-    for command in commands:
-        print(' '.join(command))
-        subprocess.run(command)
 
     # Transfer via rclone if requested
     if args.rclone_transfer_remote is not None:
@@ -186,16 +162,18 @@ def main():
             while folders.pop(0) != args.rclone_transfer_remote:
                 continue
 
-            command = [
+            commands.append([
                 'rclone',
                 'move',
                 '-v',
                 '--delete-empty-src-dirs',
                 output_path,
                 args.rclone_transfer_remote + ':' + os.path.join(*folders)
-            ]
-            print(' '.join(command))
-            subprocess.run(command)
+            ])
+
+    for command in commands:
+        print(' '.join(command))
+        subprocess.run(command)
 
 
 if __name__ == '__main__':
