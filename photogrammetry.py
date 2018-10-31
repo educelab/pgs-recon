@@ -40,6 +40,12 @@ def main():
     )
     os.makedirs(output_path)
 
+    metadata = {}
+    metadata['Arguments'] = vars(args)
+
+    with open(os.path.join(output_path, 'metadata.json'), 'w') as f:
+        f.write(json.dumps(metadata, indent=4, sort_keys=False))    
+
     mvg_dir = os.path.join(output_path, 'openMVG')
     matches_dir = os.path.join(mvg_dir, 'matches')
     reconstruction_dir = os.path.join(mvg_dir, 'reconstruction_global')
