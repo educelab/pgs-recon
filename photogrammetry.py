@@ -30,7 +30,8 @@ def main():
     parser.add_argument('--free-space-support', action='store_true', help='use free-space support in ReconstructMesh')
     parser.add_argument('--densify-resolution-level', default=None, type=int, help='how many times to scale down images before DensifyPointCloud')
     parser.add_argument('--refine-resolution-level', default=None, type=int, help='how many times to scale down images before RefineMesh')
-    parser.add_argument('--texture-resolution-level', default=None, type=int, help='how many times to scale down images before TextureMesh')        
+    parser.add_argument('--texture-resolution-level', default=None, type=int, help='how many times to scale down images before TextureMesh')
+    parser.add_argument('--matching-geometric-model', default=None, help='type of model used for robust estimation from the photometric putative matches')
     args = parser.parse_args()
 
     output_path = os.path.join(
@@ -68,14 +69,17 @@ def main():
         '-i', os.path.join(matches_dir, 'sfm_data.json'),
         '-o', matches_dir,
         '-m', 'SIFT',
-	'-p', 'HIGH',  # https://openmvg.readthedocs.io/en/latest/software/SfM/GlobalSfM/?highlight=please%20use
     ])
+    if not args.incremental_sfm:
+        commands[-1] += ['-p', 'HIGH']  # https://openmvg.readthedocs.io/en/latest/software/SfM/GlobalSfM/?highlight=please%20use
+
     commands.append([
         os.path.join(OPENMVG_SFM_BIN, 'openMVG_main_ComputeMatches'),
         '-i', os.path.join(matches_dir, 'sfm_data.json'),
         '-o', matches_dir,
-        '-g', 'e',
     ])
+    if args.matching_geometric_model is not None:
+        commands[-1] += ['-g', args.matching_geometric_model]
     if args.video_mode_matching is not None:
         commands[-1] += ['-v', str(args.video_mode_matching)]
 
