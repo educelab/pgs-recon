@@ -27,6 +27,10 @@ def main():
                         'the output path, transfer the results to that rclone remote into the '
                         'subpath following the remote name')
     parser.add_argument('--incremental-sfm', '-i', action='store_true', help='use incremental SfM instead of global')
+    parser.add_argument('--free-space-support', action='store_true', help='use free-space support in ReconstructMesh')
+    parser.add_argument('--densify-resolution-level', default=None, type=int, help='how many times to scale down images before DensifyPointCloud')
+    parser.add_argument('--refine-resolution-level', default=None, type=int, help='how many times to scale down images before RefineMesh')
+    parser.add_argument('--texture-resolution-level', default=None, type=int, help='how many times to scale down images before TextureMesh')        
     args = parser.parse_args()
 
     output_path = os.path.join(
@@ -110,16 +114,22 @@ def main():
         '-o', os.path.join(output_path, 'openMVS', 'scene.mvs'),
         '-d', os.path.join(output_path, 'openMVG', 'undistorted_images'),
     ])
+    
     commands.append([
         os.path.join(OPENMVS_BIN, 'DensifyPointCloud'),
         os.path.join(output_path, 'openMVS', 'scene.mvs'),
         '-w', os.path.join(output_path, 'openMVS', 'working'),
     ])
+    if args.densify_resolution_level is not None:
+        commands[-1] += ['--resolution-level', str(args.densify_resolution_level)]
+        
     commands.append([
         os.path.join(OPENMVS_BIN, 'ReconstructMesh'),
         os.path.join(output_path, 'openMVS', 'scene_dense.mvs'),
         '-w', os.path.join(output_path, 'openMVS', 'working'),
     ])
+    if args.free_space_support:
+        commands[-1] += ['--free-space-support', '1']
 
     built_with_cuda = False
     if os.path.isfile('build/openMVS-prefix/src/openMVS-build/CMakeCache.txt'):
@@ -139,12 +149,16 @@ def main():
     ])
     if built_with_cuda:
         commands[-1] += ['--use-cuda', '0']  # https://github.com/cdcseacave/openMVS/issues/230
+    if args.refine_resolution_level is not None:
+        commands[-1] += ['--resolution-level', str(args.refine_resolution_level)]
 
     commands.append([
         os.path.join(OPENMVS_BIN, 'TextureMesh'),
         os.path.join(output_path, 'openMVS', 'scene_dense_mesh_refine.mvs'),
         '-w', os.path.join(output_path, 'openMVS', 'working'),
     ])
+    if args.texture_resolution_level is not None:
+        commands[-1] += ['--resolution-level', str(args.texture_resolution_level)]
 
     # Transfer via rclone if requested
     if args.rclone_transfer_remote is not None:
