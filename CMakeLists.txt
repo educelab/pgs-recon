@@ -22,8 +22,8 @@ ExternalProject_Add(
 ExternalProject_Add(
 	openMVS
 	GIT_REPOSITORY https://github.com/cdcseacave/openMVS
-	GIT_TAG 063e5cd7f1139aceaf882f9f6ae3f0de26c59138
-	CMAKE_ARGS -DVCG_ROOT=${CMAKE_BINARY_DIR}/VCG-prefix/src/VCG -DCMAKE_BUILD_TYPE=Release
+	GIT_TAG d19dae8473682a565823d6a6258420c052d483ec
+	CMAKE_ARGS -DVCG_ROOT=${CMAKE_BINARY_DIR}/VCG-prefix/src/VCG -DCMAKE_BUILD_TYPE=Release -DCGAL_DIR=/usr/local/Cellar/cgal/4.14/lib/cmake/CGAL
 	DEPENDS VCG
 	INSTALL_COMMAND ""
 )

@@ -129,7 +129,7 @@ def main():
     commands.append([
         os.path.join(OPENMVS_BIN, 'DensifyPointCloud'),
         os.path.join(output_path, 'openMVS', 'scene.mvs'),
-        '-w', os.path.join(output_path, 'openMVS', 'working'),
+        # '-w', os.path.join(output_path, 'openMVS', 'working'),
     ])
     if args.densify_resolution_level is not None:
         commands[-1] += ['--resolution-level', str(args.densify_resolution_level)]
@@ -137,7 +137,7 @@ def main():
     commands.append([
         os.path.join(OPENMVS_BIN, 'ReconstructMesh'),
         os.path.join(output_path, 'openMVS', 'scene_dense.mvs'),
-        '-w', os.path.join(output_path, 'openMVS', 'working'),
+        # '-w', os.path.join(output_path, 'openMVS', 'working'),
     ])
     if args.free_space_support:
         commands[-1] += ['--free-space-support', '1']
@@ -156,7 +156,7 @@ def main():
     commands.append([
         os.path.join(OPENMVS_BIN, 'RefineMesh'),
         os.path.join(output_path, 'openMVS', 'scene_dense_mesh.mvs'),
-        '-w', os.path.join(output_path, 'openMVS', 'working'),
+        # '-w', os.path.join(output_path, 'openMVS', 'working'),
     ])
     if built_with_cuda:
         commands[-1] += ['--use-cuda', '0']  # https://github.com/cdcseacave/openMVS/issues/230
@@ -166,7 +166,7 @@ def main():
     commands.append([
         os.path.join(OPENMVS_BIN, 'TextureMesh'),
         os.path.join(output_path, 'openMVS', 'scene_dense_mesh_refine.mvs'),
-        '-w', os.path.join(output_path, 'openMVS', 'working'),
+        # '-w', os.path.join(output_path, 'openMVS', 'working'),
     ])
     if args.texture_resolution_level is not None:
         commands[-1] += ['--resolution-level', str(args.texture_resolution_level)]
