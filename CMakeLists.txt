@@ -1,29 +1,51 @@
 cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
 
-include(ExternalProject)
+#### Initialize cache variables ####
+get_property(multiConfig GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT multiConfig AND NOT DEFINED CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel.")
+endif()
 
+#### Define project ####
 project(Photogrammetry)
 
-ExternalProject_Add(
-	VCG
-	GIT_REPOSITORY https://github.com/cdcseacave/VCG
-	GIT_TAG 56c76b08893a556e8bbd70673d84a82777b8cfff
-	BUILD_COMMAND ""
-	CONFIGURE_COMMAND ""
-	INSTALL_COMMAND ""
+#### CMake Module Path ####
+set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
+
+### Include extra CMake Modules ###
+include(ExternalProject)
+include(CMakeDependentOption)
+
+#### Setup output directory if not specified ####
+if (CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX "${PROJECT_SOURCE_DIR}/installed" CACHE PATH "Default Install Path" FORCE )
+endif()
+
+### Global arguments ###
+set(GLOBAL_CMAKE_ARGS
+    "-DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}"
+    "-DCMAKE_INSTALL_PREFIX:PATH=${CMAKE_INSTALL_PREFIX}"
+    "-DCMAKE_PREFIX_PATH:PATH=${CMAKE_PREFIX_PATH}"
+    "-DBUILD_SHARED_LIBS:BOOL=FALSE"
 )
-ExternalProject_Add(
-	openMVG
-	GIT_REPOSITORY https://github.com/openMVG/openMVG
-	GIT_TAG 835f1e585377a55d4143548fa9181438f5d23889
-	SOURCE_SUBDIR src
-	INSTALL_COMMAND printf "iPhone X\\\\\\\\;4.8\\nILCE-6300\\\\\\\\;23.5\\n" >> ../openMVG/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt
-)
-ExternalProject_Add(
-	openMVS
-	GIT_REPOSITORY https://github.com/cdcseacave/openMVS
-	GIT_TAG d19dae8473682a565823d6a6258420c052d483ec
-	CMAKE_ARGS -DVCG_ROOT=${CMAKE_BINARY_DIR}/VCG-prefix/src/VCG -DCMAKE_BUILD_TYPE=Release -DCGAL_DIR=/usr/local/Cellar/cgal/4.14/lib/cmake/CGAL
-	DEPENDS VCG
-	INSTALL_COMMAND ""
-)
+
+### Eigen ###
+include(BuildEigen)
+
+### jpeg ###
+include(BuildJPEG)
+
+### OpenCV ###
+include(BuildOpenCV)
+
+### CGAL ###
+include(BuildCGAL)
+
+### VCG ###
+include(BuildVCG)
+
+### openMVG ###
+include(BuildOpenMVG)
+
+### openMVS ###
+include(BuildOpenMVS)

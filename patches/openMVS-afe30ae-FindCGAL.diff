@@ -1,0 +1,37 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6d9677e..af0685d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4,6 +4,7 @@
+ #
+ # Project-wide settings
+ CMAKE_MINIMUM_REQUIRED(VERSION 3.1.0)
++cmake_policy(SET CMP0074 NEW)
+ 
+ # Name of the project.
+ #
+diff --git a/libs/MVS/CMakeLists.txt b/libs/MVS/CMakeLists.txt
+index 14be620..9f2c765 100644
+--- a/libs/MVS/CMakeLists.txt
++++ b/libs/MVS/CMakeLists.txt
+@@ -1,10 +1,5 @@
+ # Find required packages
+-FIND_PACKAGE(CGAL ${SYSTEM_PACKAGE_REQUIRED})
+-if(CGAL_FOUND)
+-	include_directories(${CGAL_INCLUDE_DIRS})
+-	add_definitions(${CGAL_DEFINITIONS})
+-	link_directories(${CGAL_LIBRARY_DIRS})
+-endif()
++FIND_PACKAGE(CGAL CONFIG ${SYSTEM_PACKAGE_REQUIRED})
+ 
+ FIND_PACKAGE(VCG ${SYSTEM_PACKAGE_REQUIRED})
+ if(VCG_FOUND)
+@@ -42,7 +37,7 @@ cxx_library_with_type_no_pch(MVS "Libs" "" "${cxx_default}"
+ set_target_pch(MVS Common.h)
+ 
+ # Link its dependencies
+-TARGET_LINK_LIBRARIES(MVS PRIVATE Common Math IO ${CERES_LIBS} ${CGAL_LIBS} ${CUDA_CUDA_LIBRARY})
++TARGET_LINK_LIBRARIES(MVS PRIVATE Common Math IO ${CERES_LIBS} CGAL::CGAL ${CUDA_CUDA_LIBRARY})
+ 
+ # Install
+ SET_TARGET_PROPERTIES(MVS PROPERTIES
