@@ -1,2 +1,46 @@
-# photogrammetry
+# Photogrammetry
+A Python script for processing image sets for photogrammetric reconstruction. Includes a CMake project for compiling required executables.
 
+## Setup
+The Python script uses executables provided by the OpenMVG and OpenMVS projects. The included CMake project will compile both of these projects as well as _some_ of their dependencies. Before configuring the CMake project, please preinstall the following dependencies:
+* CMake 3.5+
+* Boost 1.48+
+* GMP and MPFR
+* (Optional) NASM (Required by jpeg-turbo)
+* (Optional) Ceres Solver
+* (Optional) CUDA Toolkit
+
+After the dependencies have been installed, configure and build the CMake project to compile the required executables:
+```shell
+mkdir build/
+cd build/
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j4
+```
+
+#### Notes:
+* OpenMVS requires a specific version of VCG (built by this project). This CMake script makes every attempt to use the locally built VCG when building OpenMVS, however, other versions of VCG in the system path may cause conflicts. If you have build issues with OpenMVS, you may temporarily remove these installations.
+* OpenMVS and OpenCV must be linked against the same version of libjpeg.
+
+### Advanced Installation
+#### Installation Location
+By default, executables created by this CMake project will be installed to `installed/`. The installation location can be changed by setting the CMake installation prefix flag:
+```shell
+cmake -DCMAKE_INSTALL_PREFIX=/usr/local/ ..
+```
+
+#### Disable compilation of extra libraries
+In addition to VCG, OpenMVG, and OpenMVS, the CMake project also compiles a number of required software libraries. We provide corresponding CMake flags to control the compilation of these libraries. To use a system-provided version of these libraries, set the library's flag to `OFF`:
+
+```cmake
+BUILD_EIGEN: If ON, builds Eigen 3.2
+BUILD_JPEG: If ON, builds libjpeg
+BUILD_JPEG_TURBO: If ON, builds libjpeg-turbo (depends BUILD_JPEG=ON)
+BUILD_OPENCV: If ON, builds OpenCV
+BUILD_CGAL: If ON, builds CGAL
+```
+
+## Running The Pipeline
+```shell
+python3 photogrammetry.py images/ results/
+```
