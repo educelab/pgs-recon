@@ -19,8 +19,8 @@ if(BUILD_JPEG)
     # libjpeg
     ExternalProject_Add(
       jpeg
-      URL https://github.com/csparker247/jpeg-cmake/archive/v1.0.1.tar.gz
-      URL_HASH SHA256=1d6d4298f7267e6b1f956ec969da561cb7028ca138437bd85166d0a96cccc04e
+      URL https://github.com/csparker247/jpeg-cmake/archive/v1.1.0.tar.gz
+      URL_HASH SHA256=e4d91447b8718df8b0dc7b6e01be3cc27e6b2f90d40450ea4c760eda6b843548
       DOWNLOAD_NO_PROGRESS true
       CMAKE_CACHE_ARGS
           ${GLOBAL_CMAKE_ARGS}
