@@ -1,11 +1,12 @@
 diff --git a/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt b/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt
-index 4bda942a..90dc56ee 100644
+index 4bda942a..1918836e 100644
 --- a/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt
 +++ b/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt
-@@ -3480,3 +3480,6 @@ Yakumo Mega Image 45;7.11
+@@ -3480,3 +3480,7 @@ Yakumo Mega Image 45;7.11
  Yakumo Mega Image 34;5.33
  Yakumo Mega Image IV;7.11
  Yakumo Mega Image II;7.11
 +iPhone X;4.8
 +ILCE-6300;23.5
 +Nexus 5X;4.7
++Sony IMX265;7.0656
