@@ -1,3 +1,8 @@
 build/*
 installed/*
 out/*
+venv/*
+**/__pycache__/*
+.idea/*
+**/*.egg-info
+**/*.sif
