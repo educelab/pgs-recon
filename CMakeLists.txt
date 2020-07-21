@@ -7,7 +7,7 @@ if(NOT multiConfig AND NOT DEFINED CMAKE_BUILD_TYPE)
 endif()
 
 #### Define project ####
-project(Photogrammetry)
+project(pgs-deps)
 
 #### CMake Module Path ####
 set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
@@ -28,6 +28,17 @@ set(GLOBAL_CMAKE_ARGS
     "-DCMAKE_PREFIX_PATH:PATH=${CMAKE_PREFIX_PATH}"
     "-DBUILD_SHARED_LIBS:BOOL=FALSE"
 )
+
+# AppleClang 11.0.0-11.0.2 Bug: https://developer.apple.com/forums/thread/121887
+if(${CMAKE_CXX_COMPILER_ID} STREQUAL "AppleClang")
+if(NOT ${CMAKE_BUILD_TYPE} STREQUAL "Debug")
+if (${CMAKE_CXX_COMPILER_VERSION} VERSION_GREATER_EQUAL 11 AND ${CMAKE_CXX_COMPILER_VERSION} VERSION_LESS 11.0.3)
+    message(STATUS "Disabling stack check for AppleClang ${CMAKE_CXX_COMPILER_VERSION}")
+    add_compile_options(-fno-stack-check)
+    list(APPEND GLOBAL_CMAKE_ARGS "-DCMAKE_CXX_FLAGS:STRING=-fno-stack-check")
+endif()
+endif()
+endif()
 
 ### Eigen ###
 include(BuildEigen)

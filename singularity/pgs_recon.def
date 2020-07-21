@@ -1,0 +1,129 @@
+Bootstrap: library
+From: debian:10
+
+%labels
+  MAINTAINER Seth Parker <c.seth.parker@uky.edu>
+  OS Debian 10 (Buster)
+
+%files
+  /tmp/photogrammetry /usr/local/dri/photogrammetry
+
+%post
+  # Give read/write access in git repo (so it can later be edited using a persistent overlay)
+  chmod --recursive a+rw /usr/local/dri/photogrammetry/
+
+  # Add backports
+  echo 'deb http://deb.debian.org/debian buster-backports main' > /etc/apt/sources.list.d/backports.list
+
+  # apt dependencies
+  apt update
+  apt install -y \
+    build-essential \
+    bzip2 \
+    curl \
+    doxygen \
+    git \
+    graphviz \
+    libboost-dev \
+    libboost-iostreams-dev \
+    libboost-program-options-dev \
+    libboost-serialization-dev \
+    libboost-system-dev \
+    libboost-thread-dev \
+    libbz2-dev \
+    libgmp3-dev \
+    libjpeg62-turbo-dev \
+    libmpfr-dev \
+    libqt5svg5-dev \
+    libqt5x11extras5-dev \
+    nano \
+    ninja-build \
+    qt5-default \
+    wget \
+    xz-utils \
+    zlib1g-dev
+  apt-get -t buster-backports install -y cmake
+
+  # Python installs
+  apt-get install -y python3.7-dev python3-pip python3-venv python3-wheel
+
+  # Store git credentials for up to an hour (in overlay, not container) for convenience
+  git config --global credential.helper cache
+  git config --global credential.helper 'cache --timeout=3600'
+
+  # Build photogrammetry dependencies
+  mkdir -p /usr/local/dri/build/ && cd /usr/local/dri/build/
+  cmake \
+    -DCMAKE_INSTALL_PREFIX=/usr/local/ \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_JPEG=OFF \
+    -GNinja \
+    /usr/local/dri/photogrammetry/
+  ninja
+
+  # Install exiftool
+  mkdir -p /usr/local/dri/exiftool/ && cd /usr/local/dri/exiftool/
+  curl -O -L https://exiftool.org/Image-ExifTool-12.01.tar.gz
+  tar -xzf Image-ExifTool-12.01.tar.gz
+  cd Image-ExifTool-12.01/
+  perl Makefile.PL
+  make test
+  make install
+
+  # Create a virtual environment for this project
+  python3 -m venv /usr/local/dri/photogrammetry/.venv
+  # Activate virtualenv
+  . /usr/local/dri/photogrammetry/.venv/bin/activate
+  # Install the exact versions of all of the python dependencies
+  pip install wheel
+  pip install --requirement /usr/local/dri/photogrammetry/requirements.txt
+  # Now install this project
+  pip install --editable /usr/local/dri/photogrammetry
+  chmod --recursive a+rw /usr/local/dri/photogrammetry/.venv
+
+%runscript 
+#!/bin/bash
+  if [ $# -lt 1 ]; then
+      echo "Usage: ./container <command>"
+      exit 1
+  fi
+
+  source /usr/local/dri/photogrammetry/.venv/bin/activate
+  exec "$@"
+
+%help
+  This container provides an environment for running pgs_recon.
+
+  Building the container:
+    - The photogrammetry git repository must exist at /tmp/photogrammetry on the
+      host machine before building the container. Cloning using https is
+      recommended so that the repository can be manipulated after container
+      creation using your username and password instead of needing ssh keys
+      on the container. After this clone, you can check out a different branch
+      or make changes if desired, but this can also be done after the container
+      is built.
+    - Example command sequence to build fresh container:
+      `cd <path_to_project>/singularity`
+      `rm -rf /tmp/photogrammetry`
+      `git clone --branch develop https://code.cs.uky.edu/seales-research/photogrammetry.git /tmp/photogrammetry`
+      `sudo singularity build pgs_recon.sif pgs_recon.def`
+
+  Preparing for use:
+    - Then get the container ready for use, for example:
+      `scp pgs_recon.sif lcc:~`
+      `ssh lcc`
+      `module load ccs/singularity`
+      `rm pgs_recon.overlay && dd if=/dev/zero of=pgs_recon.overlay bs=1M count=500 && mkfs.ext3 pgs_recon.overlay  # Create a new overlay for the new container`
+      `singularity shell --overlay pgs_recon.overlay pgs_recon.sif  # If you want to get into the container and make any changes to the code, or checkout another branch`
+
+  Usage:
+    - It is possible to use an overlay to allow one to check out another branch, pull recent changes, or make local edits to project code. To create and use an overlay: `dd if=/dev/zero of=pgs_recon.overlay bs=1M count=500 && mkfs.ext3 pgs_recon.overlay; singularity shell --overlay pgs_recon.overlay pgs_recon.sif` (see Singularity documentation on persistent overlays). If the overlay directory is deleted or not specified when using the container, the changes will be gone and the checkout built into the container will be present.
+    - You can use `git config` to set your name and email after creating an overlay so you get accurate commit authorship.
+    - It is recommended to use the included `singularity/submit.sh` to run a job.
+    - Example reconstruction pipeline usage with sbatch:
+      `sbatch -p <partition> --time=<timelimit> submit.sh pgs-recon input_images/ output_dir/ # Submit jobs using the container`
+    - Example running single executable with sbatch:
+      `sbatch -p <partition> --time=<timelimit> submit.sh openMVG_main_GlobalSfM -i sfm_data.json -o recon/ -m matches/'
+
+
+  This container is intended to be built once and used with multiple checkouts of project code, using an overlay to store the changes or checkouts. Only when the dependencies change does the container need rebuilding.
