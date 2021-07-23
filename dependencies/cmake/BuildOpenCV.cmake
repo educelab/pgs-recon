@@ -3,8 +3,8 @@ if(BUILD_OPENCV)
 externalproject_add(
     opencv
     DEPENDS jpeg
-    URL https://github.com/opencv/opencv/archive/3.4.10.tar.gz
-    URL_HASH SHA256=1ed6f5b02a7baf14daca04817566e7c98ec668cec381e0edf534fa49f10f58a2
+    URL https://github.com/opencv/opencv/archive/3.4.15.tar.gz
+    URL_HASH SHA512=775149e56f0aa94d53eb024404866380d97ce423ef1c8343ee8f12c1377e454ae182b2528e86949b5f7250e551d464bd1a5de2e2d9f0d0e1dd3dc188a1db790d
     DOWNLOAD_NO_PROGRESS true
     CMAKE_CACHE_ARGS
         ${GLOBAL_CMAKE_ARGS}
