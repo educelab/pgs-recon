@@ -3,7 +3,7 @@ ExternalProject_Add(
     openMVS
     DEPENDS eigen VCG CGAL jpeg opencv
     GIT_REPOSITORY https://github.com/cdcseacave/openMVS
-    GIT_TAG v1.1
+    GIT_TAG v1.1.1
     DOWNLOAD_NO_PROGRESS true
     PATCH_COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVS-v1.1-FixDeps.diff || true
     CMAKE_CACHE_ARGS
