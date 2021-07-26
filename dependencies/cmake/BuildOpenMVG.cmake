@@ -12,3 +12,15 @@ ExternalProject_Add(
         -DEIGENSPARSE:BOOL=ON
         -DOpenMVG_USE_OCVSIFT:BOOL=ON
 )
+
+ExternalProject_Get_Property(openMVG SOURCE_DIR)
+
+ExternalProject_Add_Step(
+    openMVG
+    patch-tiff
+    DEPENDEES patch
+    DEPENDERS configure
+    COMMENT "Moving OpenMVG libtiff VERSION file"
+    COMMAND ${CMAKE_COMMAND} -E rename src/third_party/tiff/VERSION src/third_party/tiff/VERSION.txt
+    WORKING_DIRECTORY ${SOURCE_DIR}
+)
