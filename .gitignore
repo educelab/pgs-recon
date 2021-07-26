@@ -1,5 +1,5 @@
-build/*
-installed/*
+dependencies/build/*
+dependencies/installed/*
 out/*
 venv/*
 **/__pycache__/*
