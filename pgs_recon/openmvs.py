@@ -4,7 +4,8 @@ from typing import Dict
 from pgs_recon.utility import current_timestamp, run_command
 
 
-def mvs_densify(paths: Dict[str, Path], mvs_key: str, resolution_lvl: int = None, metadata: Dict = None) -> str:
+def mvs_densify(paths: Dict[str, Path], mvs_key: str,
+                resolution_lvl: int = None, metadata: Dict = None) -> str:
     """Densify a point cloud"""
     out_key = mvs_key + '_dense'
     in_path = paths[mvs_key]
@@ -23,7 +24,8 @@ def mvs_densify(paths: Dict[str, Path], mvs_key: str, resolution_lvl: int = None
     return out_key
 
 
-def mvs_reconstruct(paths: Dict[str, Path], mvs_key: str, free_space=False, metadata: Dict = None) -> str:
+def mvs_reconstruct(paths: Dict[str, Path], mvs_key: str, free_space=False,
+                    smooth: int = 2, metadata: Dict = None) -> str:
     """Reconstruct an MVS scene"""
     out_key = mvs_key + '_mesh'
     in_path = paths[mvs_key]
@@ -32,7 +34,8 @@ def mvs_reconstruct(paths: Dict[str, Path], mvs_key: str, free_space=False, meta
         str(paths['MVS_BIN'] / 'ReconstructMesh'),
         '-i', str(paths[mvs_key].name),
         '-o', str(paths[out_key].name),
-        '-w', str(paths['mvs'])
+        '-w', str(paths['mvs']),
+        '--smooth', str(smooth),
     ]
     if free_space:
         command.extend(['--free-space-support', '1'])
@@ -42,7 +45,8 @@ def mvs_reconstruct(paths: Dict[str, Path], mvs_key: str, free_space=False, meta
     return out_key
 
 
-def mvs_refine(paths: Dict[str, Path], mvs_key: str, decimation_factor: float = None, resolution_lvl: int = None,
+def mvs_refine(paths: Dict[str, Path], mvs_key: str,
+               decimation_factor: float = None, resolution_lvl: int = None,
                metadata: Dict = None) -> str:
     """Refine a reconstructed mesh"""
     out_key = mvs_key + '_refine'
@@ -64,12 +68,17 @@ def mvs_refine(paths: Dict[str, Path], mvs_key: str, decimation_factor: float = 
     return out_key
 
 
-def mvs_texture(paths: Dict[str, Path], mvs_key: str, file_format: str = 'ply', resolution_lvl: int = None,
-                metadata: Dict = None) -> str:
+def mvs_texture(paths: Dict[str, Path], mvs_key: str, file_format: str = 'ply',
+                resolution_lvl: int = None,
+                metadata: Dict = None, output_name: str = None) -> str:
     """Texture a mesh"""
     out_key = mvs_key + '_texture'
     in_path = paths[mvs_key]
-    paths[out_key] = in_path.parent / (in_path.stem + f'_texture.{file_format.lower()}')
+    if output_name is not None:
+        paths[out_key] = in_path.parent / f'{output_name}.{file_format.lower()}'
+    else:
+        paths[out_key] = in_path.parent / (
+                    in_path.stem + f'_texture.{file_format.lower()}')
     command = [
         str(paths['MVS_BIN'] / 'TextureMesh'),
         '-i', str(paths[mvs_key].name),

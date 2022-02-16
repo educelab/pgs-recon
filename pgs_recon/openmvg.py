@@ -4,7 +4,8 @@ from typing import Dict
 from pgs_recon.utility import current_timestamp, run_command
 
 
-def init_sfm_generic(paths: Dict[str, Path], focal_length=None, metadata: Dict = None):
+def init_sfm_generic(paths: Dict[str, Path], focal_length=None,
+                     metadata: Dict = None):
     """Init sfm scene from dir of images"""
     command = [
         str(paths['BIN'] / 'openMVG_main_SfMInit_ImageListing'),
@@ -19,7 +20,8 @@ def init_sfm_generic(paths: Dict[str, Path], focal_length=None, metadata: Dict =
     run_command(command)
 
 
-def compute_features(paths: Dict[str, Path], method: str, preset: str, upright=False, threads: int = None,
+def compute_features(paths: Dict[str, Path], method: str, preset: str,
+                     upright=False, threads: int = None,
                      metadata: Dict = None):
     """MVG: Compute image features"""
     # Compute features
@@ -39,7 +41,8 @@ def compute_features(paths: Dict[str, Path], method: str, preset: str, upright=F
     run_command(command)
 
 
-def compute_matches(paths: Dict[str, Path], method: str, model: str = None, ratio: float = None,
+def compute_matches(paths: Dict[str, Path], method: str, model: str = None,
+                    ratio: float = None,
                     video_frames: int = None,
                     metadata: Dict = None):
     """Compute image feature matches"""
@@ -60,7 +63,8 @@ def compute_matches(paths: Dict[str, Path], method: str, model: str = None, rati
     run_command(command)
 
 
-def mvg_sfm(paths: Dict[str, Path], sfm_key: str, method: str, use_priors=False, refine_intrinsics: str = None,
+def mvg_sfm(paths: Dict[str, Path], sfm_key: str, method: str, use_priors=False,
+            refine_intrinsics: str = None,
             initializer: str = None,
             metadata: Dict = None) -> str:
     """Run SfM"""
@@ -95,7 +99,8 @@ def mvg_sfm(paths: Dict[str, Path], sfm_key: str, method: str, use_priors=False,
     return 'sfm_recon'
 
 
-def mvg_compute_known(paths: Dict[str, Path], sfm_key: str, direct: bool = False, bundle_adjustment: bool = False,
+def mvg_compute_known(paths: Dict[str, Path], sfm_key: str,
+                      direct: bool = False, bundle_adjustment: bool = False,
                       metadata: Dict = None) -> str:
     """Compute structure from known poses (direct/robust)"""
     out_key = sfm_key + '_structured'
@@ -118,11 +123,13 @@ def mvg_compute_known(paths: Dict[str, Path], sfm_key: str, direct: bool = False
     return out_key
 
 
-def mvg_colorize_sfm(paths: Dict[str, Path], sfm_key: str, metadata: Dict = None) -> str:
+def mvg_colorize_sfm(paths: Dict[str, Path], sfm_key: str,
+                     metadata: Dict = None) -> str:
     """Colorize SfM file"""
     sfm_colorized_key = sfm_key + '_colorized'
     in_path = paths[sfm_key]
-    paths[sfm_colorized_key] = in_path.parent / (in_path.stem + '_colorized.ply')
+    paths[sfm_colorized_key] = in_path.parent / (
+                in_path.stem + '_colorized.ply')
     command = [
         str(paths['BIN'] / 'openMVG_main_ComputeSfM_DataColor'),
         '-i', str(paths[sfm_key]),
@@ -134,7 +141,8 @@ def mvg_colorize_sfm(paths: Dict[str, Path], sfm_key: str, metadata: Dict = None
     return sfm_colorized_key
 
 
-def mvg_to_mvs(paths: Dict[str, Path], sfm_key: str, threads: int = None, metadata: Dict = None) -> str:
+def mvg_to_mvs(paths: Dict[str, Path], sfm_key: str, threads: int = None,
+               metadata: Dict = None) -> str:
     """Convert OpenMVG SfM to OpenMVS Scene"""
     command = [
         str(paths['BIN'] / 'openMVG_main_openMVG2openMVS'),

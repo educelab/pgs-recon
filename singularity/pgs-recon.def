@@ -25,6 +25,7 @@ From: ubuntu:20.04
     doxygen \
     git \
     graphviz \
+    imagemagick \
     libboost-iostreams-dev \
     libboost-program-options-dev \
     libboost-serialization-dev \
@@ -63,9 +64,9 @@ From: ubuntu:20.04
 
   # Install exiftool
   mkdir -p /usr/local/educelab/exiftool/ && cd /usr/local/educelab/exiftool/
-  curl -O -L https://exiftool.org/Image-ExifTool-12.29.tar.gz
-  tar -xzf Image-ExifTool-12.29.tar.gz
-  cd Image-ExifTool-12.29/
+  curl -O -L https://exiftool.org/Image-ExifTool-12.38.tar.gz
+  tar -xzf Image-ExifTool-12.38.tar.gz
+  cd Image-ExifTool-12.38/
   perl Makefile.PL
   make test
   make install
@@ -106,7 +107,7 @@ From: ubuntu:20.04
     - Example command sequence to build fresh container:
       `cd <path_to_project>/singularity`
       `rm -rf /tmp/pgs-recon`
-      `git clone --branch develop https://code.cs.uky.edu/seales-research/photogrammetry.git /tmp/pgs-recon`
+      `git clone --branch main https://code.cs.uky.edu/seales-research/pgs-recon.git /tmp/pgs-recon`
       `sudo singularity build pgs-recon.sif pgs-recon.def`
 
   Preparing for use:
@@ -114,8 +115,12 @@ From: ubuntu:20.04
       `scp pgs-recon.sif lcc:~`
       `ssh lcc`
       `module load ccs/singularity`
-      `rm pgs-recon.overlay && dd if=/dev/zero of=pgs-recon.overlay bs=1M count=500 && mkfs.ext3 pgs-recon.overlay  # Create a new overlay for the new container`
+      `rm -f pgs-recon.overlay && dd if=/dev/zero of=pgs-recon.overlay bs=1M count=500 && mkfs.ext3 -F pgs-recon.overlay  # Create a new overlay for the new container`
       `singularity shell --overlay pgs-recon.overlay pgs-recon.sif  # If you want to get into the container and make any changes to the code, or checkout another branch`
+      `rclone copy -uv pgs-recon.sif dri-experiments-drive:singularity-containers`  # If you want to update the shared .sif file
+      `cp pgs-recon.sif $PROJECT/seales_uksr/containers`
+      `chmod g+w $PROJECT/seales_uksr/containers/pgs-recon.sif`
+      `chgrp seales_uksr $PROJECT/seales_uksr/containers/pgs-recon.sif`
 
   Usage:
     - It is possible to use an overlay to allow one to check out another branch, pull recent changes, or make local edits to project code. To create and use an overlay: `dd if=/dev/zero of=pgs-recon.overlay bs=1M count=500 && mkfs.ext3 pgs-recon.overlay; singularity shell --overlay pgs-recon.overlay pgs-recon.sif` (see Singularity documentation on persistent overlays). If the overlay directory is deleted or not specified when using the container, the changes will be gone and the checkout built into the container will be present.
