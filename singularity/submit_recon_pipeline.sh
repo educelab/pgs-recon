@@ -10,11 +10,11 @@
 #SBATCH --export=SINGULARITY_BIND='/share/singularity/bin',SINGULARITYENV_PREPEND_PATH='/share/singularity/bin'
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: submit_single_recon.sh <dtn_path_to_input_folder> <pgs-recon args>"
+    echo "Usage: submit_recon_pipeline.sh <dtn_path_to_input_folder> <pgs-recon args>"
     echo "  Path should be a path accessible from dtn."
-    echo "  Example: submit_single_recon.sh /gemini1-4/seales_uksr/herculaneum/Dailies/Preinterval/20211207_103351_7Dec2021_PHercPHerc1186Cr01_90d8c473"
+    echo "  Example: submit_recon_pipeline.sh /gemini1-4/seales_uksr/herculaneum/Dailies/Preinterval/20211207_103351_7Dec2021_PHercPHerc1186Cr01_90d8c473"
     echo "Usage example with sbatch:"
-    echo "  sbatch -p SKY32M192_L --cpus-per-task=32 submit_single_recon.sh /gemini1-4/seales_uksr/herculaneum/Dailies/Preinterval/20211207_103351_7Dec2021_PHercPHerc1186Cr01_90d8c473"
+    echo "  sbatch -p SKY32M192_L --cpus-per-task=32 submit_recon_pipeline.sh /gemini1-4/seales_uksr/herculaneum/Dailies/Preinterval/20211207_103351_7Dec2021_PHercPHerc1186Cr01_90d8c473"
     exit 2
 fi
 
