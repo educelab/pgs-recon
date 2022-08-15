@@ -19,8 +19,4 @@ done
 
 module load ccs/singularity
 
-if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
-    time singularity run --overlay pgs-recon.overlay ${PROJECT}/seales_uksr/containers/pgs-recon.sif "$@"
-else
-    time singularity run --overlay pgs-recon.overlay ${PROJECT}/seales_uksr/containers/pgs-recon.sif "$@" -k $SLURM_ARRAY_TASK_ID
-fi
+time singularity run --overlay pgs-recon.overlay ${PROJECT}/seales_uksr/containers/pgs-recon.sif "$@"

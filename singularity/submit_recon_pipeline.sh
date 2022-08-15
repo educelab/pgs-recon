@@ -12,9 +12,11 @@
 if [[ $# -lt 1 ]]; then
     echo "Usage: submit_recon_pipeline.sh <dtn_path_to_input_folder> <pgs-recon args>"
     echo "  Path should be a path accessible from dtn."
-    echo "  Example: submit_recon_pipeline.sh /gemini1-4/seales_uksr/herculaneum/Dailies/Preinterval/20211207_103351_7Dec2021_PHercPHerc1186Cr01_90d8c473"
+    echo "  Example: submit_recon_pipeline.sh /mnt/gemini1-4/seales_uksr/herculaneum/Dailies/Preinterval/20211207_103351_7Dec2021_PHercPHerc1186Cr01_90d8c473"
     echo "Usage example with sbatch:"
-    echo "  sbatch -p SKY32M192_L --cpus-per-task=32 submit_recon_pipeline.sh /gemini1-4/seales_uksr/herculaneum/Dailies/Preinterval/20211207_103351_7Dec2021_PHercPHerc1186Cr01_90d8c473"
+    echo "  sbatch -p SKY32M192_L --cpus-per-task=32 submit_single_recon.sh /mnt/gemini1-4/seales_uksr/herculaneum/Dailies/Preinterval/20211207_103351_7Dec2021_PHercPHerc1186Cr01_90d8c473"
+    echo "Usage example with env variables:"
+    echo "  sbatch --export ALL,PGS_EXPOSURE=1.5 submit_recon_pipeline.sh /mnt/gemini1-4/seales_uksr/herculaneum/Dailies/Preinterval/20211207_103351_7Dec2021_PHercPHerc1186Cr01_90d8c473"
     exit 2
 fi
 
@@ -44,8 +46,8 @@ containers_dir="${PROJECT}/seales_uksr/containers"
 pgs_recon_container="${containers_dir}/pgs-recon.sif"
 registration_toolkit_container="${containers_dir}/registration-toolkit.sif"
 root_processing_dir="${PSCRATCH}/seales_uksr/herculaneum-processing"
-recon_config_file="${PSCRATCH}/seales_uksr/dri-experiments-drive/2021-pgs-recon/configs/pgs-recon-import-global.txt"
-processed_dir="/gemini1-4/seales_uksr/herculaneum/Processed"
+recon_config_file="${PGS_CONFIG:-"${PSCRATCH}/seales_uksr/dri-experiments-drive/2021-pgs-recon/configs/pgs-recon-import-global.txt"}"
+processed_dir="/mnt/gemini1-4/seales_uksr/herculaneum/Processed"
 
 # Convert options
 exposure=${PGS_EXPOSURE:-"2.5"}
@@ -81,13 +83,20 @@ time singularity run --overlay pgs-recon.overlay "${pgs_recon_container}" \
 echo "Reordering mesh"
 time singularity run --overlay registration-toolkit.overlay "${registration_toolkit_container}" \
   rt_reorder_texture -i "${processed_job_dir}/mvs/${job_name}.obj" \
-  -o "${processed_job_dir}/${job_name}_reordered.obj"
+  -o "${processed_job_dir}/mvs/${job_name}_reordered.obj"
+
+# Center mesh
+echo "Centering and scaling mesh"
+time singularity run --overlay pgs-recon.overlay "${pgs_recon_container}" \
+  pgs-center \
+  -i "${processed_job_dir}/mvs/${job_name}_reordered.obj" \
+  -o "${processed_job_dir}/${job_name}_final.obj"
 
 # Copy out OpenMVS final output
 echo "Collecting results"
 cp "${processed_job_dir}/mvs/${job_name}.obj" \
   "${processed_job_dir}/mvs/${job_name}.mtl" \
-  $processed_job_dir/mvs/*.jpg \
+  "${processed_job_dir}/mvs/${job_name}"_material_*.jpg \
   "${processed_job_dir}/"
 
 # Package the intermediate files (remove them as we go)

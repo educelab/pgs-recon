@@ -1,5 +1,7 @@
 configargparse
 numpy
+opencv-contrib-python
 PyExifTool
 PySfMUtils
 scipy
+vtk
