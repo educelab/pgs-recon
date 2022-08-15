@@ -48,8 +48,8 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict, cam_calib: dict = None) -> sfm
         logger.error('Provided scan metadata specifies file pattern, but no files match.')
         raise RuntimeError()
 
-    with exiftool.ExifTool() as et:
-        img_metadata = et.get_metadata_batch(files)
+    with exiftool.ExifToolHelper() as et:
+        img_metadata = et.get_metadata(files)
 
     # Setup sfm
     scene = sfm.Scene()

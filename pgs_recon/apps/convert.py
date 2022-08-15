@@ -1,10 +1,29 @@
 import json
 import logging
 from pathlib import Path
+from datetime import datetime as dt, timezone as tz
 
 import configargparse
 
 from pgs_recon.utility import run_command
+
+
+def write_config(args, config_path=None):
+    # Setup experiment
+    experiment_start = dt.now(tz.utc)
+    datetime_str = experiment_start.strftime('%Y%m%d%H%M%S')
+    args.name = datetime_str + '_' + str(Path(args.input).stem)
+
+    # Write config after all arguments have been changed
+    if config_path is None:
+        config_path = Path(
+            args.output) / f'{datetime_str}_{args.name}_convert_config.txt'
+    args.config = str(config_path)
+    with config_path.open(mode='w') as file:
+        for arg in vars(args):
+            attr = getattr(args, arg)
+            arg = arg.replace('_', '-')
+            file.write(f'{arg} = {attr}\n')
 
 
 def main():
@@ -96,6 +115,9 @@ def main():
     # Add input file list
     cmd.extend([str(i) for i in images])
 
+    # Write config before convert
+    write_config(args)
+
     # Modify the metadata and save to out dir
     meta['adjustment'] = conv_meta
     meta['scan']['output_dir'] = str(output_dir.resolve())
@@ -106,6 +128,7 @@ def main():
 
     # Convert images
     logger.info('Converting data...')
+    logger.debug(f'Convert args: {cmd}')
     run_command(cmd)
 
     # Setup metadata copy
@@ -129,6 +152,7 @@ def main():
 
     # Copy metadata
     logger.info('Copying metadata...')
+    logger.debug(f'Metadata args: {cmd}')
     run_command(cmd)
 
 

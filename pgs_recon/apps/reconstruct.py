@@ -187,7 +187,7 @@ def main():
         for arg in vars(args):
             attr = getattr(args, arg)
             arg = arg.replace('_', '-')
-            file.write('{} = {}\n'.format(arg, attr))
+            file.write(f'{arg} = {attr}\n')
 
     # Init metadata
     metadata = {'args': " ".join(sys.argv),
