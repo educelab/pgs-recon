@@ -1,8 +1,8 @@
 # Note: Must use the cdcseacave repo
 ExternalProject_Add(
     VCG
-    URL https://github.com/cdcseacave/VCG/archive/88f12f2.tar.gz
-    URL_HASH SHA512=170b3bf61a58802ea9a593c0b9356f2db92a878140570ba169adf7f62c86e542a6170cc1601095514e15f409cd3a0798879941e5909b739e549452171b9d4eae
+    URL https://github.com/cdcseacave/VCG/archive/10d73fc.tar.gz
+    URL_HASH SHA512=391b0fe7633553755a53dd1b1d6dea8c6308eba80d534fd365b899ebecfe8bbc791b40f20afe54361e52215b654278d3aca009b6c62d7fcc6bc38073eb368ed6
     DOWNLOAD_NO_PROGRESS true
     BUILD_IN_SOURCE true
     CONFIGURE_COMMAND mkdir -p ${CMAKE_INSTALL_PREFIX}/include/vcg

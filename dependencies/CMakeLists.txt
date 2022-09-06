@@ -40,6 +40,15 @@ endif()
 endif()
 endif()
 
+# Check for SSE support for OpenMVS on ARM
+message(STATUS "Detecting SSE support")
+cmake_host_system_information(RESULT HAS_SSE QUERY HAS_SSE)
+if(HAS_SSE)
+    message(STATUS "Detecting SSE support - done")
+else()
+    message(STATUS "Detecting SSE support - failed")
+endif()
+
 ### Eigen ###
 include(BuildEigen)
 

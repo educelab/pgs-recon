@@ -41,52 +41,57 @@ def compute_features(paths: Dict[str, Path], method: str, preset: str,
     run_command(command)
 
 
-def compute_matches(paths: Dict[str, Path], method: str, model: str = None,
+def compute_matches(paths: Dict[str, Path], method: str,
                     ratio: float = None,
-                    video_frames: int = None,
                     metadata: Dict = None):
     """Compute image feature matches"""
     command = [
         str(paths['BIN'] / 'openMVG_main_ComputeMatches'),
         '-i', str(paths['sfm']),
-        '-o', str(paths['matches_dir']),
+        '-o', str(paths['matches_file']),
         '-n', method,
     ]
-    if model is not None:
-        command.extend(['-g', model])
     if ratio is not None:
         command.extend(['-r', str(ratio)])
-    if video_frames is not None:
-        command.extend(['-v', str(video_frames)])
     if metadata is not None:
         metadata['commands'][current_timestamp()] = (str(' ').join(command))
     run_command(command)
 
 
-def mvg_sfm(paths: Dict[str, Path], sfm_key: str, method: str, use_priors=False,
+def geometric_filter(paths: Dict[str, Path], model: str = None,
+                     metadata: Dict = None):
+    filtered = paths['matches_file']
+    filtered = filtered.parent / (filtered.stem + '_filtered' + filtered.suffix)
+    paths['matches_file_filtered'] = filtered
+    command = [
+        str(paths['BIN'] / 'openMVG_main_GeometricFilter'),
+        '-i', str(paths['sfm']),
+        '-m', str(paths['matches_file']),
+        '-o', str(filtered)
+    ]
+    if model is not None:
+        command.extend(['-g', model.lower()])
+    if metadata is not None:
+        metadata['commands'][current_timestamp()] = (str(' ').join(command))
+    run_command(command)
+
+
+def mvg_sfm(paths: Dict[str, Path], sfm_key: str, engine: str, use_priors=False,
             refine_intrinsics: str = None,
             initializer: str = None,
             metadata: Dict = None) -> str:
     """Run SfM"""
-    if method == 'global':
-        sfm_binary = 'openMVG_main_GlobalSfM'
-    elif method == 'incremental':
-        sfm_binary = 'openMVG_main_IncrementalSfM'
-    elif method == 'incremental2':
-        sfm_binary = 'openMVG_main_IncrementalSfM2'
-    else:
-        raise ValueError(f'Invalid SfM reconstruction method: {method}')
-
     command = [
-        str(paths['BIN'] / sfm_binary),
+        str(paths['BIN'] / 'openMVG_main_SfM'),
         '-i', str(paths[sfm_key]),
+        '-s', engine.upper(),
         '-m', str(paths['matches_dir']),
         '-o', str(paths['recon_dir']),
-        '-M', str(paths['matches_file']),
+        '-M', str(paths['matches_file_filtered'].name),
     ]
     if use_priors:
         command.append('-P')
-        if method == 'incremental2':
+        if engine == 'incrementalv2':
             command.extend(['-S', 'EXISTING_POSE'])
     if refine_intrinsics is not None:
         command.extend(['-f', refine_intrinsics])

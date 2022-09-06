@@ -3,8 +3,8 @@ if(BUILD_CGAL)
   ExternalProject_Add(
       CGAL
       DEPENDS eigen
-      URL https://github.com/CGAL/cgal/releases/download/releases%2FCGAL-5.0.2/CGAL-5.0.2-library.tar.xz
-      URL_HASH SHA256=bdc029e87902f76ad6b55af59cf595c3a974f3c8eac6e4a6df3c8eeebfab5d0c
+      URL https://github.com/CGAL/cgal/releases/download/v5.5/CGAL-5.5-library.tar.xz
+      URL_HASH SHA512=0ec4760c7d7306077452dac3c4c725d3c75bd72c278049df367aa42972ad81cc22aa4af12eca6a23940eceded54cdd88a092e9a007933ad7d8dc7aa17e8ed6fe
       DOWNLOAD_NO_PROGRESS true
       CMAKE_CACHE_ARGS
           ${GLOBAL_CMAKE_ARGS}
