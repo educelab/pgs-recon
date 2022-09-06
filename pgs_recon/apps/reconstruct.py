@@ -1,5 +1,5 @@
 """Run the photogrammetry pipeline on a set of input images."""
-
+import argparse
 import atexit
 import json
 import logging
@@ -9,11 +9,12 @@ from pathlib import Path
 
 import configargparse
 
-from pgs_recon.openmvg import compute_features, compute_matches, \
-    init_sfm_generic, mvg_colorize_sfm, \
-    mvg_compute_known, mvg_sfm, mvg_to_mvs
-from pgs_recon.openmvs import mvs_densify, mvs_reconstruct, mvs_refine, \
-    mvs_texture
+from pgs_recon.openmvg import (compute_features, compute_matches,
+                               geometric_filter, init_sfm_generic,
+                               mvg_colorize_sfm, mvg_compute_known, mvg_sfm,
+                               mvg_to_mvs)
+from pgs_recon.openmvs import (mvs_densify, mvs_reconstruct, mvs_refine,
+                               mvs_texture)
 from pgs_recon.pgs_data import init_sfm_pgs
 from pgs_recon.utility import current_timestamp
 
@@ -34,7 +35,8 @@ def main():
                         help='Output format for final textured mesh')
     parser.add_argument('--focal-length', '-f', type=int, default=None,
                         help='focal length in pixels', metavar='n')
-    parser.add_argument('--import-pgs-scan', '-p', action='store_true',
+    parser.add_argument('--import-pgs-scan', '-p',
+                        action=argparse.BooleanOptionalAction,
                         help='Input directory is assumed to be a PGS Scan '
                              'directory')
     parser.add_argument('--import-calib', type=str,
@@ -57,7 +59,8 @@ def main():
                            choices=['NORMAL', 'HIGH', 'ULTRA'], default='HIGH',
                            type=str.upper,
                            help='Set the description detail level.')
-    opts_desc.add_argument('--describer-upright', '-u', action='store_true',
+    opts_desc.add_argument('--describer-upright', '-u',
+                           action=argparse.BooleanOptionalAction,
                            help='Disable rotational invariance for feature '
                                 'detection step. Useful if the camera is '
                                 'always "upright" w.r.t the ground plane.')
@@ -73,26 +76,28 @@ def main():
                               default="FASTCASCADEHASHINGL2", type=str.upper,
                               help='Feature matching method.')
     opts_matcher.add_argument('--matching-geometric-model',
-                              choices=['f', 'e', 'h'], default='f',
+                              choices=['f', 'e', 'h', 'a', 'u', 'o'],
                               type=str.lower,
                               help='Geometric model for robust putative '
                                    'matches filtering: f: Fundamental, '
-                                   'e: Essential, h: Homography')
+                                   'e: Essential, h: Homography, a: essential '
+                                   'matrix with angular parameterization, u: '
+                                   'upright essential matrix with angular '
+                                   'parameterization, o: orthographic '
+                                   'essential matrix')
     opts_matcher.add_argument('--matching-ratio', type=float, default=None,
                               help='Nearest-Neighbor distance ratio')
-    opts_matcher.add_argument('--matching-video-mode', '-v', type=int,
-                              default=None,
-                              help='sequence matching with an overlap of X '
-                                   'images')
 
     opts_mvg = parser.add_argument_group('mvg reconstruction options')
     opts_mvg.add_argument('--mvg-recon-method', '-m',
-                          choices=['global', 'incremental', 'incremental2',
+                          choices=['global',
+                                   'incremental',
+                                   'incrementalv2',
                                    'direct'],
                           type=str.lower, default='global',
                           help='MVG scene reconstruction method. Note: direct '
                                'requires an sfm file with camera poses.')
-    opts_mvg.add_argument('--mvg-priors', action='store_true',
+    opts_mvg.add_argument('--mvg-priors', action=argparse.BooleanOptionalAction,
                           help='Use pose priors with SfM reconstruction')
     opts_mvg.add_argument('--mvg-refine-intrinsics', type=str.upper,
                           help='SfM intrinsic refinement options: NONE, '
@@ -101,13 +106,14 @@ def main():
                                'Note: Quoted options can be combined with '
                                '\'|\' (e.g. '
                                '\'ADJUST_FOCAL_LENGTH|ADJUST_DISTORTION\')')
-    opts_mvg.add_argument('--mvg-robust', '-r', action='store_true',
+    opts_mvg.add_argument('--mvg-robust', '-r',
+                          action=argparse.BooleanOptionalAction,
                           help='robustly triangulate reconstructed scene')
 
     # MVG hidden opts
-    opts_mvg.add_argument('--sfm-ba', action='store_true',
+    opts_mvg.add_argument('--sfm-ba', action=argparse.BooleanOptionalAction,
                           help=configargparse.SUPPRESS)
-    opts_mvg.add_argument('--robust-ba', action='store_true',
+    opts_mvg.add_argument('--robust-ba', action=argparse.BooleanOptionalAction,
                           help=configargparse.SUPPRESS)
     opts_mvg.add_argument('--mvg-initializer',
                           choices=['EXISTING_POSE', 'MAX_PAIR', 'AUTO_PAIR',
@@ -115,9 +121,11 @@ def main():
                           type=str.upper, help=configargparse.SUPPRESS)
 
     opts_mvs = parser.add_argument_group('openmvs options')
-    opts_mvs.add_argument('--free-space-support', action='store_true',
+    opts_mvs.add_argument('--free-space-support',
+                          action=argparse.BooleanOptionalAction,
                           help='use free-space support in ReconstructMesh')
-    opts_mvs.add_argument('--mvs-densify', action='store_true',
+    opts_mvs.add_argument('--mvs-densify',
+                          action=argparse.BooleanOptionalAction,
                           help='Enable point cloud densification step')
     opts_mvs.add_argument('--mvs-smooth', type=int, default=2,
                           help='Number of smoothing iterations after initial '
@@ -156,6 +164,7 @@ def main():
     # Setup output directory names
     paths['mvg'] = paths['output'] / 'mvg'
     paths['matches_dir'] = paths['mvg'] / 'matches_dir'
+    paths['matches_file'] = paths['matches_dir'] / 'matches.bin'
     paths['recon_dir'] = paths['mvg'] / 'recon_dir'
     paths['sfm'] = paths['mvg'] / 'sfm_data.json'
     paths['mvs'] = paths['output'] / 'mvs'
@@ -165,14 +174,6 @@ def main():
     # Create output folders
     for d in 'output', 'mvg', 'matches_dir', 'recon_dir', 'mvs':
         paths[d].mkdir(exist_ok=True, parents=True)
-
-    # Generate the matches file path from the geometric model
-    model = args.matching_geometric_model.lower()
-    if model in ("f", "a"):
-        matches_file = 'matches.f.bin'
-    else:
-        matches_file = f'matches.{model}.bin'
-    paths['matches_file'] = paths['matches_dir'] / matches_file
 
     # Setup experiment
     experiment_start = dt.now(tz.utc)
@@ -225,9 +226,12 @@ def main():
     # Match features/Compute Structure
     logger.info('Matching image features')
     compute_matches(paths, method=args.matching_method,
-                    model=args.matching_geometric_model,
-                    ratio=args.matching_ratio,
-                    video_frames=args.matching_video_mode, metadata=metadata)
+                    ratio=args.matching_ratio, metadata=metadata)
+
+    # Filter matches
+    logger.info('Filtering image features')
+    geometric_filter(paths, model=args.matching_geometric_model,
+                     metadata=metadata)
 
     # MVG scene computation
     if args.mvg_recon_method == 'direct':
@@ -237,7 +241,7 @@ def main():
                                     metadata=metadata)
     else:
         logger.info(f'Running SfM (Engine: {args.mvg_recon_method}')
-        sfm_key = mvg_sfm(paths, sfm_key='sfm', method=args.mvg_recon_method,
+        sfm_key = mvg_sfm(paths, sfm_key='sfm', engine=args.mvg_recon_method,
                           use_priors=args.mvg_priors,
                           refine_intrinsics=args.mvg_refine_intrinsics,
                           initializer=args.mvg_initializer,
