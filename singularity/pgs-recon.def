@@ -9,9 +9,6 @@ From: ubuntu:20.04
   /tmp/pgs-recon /usr/local/educelab/pgs-recon
 
 %post
-  # Give read/write access in git repo (so it can later be edited using a persistent overlay)
-  chmod --recursive a+rw /usr/local/educelab/pgs-recon/
-
   # Restore container PATH
   export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -38,10 +35,12 @@ From: ubuntu:20.04
     libmpfr-dev \
     libqt5svg5-dev \
     libqt5x11extras5-dev \
+    locales \
     nano \
     ninja-build \
     qt5-default \
     software-properties-common \
+    tzdata \
     wget \
     xz-utils \
     zlib1g-dev
@@ -54,11 +53,6 @@ From: ubuntu:20.04
     python3.9-venv
   curl https://bootstrap.pypa.io/get-pip.py | python3
 
-  # Store git credentials for up to an hour (in overlay, not container) for convenience
-  git config --global credential.helper cache
-  git config --global credential.helper 'cache --timeout=3600'
-  git config --global --add safe.directory /usr/local/educelab/pgs-recon/
-
   # Build photogrammetry dependencies
   mkdir -p /usr/local/educelab/build/ && cd /usr/local/educelab/build/
   cmake \
@@ -69,14 +63,20 @@ From: ubuntu:20.04
     /usr/local/educelab/pgs-recon/dependencies/
   ninja
 
+  # Fix locales
+  locale-gen en_US en_US.UTF-8
+  dpkg-reconfigure --frontend=noninteractive locales
+
   # Install exiftool
+  echo "Installing exiftool"
   mkdir -p /usr/local/educelab/exiftool/ && cd /usr/local/educelab/exiftool/
-  curl -O -L https://exiftool.org/Image-ExifTool-12.38.tar.gz
-  tar -xzf Image-ExifTool-12.38.tar.gz
-  cd Image-ExifTool-12.38/
+  curl -O -L https://exiftool.org/Image-ExifTool-12.50.tar.gz
+  tar -xzf Image-ExifTool-12.50.tar.gz
+  cd Image-ExifTool-12.50/
   perl Makefile.PL
   make test
   make install
+  echo "Exiftool installed"
 
   # Create a virtual environment for this project
   python3.9 -m venv /usr/local/educelab/pgs-recon/.venv
@@ -88,7 +88,12 @@ From: ubuntu:20.04
 
   # Install PGSRecon
   python3 -m pip install --editable /usr/local/educelab/pgs-recon
-  chmod --recursive a+rw /usr/local/educelab/pgs-recon
+
+  # Setup code and git for overlays
+  chmod --recursive a+rw /usr/local/educelab/pgs-recon/
+  git config --global credential.helper cache
+  git config --global credential.helper 'cache --timeout=3600'
+  git config --global --add safe.directory /usr/local/educelab/pgs-recon/
 
 %runscript 
 #!/bin/bash

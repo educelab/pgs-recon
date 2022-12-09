@@ -1,7 +1,10 @@
+import argparse
 import json
 import logging
-from pathlib import Path
+import shutil
+import sys
 from datetime import datetime as dt, timezone as tz
+from pathlib import Path
 
 import configargparse
 
@@ -26,6 +29,10 @@ def write_config(args, config_path=None):
             file.write(f'{arg} = {attr}\n')
 
 
+def has_group_opt(args, grp):
+    return any([getattr(args, b.dest) is not None for b in grp._group_actions])
+
+
 def main():
     parser = configargparse.ArgumentParser(prog='pgs-convert')
     parser.add_argument('--config', '-c', is_config_file=True,
@@ -35,16 +42,32 @@ def main():
     parser.add_argument('--output', '-o', type=str, required=True,
                         help='Output PGS dataset directory')
 
-    parser.add_argument('--file-type', '-f', choices=['jpg', 'tif'],
-                        default='jpg', type=str.lower,
-                        help='Output image format')
-    parser.add_argument('--quality', '-q', type=int,
-                        help='Output image quality. Range depends on '
-                             '--file-type.')
+    convert_opts = parser.add_argument_group('conversion options')
+    convert_opts.add_argument('--file-type', '-f', choices=['jpg', 'tif'],
+                              default='jpg', type=str.lower,
+                              help='Output image format')
+    convert_opts.add_argument('--if-same-type', default='copy',
+                              choices=['skip', 'copy', 'convert'],
+                              help='Behavior to use when the input file type '
+                                   'matches the target: (skip) the dataset, '
+                                   '(copy) directly to the output directory, '
+                                   '(convert) files anyway. Files are always '
+                                   'converted if one of the enhancement '
+                                   'options is provided.')
+    convert_opts.add_argument('--force-copy', default=False,
+                              action=argparse.BooleanOptionalAction,
+                              help='When performing a dataset copy, ignore '
+                                   'files which would be overwritten in the '
+                                   'output directory')
+    convert_opts.add_argument('--quality', '-q', type=int,
+                              help='Output image quality. Range depends on '
+                                   '--file-type')
 
-    parser.add_argument('--exposure', type=float,
-                        help='Exposure adjustment +/-')
-    parser.add_argument('--shadows', type=float, help='Shadow adjustment +/-')
+    enhance_opts = parser.add_argument_group('enhancement options')
+    enhance_opts.add_argument('--exposure', type=float,
+                              help='Exposure adjustment +/-')
+    enhance_opts.add_argument('--shadows', type=float,
+                              help='Shadow adjustment +/-')
 
     parser.add_argument('--log-level', type=str.upper,
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -58,23 +81,52 @@ def main():
     scan_dir = Path(args.input)
     if not scan_dir.exists():
         logger.error(f'Input directory does not exist: {str(scan_dir)}')
-        return 1
+        sys.exit(1)
+
+    # Get output directory
+    output_dir = Path(args.output)
 
     # Load the scan metadata
     meta_path = scan_dir / 'metadata.json'
     if not meta_path.exists():
         logger.error(f'File not found: {str(meta_path)}')
-        return 1
-    with meta_path.open() as f:
+        sys.exit(1)
+    with meta_path.open(encoding='utf-8') as f:
         meta = json.loads(f.read())
 
-    # Get a list of images
+    # Get file name info
     prefix = meta['scan']['file_prefix']
     ext = meta['scan']['format'].lower()
+
+    # Handle matching format
+    fmt_match = ext == args.file_type
+    has_enhance_opt = has_group_opt(args, enhance_opts)
+    if fmt_match and not has_enhance_opt:
+        # Format matches and not copying
+        if args.if_same_type == 'skip':
+            logger.info('Input dataset matches requested format. '
+                        'Data will not be copied or converted.')
+            sys.exit(0)
+
+        # Format matches and copying directly
+        elif args.if_same_type == 'copy':
+            logger.info('Input dataset matches requested format. '
+                        'Copying to the output directory.')
+            try:
+                shutil.copytree(scan_dir, output_dir,
+                                dirs_exist_ok=args.force_copy)
+            except FileExistsError as e:
+                logger.error(e)
+                sys.exit(1)
+            write_config(args)
+            sys.exit(0)
+
+    # Get a list of images
     images = list(scan_dir.glob(f'{prefix}*.{ext}'))
     images.sort()
     if len(images) == 0:
         logger.error('No images found in directory.')
+        sys.exit(1)
 
     # Construct command
     cmd = ['mogrify']
@@ -108,7 +160,6 @@ def main():
         cmd.extend(['-quality', str(args.quality)])
 
     # Setup output directory
-    output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     cmd.extend(['-path', str(output_dir)])
 
@@ -123,7 +174,7 @@ def main():
     meta['scan']['output_dir'] = str(output_dir.resolve())
     meta['scan']['format'] = args.file_type.upper()
     meta_path = output_dir / 'metadata.json'
-    with meta_path.open('w') as f:
+    with meta_path.open('w', encoding='utf8') as f:
         json.dump(meta, f, indent=4)
 
     # Convert images

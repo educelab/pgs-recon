@@ -1,0 +1,40 @@
+stages:
+  - test
+  - deploy
+
+### Tests ###
+.build:
+  variables:
+    PACKAGE_LIST: ""
+    PYTHON_EXE: "python3"
+    DEBIAN_FRONTEND: "noninteractive"
+  before_script:
+    - apt update
+    - apt install -y --no-install-recommends $(cat $PACKAGE_LIST)
+    - curl https://bootstrap.pypa.io/get-pip.py | ${PYTHON_EXE}
+    - ${PYTHON_EXE} -m pip install --upgrade pip setuptools wheel
+  script:
+    - echo Building dependencies
+    - mkdir -p dependencies/build/
+    - cmake -GNinja -S dependencies/ -B dependencies/build/ -DCMAKE_BUILD_TYPE=Release -DBUILD_JPEG=OFF
+    - cmake --build dependencies/build/
+    - ${PYTHON_EXE} -m venv venv
+    - source venv/bin/activate
+    - python -m pip install .
+  tags:
+    - docker
+
+test:ubuntu:20.04:
+  extends: .build
+  stage: test
+  variables:
+    PACKAGE_LIST: ci/apt-ubuntu-focal
+    PYTHON_EXE: "python3.9"
+  image: ubuntu:20.04
+
+#test:ubuntu:22.04:
+#  extends: .build
+#  stage: test
+#  variables:
+#    PACKAGE_LIST: ci/apt-ubuntu-jammy
+#  image: ubuntu:22.04

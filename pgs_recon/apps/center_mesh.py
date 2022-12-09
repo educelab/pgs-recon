@@ -78,14 +78,6 @@ def lookup_uv_to_3d(uv_tree, uv_pt, mesh):
         return None
 
 
-# vector magnitude normalization
-def normalize(v):
-    norm = np.linalg.norm(v)
-    if norm == 0:
-        return v
-    return v / norm
-
-
 # calculate rotation matrix that aligns vector a to b
 # If a == b, return identity
 # If -a == b, return 180-degree rotation around c
@@ -112,9 +104,9 @@ def align_vector(a, b, c):
 # Find the closest vector to v in vs
 # If result is anti-parallel to v, it will be flipped
 def find_closest_vector(v, vs):
-    dots = [np.dot(normalize(v), normalize(e)) for e in vs]
+    dots = [np.dot(el.unit_vec(v), el.unit_vec(e)) for e in vs]
     edge_idx = np.argmax(np.abs(dots))
-    v = normalize(vs[edge_idx])
+    v = el.unit_vec(vs[edge_idx])
     if dots[edge_idx] < 0:
         v *= -1
     return v
@@ -130,11 +122,11 @@ def bounding_box_calibration(polydata, max_edge, mid_edge, max_dir, mid_dir,
 
     # Align max edge to max target
     max_target = flip_max * max_target
-    r = align_vector(normalize(max_edge), max_target, mid_target)
+    r = align_vector(el.unit_vec(max_edge), max_target, mid_target)
 
     # Rotate mid edge by prev rot, align to mid target, and update rot
     mid_target = flip_mid * mid_target
-    r = align_vector(r @ normalize(mid_edge), mid_target, max_target) @ r
+    r = align_vector(r @ el.unit_vec(mid_edge), mid_target, max_target) @ r
 
     # Sample N normals
     num_pts = polydata.GetNumberOfPoints()
@@ -174,12 +166,12 @@ def sample_square_calibration(mesh, img, edges):
 
     # Detect board
     print('Detecting EduceLab sample square...')
-    detected, boards, ppcm, kp_ids, kp_pixels = el.detect_sample_square(img)
+    detected, boards, ppcm, kp_ids, kp_pixels, flip, rotate = el.detect_sample_square(img)
 
     # Nothing detected
     if not detected:
         print('Not detected.')
-        return detected, scale, r
+        return detected, scale, r, None
 
     # Report detection results
     num_markers = sum((b.marker_cnt for b in boards))
@@ -188,6 +180,24 @@ def sample_square_calibration(mesh, img, edges):
           f' - Markers: {num_markers}\n'
           f' - Board corners: {num_boards}\n'
           f' - Texture resolution (pixels/cm): {ppcm}')
+
+    # Flip the image and UV map if needed
+    # OpenCV flip codes: 0 == vertical, 1 == horizontal
+    if flip is not None:
+        print('Flipping image...')
+        img = cv2.flip(img, flip)
+        for idx, uv in enumerate(mesh.texcoords):
+            u = 1. - uv[0] if flip == 1 else uv[0]
+            v = 1. - uv[1] if flip == 0 else uv[1]
+            mesh.texcoords[idx] = [u, v]
+
+    # Rotate image
+    if rotate is not None:
+        msg = ['90°', '180°', '270°']
+        print(f'Rotating image {msg[rotate]}...')
+        img = cv2.rotate(img, rotate)
+        for idx, uv in enumerate(mesh.texcoords):
+            mesh.texcoords[idx] = el.rotate_kp(uv, (1., 1.), rotate).tolist()
 
     # Convert UV map to polydata
     print('Computing UV lookup tree...')
@@ -205,26 +215,33 @@ def sample_square_calibration(mesh, img, edges):
             for m in b.marker_corners:
                 pts = m[0] / [img.shape[1] - 1, img.shape[0] - 1]
                 pts = [lookup_uv_to_3d(uv_tree, uv, mesh) for uv in pts]
-                right_samples.append(normalize(pts[1] - pts[0]))
-                right_samples.append(normalize(pts[2] - pts[3]))
-                down_samples.append(normalize(pts[3] - pts[0]))
-                down_samples.append(normalize(pts[2] - pts[1]))
+                if not np.all(pts):
+                    continue
+                right_samples.append(el.unit_vec(pts[1] - pts[0]))
+                right_samples.append(el.unit_vec(pts[2] - pts[3]))
+                down_samples.append(el.unit_vec(pts[3] - pts[0]))
+                down_samples.append(el.unit_vec(pts[2] - pts[1]))
 
-        # Rotation targets
-        right_target = basis_vectors['x']
-        down_target = basis_vectors['y']
+        # Make sure we detected the UVs correctly
+        if len(right_samples) == 0 and len(down_samples) == 0:
+            print('Error: Found orientation markers but the corners don\'t '
+                  'lie in the UV map. Cannot calculate orientation.')
+        else:
+            # Rotation targets
+            right_target = basis_vectors['x']
+            down_target = -basis_vectors['y']
 
-        # Align right edge to X axis
-        right = np.mean(right_samples, axis=0)
-        if edges is not None:
-            right = find_closest_vector(right, edges)
-        r = align_vector(right, right_target, down_target)
+            # Align right edge to X axis
+            right = np.mean(right_samples, axis=0)
+            if edges is not None:
+                right = find_closest_vector(right, edges)
+            r = align_vector(right, right_target, down_target)
 
-        # Align down edge to Y axis
-        down = np.mean(down_samples, axis=0)
-        if edges is not None:
-            down = find_closest_vector(down, edges)
-        r = align_vector(r @ down, down_target, right_target) @ r
+            # Align down edge to Y axis
+            down = np.mean(down_samples, axis=0)
+            if edges is not None:
+                down = find_closest_vector(down, edges)
+            r = align_vector(r @ down, down_target, right_target) @ r
     else:
         print('Warning: No markers detected. Cannot calculate orientation.')
 
@@ -245,7 +262,7 @@ def sample_square_calibration(mesh, img, edges):
     distances_measured = []
     for ids, pts in zip(combinations(kp_ids, r=2),
                         combinations(kp_pos, r=2)):
-        dist_cm = el.keypoint_distance(ids[0], ids[1])
+        dist_cm = el.kp_dist(ids[0], ids[1])
         dist_3d = np.linalg.norm(pts[1] - pts[0])
         distances_expected.append(dist_cm)
         distances_measured.append(dist_3d)
@@ -267,7 +284,7 @@ def sample_square_calibration(mesh, img, edges):
     print(f' - Mean: {np.mean(errors):.7f}')
     print(f' - Median: {np.median(errors):.7f}')
 
-    return detected, scale, r
+    return detected, scale, r, img if flip is not None or rotate is not None else None
 
 
 basis_vectors = {
@@ -378,12 +395,13 @@ def main():
 
     # Calculate scale and orientation from sample square
     detected = False
+    new_img = None
     if args.sample_square_calibration:
         edges = None
         if not args.use_marker_dirs:
             edges = (max_edge, mid_edge, min_edge)
-        detected, scale, rot[0:3, 0:3] = \
-            sample_square_calibration(mesh, img, edges)
+        detected, scale, rot[0:3, 0:3], new_img = sample_square_calibration(
+            mesh, img, edges)
 
     # Fallback to bounding box method if sample square disabled/failed
     if not args.sample_square_calibration or not detected:
@@ -412,10 +430,15 @@ def main():
     print('Preparing output obj file...')
     mesh_tfm = wobj.polydata_to_mesh(transformer.GetOutput(), src_mesh=mesh)
 
+    # collect replacement textures
+    textures = None
+    if new_img is not None:
+        textures = {texture_path.name: new_img}
+
     # save new obj
     print('Saving mesh...')
     output_file = Path(args.output_file)
-    wobj.save_obj(mesh_tfm, output_file)
+    wobj.save_obj(mesh_tfm, output_file, _textures=textures)
 
 
 if __name__ == '__main__':

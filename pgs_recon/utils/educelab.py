@@ -1,9 +1,20 @@
 from itertools import combinations
 
+import cv2
 import cv2.aruco as ar
 import numpy as np
 
 import pgs_recon.utils.charuco as char
+
+
+def unit_vec(v):
+    """Return a unit length v"""
+    return v / np.sqrt(np.sum(v ** 2))
+
+
+def find_nearest(value, array):
+    return np.abs(np.asarray(array) - value).argmin()
+
 
 # Physical positions of known keypoints relative to top-left corner of sample
 # square. See the Sample Square v1 Placement Guide in:
@@ -40,8 +51,8 @@ _SAMPLE_SQUARE_V1_KP_DIST_CM = [
     idx, a in enumerate(_SAMPLE_SQUARE_V1_KP_POS_CM[:-1])]
 
 
-# Get the distance between two keypoints
-def keypoint_distance(a, b):
+def kp_dist(a, b):
+    """Get the distance from keypoint a to b"""
     if a == b:
         return 0.
     if b < a:
@@ -49,13 +60,95 @@ def keypoint_distance(a, b):
     return _SAMPLE_SQUARE_V1_KP_DIST_CM[a][b - a - 1]
 
 
+def kp_dir(a, b):
+    """Get the direction from keypoint a to b"""
+    return _SAMPLE_SQUARE_V1_KP_POS_CM[b] - _SAMPLE_SQUARE_V1_KP_POS_CM[a]
+
+
+def rotate_kp(kp, dim, rot):
+    if rot == 0:
+        u = dim[1] - kp[1]
+        v = kp[0]
+    elif rot == 1:
+        u = dim[0] - kp[0]
+        v = dim[1] - kp[1]
+    else:
+        u = kp[1]
+        v = dim[0] - kp[0]
+    return np.array((u, v))
+
+
 # Detect the EduceLab sample square in an image
 def detect_sample_square(img):
+    # Check all image orientations
+    flip = None
+    boards, kp_ids, kp_pos = _detect_educelab_boards(img)
+    for axis in 1, 0:
+        flipped = cv2.flip(img, axis)
+        b_new, kp_ids_new, kp_pos_new = _detect_educelab_boards(flipped)
+        if len(kp_ids_new) > len(kp_ids):
+            boards = b_new
+            kp_ids = kp_ids_new
+            kp_pos = kp_pos_new
+            flip = axis
+
+    # Make sure we have at least two landmarks
+    num_ldms = sum((b.marker_cnt + b.board_cnt for b in boards))
+    detected = num_ldms > 1
+
+    # Calculate pixels-per-cm
+    ppcm = 0.
+    rotate = None
+    if num_ldms > 1:
+        ppc_samples = []
+        rot_samples = []
+        for ids, pts in zip(combinations(kp_ids, r=2),
+                            combinations(kp_pos, r=2)):
+            # calculate ppcm for this kp pair
+            dist_px = np.linalg.norm(pts[1] - pts[0])
+            dist_cm = kp_dist(ids[0], ids[1])
+            ppc_samples.append(dist_px / dist_cm)
+
+            # get expected vector directions
+            dir_px = unit_vec(pts[1] - pts[0])
+            dir_cm = unit_vec(kp_dir(ids[0], ids[1]))
+
+            # calculate rotation for this key-value pair
+            theta = np.arctan2(dir_px[0] * dir_cm[1] - dir_px[1] * dir_cm[0],
+                               dir_px[0] * dir_cm[0] + dir_px[1] * dir_cm[1])
+            if theta < 0:
+                theta += 2 * np.pi
+            rot_samples.append(theta)
+
+        ppcm = np.mean(ppc_samples)
+        theta = np.mean(rot_samples)
+
+        # Rotate detected key points
+        rot = find_nearest(theta, [0., np.pi / 2, np.pi, 1.5 * np.pi]) - 1
+        if rot >= 0:
+            rotate = rot
+            max_x = img.shape[1] - 1
+            max_y = img.shape[0] - 1
+            dim = (max_x, max_y)
+            for idx, kp in enumerate(kp_pos):
+                kp_pos[idx] = rotate_kp(kp, dim, rot)
+            for b in boards:
+                for idx, c in enumerate(b.board_corners):
+                    b.board_corners[idx, 0] = rotate_kp(c[0], dim, rot)
+                for idx, marker in enumerate(b.marker_corners):
+                    m = np.array([rotate_kp(c, dim, rot) for c in marker[0]])
+                    b.marker_corners[idx][0] = m
+
+    return detected, boards, ppcm, kp_ids, kp_pos, flip, rotate
+
+
+# Low-level function for detecting the two EduceLab boards from the sample
+# square
+def _detect_educelab_boards(img):
     # Results
     boards = []
     kp_ids = []
     kp_pos = []
-
     # Try to detect both boards
     for idx in range(2):
         board = char.generate_board(offset=idx * 512)
@@ -78,23 +171,7 @@ def detect_sample_square(img):
             kp_pos.extend(c[0, :].squeeze() for c in b.board_corners)
 
         boards.append(b)
-
-    # Make sure we have at least landmarks
-    num_ldms = sum((b.marker_cnt + b.board_cnt for b in boards))
-    detected = num_ldms > 1
-
-    # Calculate pixels-per-cm
-    ppcm = 0.
-    if num_ldms > 1:
-        ppc_samples = []
-        for ids, pts in zip(combinations(kp_ids, r=2),
-                            combinations(kp_pos, r=2)):
-            dist_px = np.linalg.norm(pts[1] - pts[0])
-            dist_cm = keypoint_distance(ids[0], ids[1])
-            ppc_samples.append(dist_px / dist_cm)
-        ppcm = np.mean(ppc_samples)
-
-    return detected, boards, ppcm, kp_ids, kp_pos
+    return boards, kp_ids, kp_pos
 
 
 def main():
@@ -114,8 +191,25 @@ def main():
     # Load image
     img = cv2.imread(args.input_image)
 
+    if img is None:
+        print('Failed to load image/image empty')
+        return
+    else:
+        print(f'Loaded image: {img.shape}')
+
     # Detect boards
-    detected, boards, ppcm, *_ = detect_sample_square(img)
+    detected, boards, ppcm, _, _, flip, rotate = detect_sample_square(img)
+
+    # Flip image
+    if flip is not None:
+        print(f'Flipping image along axis {flip}')
+        img = cv2.flip(img, flip)
+
+    # Rotate image
+    if rotate is not None:
+        msg = ['90°', '180°', '270°']
+        print(f'Rotating image {msg[rotate]}')
+        img = cv2.rotate(img, rotate)
 
     # Draw detected markers
     if detected:
@@ -138,7 +232,7 @@ def main():
                                                   b.board_ids)
             cv2.imwrite(args.output_image, img)
     else:
-        print('No markers detected.')
+        print('No markers detected')
 
 
 if __name__ == '__main__':
