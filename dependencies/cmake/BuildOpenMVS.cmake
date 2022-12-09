@@ -3,7 +3,7 @@ ExternalProject_Add(
     openMVS
     DEPENDS eigen VCG CGAL jpeg opencv
     GIT_REPOSITORY https://github.com/cdcseacave/openMVS
-    GIT_TAG v2.0.1
+    GIT_TAG v2.1.0
     DOWNLOAD_NO_PROGRESS true
     CMAKE_CACHE_ARGS
         ${GLOBAL_CMAKE_ARGS}

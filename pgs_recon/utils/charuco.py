@@ -24,8 +24,14 @@ def generate_board(dictionary=ar.DICT_ARUCO_ORIGINAL, offset=0):
 
 # Detect a Charuco board. Returned results are sorted by marker and board IDs.
 def detect_board(img, board) -> DetectedBoard:
+    # Account for markers being small relative to max dimension for large area
+    # scans
+    params = ar.DetectorParameters_create()
+    if max(img.shape) > 14000:
+        params.minMarkerPerimeterRate = 0.015
+
     # Detect Aruco markers
-    marker_corners, marker_ids, _ = ar.detectMarkers(img, board.dictionary)
+    marker_corners, marker_ids, _ = ar.detectMarkers(img, board.dictionary, parameters=params)
     if marker_ids is not None:
         marker_cnt = len(marker_ids)
     else:

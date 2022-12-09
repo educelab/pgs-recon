@@ -20,7 +20,8 @@ def load_cam_calib(calib_path: Path) -> dict:
     return calib
 
 
-def import_pgs_scan(scan_dir: Path, cam_db: dict, cam_calib: dict = None) -> sfm.Scene:
+def import_pgs_scan(scan_dir: Path, cam_db: dict,
+                    cam_calib: dict = None) -> sfm.Scene:
     logger = logging.getLogger(__name__)
     # Load scan metadata
     meta_path = scan_dir / 'metadata.json'
@@ -45,7 +46,8 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict, cam_calib: dict = None) -> sfm
     # Get image metadata
     files = [str(i) for i in images]
     if len(files) == 0:
-        logger.error('Provided scan metadata specifies file pattern, but no files match.')
+        logger.error(
+            'Provided scan metadata specifies file pattern, but no files match.')
         raise RuntimeError()
 
     with exiftool.ExifToolHelper() as et:
@@ -56,9 +58,11 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict, cam_calib: dict = None) -> sfm
     scene.root_dir = scan_dir
 
     # Fill out sfm with data
+    intrinsics = {}
     for img in images:
         # Lookup this images tags
-        tags = next((i for i in img_metadata if i['File:FileName'] == img.name), None)
+        tags = next((i for i in img_metadata if i['File:FileName'] == img.name),
+                    None)
         if tags is None:
             logger.error(f'No tags loaded for image: {str(img)}')
             continue
@@ -74,10 +78,21 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict, cam_calib: dict = None) -> sfm
         # Get the camera idx and the position idx
         cam_idx = None
         pos_idx = None
-        if re.fullmatch(rf'{re.escape(prefix)}\d*_\d*\.{re.escape(ext)}', img.name):
-            cam_idx, pos_idx = img.name.replace(prefix, '').replace(f'.{ext}', '').split('_')
-            cam_idx = int(cam_idx)
-            pos_idx = int(pos_idx)
+        cap_idx = 0
+        match = re.fullmatch(
+            rf'{re.escape(prefix)}(?P<camera>\d*)_(?P<position>\d*)(_(?P<capture>\d*))?\.{ext}',
+            img.name)
+        if match:
+            cam_idx = int(match.group('camera'))
+            pos_idx = int(match.group('position'))
+            if match.group('capture'):
+                cap_idx = int(match.group('capture'))
+
+        # Skip anything but the primary capture
+        # TODO: Handle other captures
+        if cap_idx != 0:
+            logger.warning(f'Skipping {img.name} from capture group {cap_idx}')
+            continue
 
         # Setup intrinsic
         intrinsic = sfm.IntrinsicRadialK3()
@@ -96,7 +111,8 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict, cam_calib: dict = None) -> sfm
         elif f'{view.model}' in cam_db.keys():
             intrinsic.sensor_width = cam_db[f'{view.model}']
         else:
-            logger.warning(f'Camera not in database: {view.make} {view.model}. Ignoring file: {img.name}')
+            logger.warning(
+                f'Camera not in database: {view.make} {view.model}. Ignoring file: {img.name}')
             continue
 
         # Init extrinsics
@@ -108,16 +124,18 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict, cam_calib: dict = None) -> sfm
             # Assign position
             if cam['is_absolute_pos'] is True or pos_idx is None:
                 if pos_idx is None:
-                    logger.warning(f'Couldn\'t parse position index. Interpreting file\'s pose as absolute: {img.name}')
+                    logger.warning(
+                        f'Couldn\'t parse position index. Interpreting file\'s pose as absolute: {img.name}')
                 pose.center = cam['position']
             else:
-                center = np.array(scan_meta['scan']['capture_positions'][pos_idx])
+                center = np.array(
+                    scan_meta['scan']['capture_positions'][pos_idx])
                 offset = cam['position']
                 position = np.add(center, offset)
                 pose.center = position.round(15).tolist()
 
             # Calculate the rotation matrix
-            # Our rotation matrix is right handed and row-major
+            # Our rotation matrix is right-handed and row-major
             # We compose rotations as ZYX, so reverse the angle list
             euler_angles = cam['rotation'][::-1]
             rotation = Rot.from_euler('zyx', euler_angles, degrees=True)
@@ -125,7 +143,12 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict, cam_calib: dict = None) -> sfm
 
         # Only add everything to the SfM at the end
         scene.add_view(view)
-        view.intrinsic = scene.add_intrinsic(intrinsic)
+        # One intrinsic per camera, not per body and lens combo
+        if cam_idx in intrinsics.keys():
+            view.intrinsic = intrinsics[cam_idx]
+        else:
+            view.intrinsic = scene.add_intrinsic(intrinsic, group_models=False)
+            intrinsics[cam_idx] = view.intrinsic
         view.pose = scene.add_pose(pose)
 
     # Return the filled out sfm
@@ -143,15 +166,17 @@ def init_sfm_pgs(paths: Dict[str, Path], metadata: Dict = None):
     if 'input_calib' in paths.keys():
         logger.info('Loading camera calibrations')
         if metadata is not None:
-            metadata['commands'][current_timestamp()] = 'load_cam_calib ' + str(paths['input_calib'])
+            metadata['commands'][
+                current_timestamp()] = f'load_cam_calib {str(paths["input_calib"])}'
         calib = load_cam_calib(paths['input_calib'])
 
     # Load the pgs file
-    scene = import_pgs_scan(paths['input'].resolve(), cam_db=cam_db, cam_calib=calib)
+    scene = import_pgs_scan(paths['input'].resolve(), cam_db=cam_db,
+                            cam_calib=calib)
     if metadata is not None:
-        cmd = ' '.join(['import_pgs_scan', str(paths["input"]), str(paths['CAM_DB'])])
+        cmd = f'import_pgs_scan {str(paths["input"])} {str(paths["CAM_DB"])}'
         if calib:
-            cmd += ' ' + str(paths['input_calib'])
+            cmd += f' {str(paths["input_calib"])}'
         metadata['commands'][current_timestamp()] = cmd
 
     # Write the SFM
@@ -160,10 +185,13 @@ def init_sfm_pgs(paths: Dict[str, Path], metadata: Dict = None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--pgs-dir', '-p', required=True, help='PGS Scan directory')
-    parser.add_argument('--cam-db', '-d', default=__OPENMVG_CAMDB_DEFAULT_PATH, help='Camera database path')
+    parser.add_argument('--pgs-dir', '-p', required=True,
+                        help='PGS Scan directory')
+    parser.add_argument('--cam-db', '-d', default=__OPENMVG_CAMDB_DEFAULT_PATH,
+                        help='Camera database path')
     parser.add_argument('--cam-calib', '-c', help="Camera calibrations file")
-    parser.add_argument('--output-sfm', '-o', default='sfm_data.json', help='Output SFM file')
+    parser.add_argument('--output-sfm', '-o', default='sfm_data.json',
+                        help='Output SFM file')
     args = parser.parse_args()
 
     # Logger

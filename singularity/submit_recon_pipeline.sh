@@ -61,13 +61,13 @@ processed_job_dir="${root_processing_dir}/${processed_job_name}"
 
 # Copy data to LCC
 echo "Copying dataset to lcc"
-time scp -r dtn:"${dtn_path}" "${root_processing_dir}/"
+time rsync -a dtn:"${dtn_path%/}" "${root_processing_dir}/"
 
 # Convert raw images to JPG
 echo "Converting raw images to jpg"
 time singularity run --overlay pgs-recon.overlay "${pgs_recon_container}" \
   pgs-convert -i "${root_processing_dir}/${job_name}" \
-  --exposure "${exposure}" --shadows "${shadows}" \
+  --exposure="${exposure}" --shadows="${shadows}" \
   -o "${processed_job_dir}/jpg"
 
 # Run reconstruction
@@ -110,8 +110,10 @@ time tar -cvzf "${processed_job_dir}/intermediate.tar.gz" \
 
 # Copy back to Gemini in Processed/ folder
 echo "Copying results to gemini"
-time rsync -av --remove-source-files "${processed_job_dir}" dtn:"${processed_dir}/"
+time rsync -a --remove-source-files "${processed_job_dir}" dtn:"${processed_dir}/"
 
 # Remove empty processing directory and copied raw files
 echo "Removing working directory"
 rm -rf "${processed_job_dir}" "${root_processing_dir}/${job_name}"
+
+echo "Done."

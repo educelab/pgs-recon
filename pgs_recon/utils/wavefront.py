@@ -8,6 +8,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Dict, Union
 
+import cv2
 import numpy as np
 from vtkmodules.vtkCommonCore import vtkFloatArray, vtkIdList, vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData, vtkPolygon
@@ -31,6 +32,9 @@ def load_mtllib(filename: Union[str, Path]) -> Dict:
         current_mtl = None
         current_data = None
         for line in mtlf:
+            # Remove everything after comment delimiter
+            line = line.partition('#')[0]
+            # Split on whitespace
             toks = line.split()
             if not toks:
                 continue
@@ -57,7 +61,7 @@ def load_mtllib(filename: Union[str, Path]) -> Dict:
 # This duplicates an MTL into a new file. The input mtl file is iterated,
 # external texture images are copied to new file names derived from the output
 # file name, and the mtl file is updated to point to the new files
-def duplicate_mtllib(in_path, out_path):
+def duplicate_mtllib(in_path, out_path, textures=None):
     num_kd = 0
     # Open both files
     with in_path.open('r') as in_file, out_path.open('w') as out_file:
@@ -82,7 +86,12 @@ def duplicate_mtllib(in_path, out_path):
 
                 # Write to the output and copy the kd file
                 out_file.write(f'{line_prefix} {kd_dst}\n')
-                shutil.copy(in_path.parent / kd_src, out_path.parent / kd_dst)
+                if textures is not None and kd_src.name in textures.keys():
+                    cv2.imwrite(str(out_path.parent / kd_dst),
+                                textures[kd_src.name])
+                else:
+                    shutil.copy(in_path.parent / kd_src,
+                                out_path.parent / kd_dst)
                 num_kd += 1
 
             # Handle every other line
@@ -126,7 +135,10 @@ def load_obj(filename: Union[str, Path], triangulate=False) -> WavefrontOBJ:
             elif toks[0] == 'vn':
                 obj.normals.append([float(v) for v in toks[1:]])
             elif toks[0] == 'vt':
-                obj.texcoords.append([float(v) for v in toks[1:]])
+                # transform to be relative to bottom-left origin
+                uv = [float(v) for v in toks[1:]]
+                uv[1] = abs(uv[1] - 1.)
+                obj.texcoords.append(uv)
             elif toks[0] == 'f':
                 poly = [parse_vertex(vstr) for vstr in toks[1:]]
                 if triangulate:
@@ -145,17 +157,22 @@ def load_obj(filename: Union[str, Path], triangulate=False) -> WavefrontOBJ:
         return obj
 
 
-# Save a WavefrontOBJ to a file
-# _prec: Format string for float to string formatting. Mainly controls floating
-#   point precision.
-# _unique_mtl: If True, mtl files and texture images in obj will be rewritten
-#   using a named derived from the output filename. If False, the obj file will
-#   reference the original mtl and texture files.
 def save_obj(obj: WavefrontOBJ, filename: Union[str, Path], _prec='.7f',
-             _unique_mtl=True):
+             _unique_mtl=True, _textures=None):
     """Saves a WavefrontOBJ object to a file
 
-    Warning: Contains no error checking!
+    @param obj: WavefrontOBJ mesh
+    @param filename: Output location
+    @param _prec: Format string for float to string formatting. Meant to
+    control decimal precision.
+    @param _unique_mtl: If True, mtl files and texture images in obj will be
+    rewritten using a named derived from the output filename. If False, the obj
+    file will reference the original mtl and texture files.
+    @param _textures: Optional dictionary for controlling texture image
+    replacement: {str: np.ndarray, ...}. When copying mtl files, if a map_Kd
+    value matches one of the dictionary's keys, the corresponding np.ndarray
+    (presumably a texture image) will be written to disk instead of copying the
+    original texture image.
     """
     filename = Path(filename)
 
@@ -180,7 +197,7 @@ def save_obj(obj: WavefrontOBJ, filename: Union[str, Path], _prec='.7f',
             # Output file path
             mtl_out = filename.parent / mtl_out
             # Copy the mtl
-            duplicate_mtllib(mtl_in, mtl_out)
+            duplicate_mtllib(mtl_in, mtl_out, textures=_textures)
 
     with filename.open('w') as ofile:
         ofile.write(f'# Exported by: Gregson OBJ IO (EduceLab pgs-recon)\n')
@@ -189,6 +206,8 @@ def save_obj(obj: WavefrontOBJ, filename: Union[str, Path], _prec='.7f',
         for vtx in obj.vertices:
             ofile.write(f'v {" ".join([f"{v:{_prec}}" for v in vtx])}\n')
         for tex in obj.texcoords:
+            # transform to be relative to bottom-left origin
+            tex[1] = abs(tex[1] - 1.)
             ofile.write(f'vt {" ".join([f"{vt:{_prec}}" for vt in tex])}\n')
         for nrm in obj.normals:
             ofile.write(f'vn {" ".join([f"{vn:{_prec}}" for vn in nrm])}\n')
