@@ -14,7 +14,7 @@ def get_notes(scan_dir: Path) -> Dict:
     info = {
         'software': '',
         'scanner': 'Unknown',
-        'notes': '-',
+        'notes': '',
         'complete': False,
         'num_captures': '?',
         'num_positions': '?',
