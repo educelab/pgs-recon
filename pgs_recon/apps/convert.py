@@ -63,6 +63,11 @@ def main():
                               help='Output image quality. Range depends on '
                                    '--file-type')
 
+    file_opts = parser.add_argument_group('file filter options')
+    file_opts.add_argument('--filter-cam', type=int, metavar='INT', help='Filter by camera index')
+    file_opts.add_argument('--filter-pos', type=int, metavar='INT', help='Filter by position index')
+    file_opts.add_argument('--filter-cap', type=int, metavar='INT', help='Filter by capture index')
+
     enhance_opts = parser.add_argument_group('enhancement options')
     enhance_opts.add_argument('--exposure', type=float,
                               help='Exposure adjustment +/-')
@@ -121,8 +126,14 @@ def main():
             write_config(args)
             sys.exit(0)
 
+    # File filter
+    cam_f = f'{args.filter_cam:03}' if args.filter_cam else '*'
+    pos_f = f'_{args.filter_pos:05}' if args.filter_pos else '_*'
+    cap_f = f'_{args.filter_cap:02}' if args.filter_cap else '_*'
+    suffix = f'{cam_f}{pos_f}{cap_f}'
+
     # Get a list of images
-    images = list(scan_dir.glob(f'{prefix}*.{ext}'))
+    images = list(scan_dir.glob(f'{prefix}{suffix}.{ext}'))
     images.sort()
     if len(images) == 0:
         logger.error('No images found in directory.')
