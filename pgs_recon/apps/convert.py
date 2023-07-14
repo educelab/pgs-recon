@@ -7,6 +7,12 @@ from datetime import datetime as dt, timezone as tz
 from pathlib import Path
 
 import configargparse
+import imageio.v3 as iio
+import numpy as np
+from educelab import imgproc
+from educelab.imgproc import pipeline
+from skimage import img_as_float
+from tqdm import tqdm
 
 from pgs_recon.utility import run_command
 
@@ -14,7 +20,7 @@ from pgs_recon.utility import run_command
 def write_config(args, config_path=None):
     # Setup experiment
     experiment_start = dt.now(tz.utc)
-    datetime_str = experiment_start.strftime('%Y%m%d%H%M%S')
+    datetime_str = experiment_start.strftime('%Y%m%d_%H%M%S')
     args.name = datetime_str + '_' + str(Path(args.input).stem)
 
     # Write config after all arguments have been changed
@@ -41,6 +47,9 @@ def main():
                         help='Input PGS dataset directory')
     parser.add_argument('--output', '-o', type=str, required=True,
                         help='Output PGS dataset directory')
+    parser.add_argument('--log-level', type=str.upper,
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                        default='WARNING', help='Logging level')
 
     convert_opts = parser.add_argument_group('conversion options')
     convert_opts.add_argument('--file-type', '-f', choices=['jpg', 'tif'],
@@ -64,20 +73,19 @@ def main():
                                    '--file-type')
 
     file_opts = parser.add_argument_group('file filter options')
-    file_opts.add_argument('--filter-cam', type=int, metavar='INT', help='Filter by camera index')
-    file_opts.add_argument('--filter-pos', type=int, metavar='INT', help='Filter by position index')
-    file_opts.add_argument('--filter-cap', type=int, metavar='INT', help='Filter by capture index')
+    file_opts.add_argument('--filter-cam', type=int, metavar='INT',
+                           help='Filter by camera index')
+    file_opts.add_argument('--filter-pos', type=int, metavar='INT',
+                           help='Filter by position index')
+    file_opts.add_argument('--filter-cap', type=int, metavar='INT',
+                           help='Filter by capture index')
 
-    enhance_opts = parser.add_argument_group('enhancement options')
-    enhance_opts.add_argument('--exposure', type=float,
-                              help='Exposure adjustment +/-')
-    enhance_opts.add_argument('--shadows', type=float,
-                              help='Shadow adjustment +/-')
+    # add the enhancement pipeline options
+    enhance_opts = pipeline.add_parser_enhancement_group(parser)
 
-    parser.add_argument('--log-level', type=str.upper,
-                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-                        default='WARNING', help='Logging level')
+    # parse arguments and commands
     args = parser.parse_args()
+    apply_pipeline, cmds = pipeline.parse_and_build(args.commands)
 
     logging.basicConfig(level=args.log_level)
     logger = logging.getLogger('pgs-convert')
@@ -127,9 +135,9 @@ def main():
             sys.exit(0)
 
     # File filter
-    cam_f = f'{args.filter_cam:03}' if args.filter_cam else '*'
-    pos_f = f'_{args.filter_pos:05}' if args.filter_pos else '_*'
-    cap_f = f'_{args.filter_cap:02}' if args.filter_cap else '_*'
+    cam_f = f'{args.filter_cam:03}' if args.filter_cam is not None else '*'
+    pos_f = f'_{args.filter_pos:05}' if args.filter_pos is not None else '_*'
+    cap_f = f'_{args.filter_cap:02}' if args.filter_cap is not None else '_*'
     suffix = f'{cam_f}{pos_f}{cap_f}'
 
     # Get a list of images
@@ -139,59 +147,60 @@ def main():
         logger.error('No images found in directory.')
         sys.exit(1)
 
-    # Construct command
-    cmd = ['mogrify']
-
-    # Conversion metadata
-    conv_meta = {}
-
-    # Bump exposure
-    # Map stop factor -> % (e.g. +2.0 -> +200%)
-    if args.exposure is not None:
-        conv_meta['exposure'] = args.exposure
-        exp_val = 100.0 + args.exposure * 10
-        cmd.extend(['+level', f'0x{exp_val}%'])
-
-    # Simulate Photoshop shadows with Magick's sigmoidal-contrast
-    # Photoshop shadows [-100, 100] -> Magick contrast [-inf, inf]
-    if args.shadows is not None:
-        conv_meta['shadows'] = args.shadows
-        prefix = '-'
-        if args.shadows < 0:
-            prefix = '+'
-        shadow_val = abs(args.shadows / 10.0)
-        cmd.extend([f'{prefix}sigmoidal-contrast', f'{shadow_val}x0%'])
-
-    # File format
-    cmd.extend(['-format', args.file_type])
-
-    # Quality
-    if args.quality is not None and args.file_type in ['jpg', 'png']:
-        conv_meta['quality'] = args.quality
-        cmd.extend(['-quality', str(args.quality)])
-
     # Setup output directory
     output_dir.mkdir(parents=True, exist_ok=True)
-    cmd.extend(['-path', str(output_dir)])
-
-    # Add input file list
-    cmd.extend([str(i) for i in images])
 
     # Write config before convert
     write_config(args)
 
     # Modify the metadata and save to out dir
-    meta['adjustment'] = conv_meta
     meta['scan']['output_dir'] = str(output_dir.resolve())
     meta['scan']['format'] = args.file_type.upper()
+    if len(cmds):
+        meta['enhancements'] = cmds
     meta_path = output_dir / 'metadata.json'
     with meta_path.open('w', encoding='utf8') as f:
         json.dump(meta, f, indent=4)
 
     # Convert images
-    logger.info('Converting data...')
-    logger.debug(f'Convert args: {cmd}')
-    run_command(cmd)
+    for img_path in tqdm(images, desc='Converting images'):
+        # Load image
+        try:
+            img = iio.imread(img_path)
+        except ValueError:
+            logger.error(f'Failed to load file: {str(img_path)}')
+            continue
+        in_dtype = img.dtype
+
+        # Convert to float for processing
+        img = img_as_float(img)
+
+        # Process the image
+        img = apply_pipeline(img)
+
+        # Determine output format
+        kwargs = {}
+
+        # Type conversion
+        if args.file_type == 'jpg':
+            out_dtype = np.uint8
+        else:
+            out_dtype = in_dtype
+        img = np.clip(img, 0., 1.)
+        img = imgproc.as_dtype(img, out_dtype)
+
+        # Format specific opts
+        if args.file_type == 'jpg':
+            kwargs[
+                'quality'] = args.quality if args.quality is not None else 100
+        elif args.file_type == 'tif':
+            kwargs['compression'] = 'zlib'
+            kwargs['compressionargs'] = {'level': 9}
+
+        # Save the image to disk
+        out_file = img_path.with_suffix(f'.{args.file_type}').name
+        out_path = output_dir / out_file
+        iio.imwrite(out_path, img, **kwargs)
 
     # Setup metadata copy
     cmd = ['exiftool', '-q', '-P', '-overwrite_original']

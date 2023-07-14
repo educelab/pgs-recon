@@ -17,8 +17,7 @@ DetectedBoard = namedtuple('DetectedBoard',
 def generate_board(dictionary=ar.DICT_ARUCO_ORIGINAL, offset=0):
     aruco_dict = ar.getPredefinedDictionary(dictionary)
     aruco_dict.bytesList = aruco_dict.bytesList[offset:offset + 4]
-    board = ar.CharucoBoard_create(squaresX=3, squaresY=3, squareLength=10,
-                                   markerLength=7, dictionary=aruco_dict)
+    board = ar.CharucoBoard((3, 3), squareLength=10, markerLength=7, dictionary=aruco_dict)
     return board
 
 
@@ -26,29 +25,23 @@ def generate_board(dictionary=ar.DICT_ARUCO_ORIGINAL, offset=0):
 def detect_board(img, board) -> DetectedBoard:
     # Account for markers being small relative to max dimension for large area
     # scans
-    params = ar.DetectorParameters_create()
+    detectorParams = ar.DetectorParameters()
     if max(img.shape) > 14000:
-        params.minMarkerPerimeterRate = 0.015
+        detectorParams.minMarkerPerimeterRate = 0.015
 
     # Detect Aruco markers
-    marker_corners, marker_ids, _ = ar.detectMarkers(img, board.dictionary, parameters=params)
+    detector = ar.CharucoDetector(board, detectorParams=detectorParams)
+    board_corners, board_ids, marker_corners, marker_ids = detector.detectBoard(img)
     if marker_ids is not None:
         marker_cnt = len(marker_ids)
     else:
+        marker_corners = ()
         marker_cnt = 0
-
-    # Interpolate Charuco corners
-    board_corners = None
-    board_ids = None
-    board_cnt = 0
-    if marker_ids is not None and len(marker_ids) > 0:
-        _, board_corners, board_ids = \
-            ar.interpolateCornersCharuco(marker_corners,
-                                         marker_ids,
-                                         img,
-                                         board)
-        if board_ids is not None:
-            board_cnt = len(board_ids)
+    if board_ids is not None:
+        board_cnt = len(board_ids)
+    else:
+        board_corners = ()
+        board_cnt = 0
 
     # Sort the results
     if marker_ids is not None:

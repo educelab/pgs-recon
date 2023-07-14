@@ -114,18 +114,19 @@ def detect_sample_square(img):
             dir_cm = unit_vec(kp_dir(ids[0], ids[1]))
 
             # calculate rotation for this key-value pair
-            theta = np.arctan2(dir_px[0] * dir_cm[1] - dir_px[1] * dir_cm[0],
-                               dir_px[0] * dir_cm[0] + dir_px[1] * dir_cm[1])
-            if theta < 0:
-                theta += 2 * np.pi
+            y = dir_px[0] * dir_cm[1] - dir_px[1] * dir_cm[0]
+            x = dir_px[0] * dir_cm[0] + dir_px[1] * dir_cm[1]
+            theta = np.arctan2(y, x)
+            # normalize to [0, 2pi]
+            theta -= 2 * np.pi * (theta // (2*np.pi))
             rot_samples.append(theta)
 
         ppcm = np.mean(ppc_samples)
         theta = np.mean(rot_samples)
 
         # Rotate detected key points
-        rot = find_nearest(theta, [0., np.pi / 2, np.pi, 1.5 * np.pi]) - 1
-        if rot >= 0:
+        rot = find_nearest(theta, [0., np.pi / 2, np.pi, 1.5 * np.pi, 2 * np.pi]) - 1
+        if 0 <= rot < 3:
             rotate = rot
             max_x = img.shape[1] - 1
             max_y = img.shape[0] - 1
