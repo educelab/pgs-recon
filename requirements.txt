@@ -1,7 +1,12 @@
 configargparse
+educelab-imgproc>=0.4
+imageio
+matplotlib
 numpy
-opencv-contrib-python
+opencv-python>=4.7
 PyExifTool
 PySfMUtils
+scikit-image
 scipy
+tqdm
 vtk

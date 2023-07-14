@@ -32,6 +32,7 @@ make -j
 ### Pipelines
 Use a recent version of `pip` to install the Python scripts:
 ```shell
+# Requires Python 3.9+
 python3 -m pip install .
 ```
 

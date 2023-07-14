@@ -83,8 +83,8 @@ def print_dir(dir_path, detail_level, status_filter, meta_filter=None) -> Tuple[
     info, meta = get_notes(dir_path)
 
     # Filter by metadata filter first
-    filter_key, filter_val = meta_filter
     if meta_filter is not None:
+        filter_key, filter_val = meta_filter
         val = get_by_path(meta, filter_key)
         if val is None or str(val) != filter_val:
             return info['complete'], False
