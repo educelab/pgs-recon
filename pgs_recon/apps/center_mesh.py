@@ -315,7 +315,7 @@ def main():
                               'directions calculated from the detected sample '
                               'square. When this flag is provided, it will '
                               'instead use the mean directions calculated from '
-                              'the sample square markers. These are often less'
+                              'the sample square markers. These are often less '
                               'globally accurate than the bounding box edges.')
 
     bb_opts = parser.add_argument_group('bounding box calibration options')

@@ -119,6 +119,8 @@ def detect_sample_square(img):
             theta = np.arctan2(y, x)
             # normalize to [0, 2pi]
             theta -= 2 * np.pi * (theta // (2*np.pi))
+            if find_nearest(theta, [1.5 * np.pi, 2 * np.pi]) == 1:
+                theta = 0.
             rot_samples.append(theta)
 
         ppcm = np.mean(ppc_samples)
@@ -174,6 +176,45 @@ def _detect_educelab_boards(img):
         boards.append(b)
     return boards, kp_ids, kp_pos
 
+
+def generate_tray_mask(img):
+    # Setup gray scale image
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # threshold kernel size
+    kt = np.min(gray.shape[:2])
+    kt = max(kt // 100, 11)
+    kt = kt + 1 if (kt % 2 == 0) else kt
+
+    # gaussian kernel size, bilateral sigma
+    kb = max(kt // 2, 3)
+    kb = kb + 1 if (kb % 2 == 0) else kb
+    sigma = max(kb // 4, 9)
+    gray = cv2.bilateralFilter(gray, -1, sigma, sigma)
+    gray = cv2.GaussianBlur(gray, (kb, kb), 0)
+
+    # threshold image
+    gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, kt, 2)
+
+    # morphological filter
+    km = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9,9))
+    gray = cv2.morphologyEx(gray, cv2.MORPH_OPEN, km, iterations=4)
+
+    # detect contours
+    cnts, _ = cv2.findContours(gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # sort by size and get largest
+    cnt = sorted(cnts, key=lambda c: cv2.contourArea(c), reverse=True)[0]
+
+    # fit bounding box
+    rect = cv2.minAreaRect(cnt)
+    box = cv2.boxPoints(rect)
+    box = np.intp(box)
+
+    # generate mask image
+    mask = np.zeros_like(gray, dtype=np.uint8)
+    cv2.drawContours(mask, [box], 0, 255, thickness=cv2.FILLED)
+    return mask
 
 def main():
     # local imports
