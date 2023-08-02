@@ -104,6 +104,10 @@ def detect_sample_square(img):
         rot_samples = []
         for ids, pts in zip(combinations(kp_ids, r=2),
                             combinations(kp_pos, r=2)):
+            # Skip keypoints which have matching IDs
+            if ids[0] == ids[1]:
+                continue
+
             # calculate ppcm for this kp pair
             dist_px = np.linalg.norm(pts[1] - pts[0])
             dist_cm = kp_dist(ids[0], ids[1])
