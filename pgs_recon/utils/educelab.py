@@ -181,7 +181,7 @@ def _detect_educelab_boards(img):
     return boards, kp_ids, kp_pos
 
 
-def generate_tray_mask(img):
+def generate_tray_mask(img, open_iterations=2, save_debug=False):
     # Setup gray scale image
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
@@ -196,19 +196,30 @@ def generate_tray_mask(img):
     sigma = max(kb // 4, 9)
     gray = cv2.bilateralFilter(gray, -1, sigma, sigma)
     gray = cv2.GaussianBlur(gray, (kb, kb), 0)
+    if save_debug:
+        cv2.imwrite('debug-mask-1-blur.jpg', gray)
 
     # threshold image
     gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, kt, 2)
+    if save_debug:
+        cv2.imwrite('debug-mask-2-thresh.jpg', gray)
 
     # morphological filter
     km = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9,9))
-    gray = cv2.morphologyEx(gray, cv2.MORPH_OPEN, km, iterations=4)
+    gray = cv2.morphologyEx(gray, cv2.MORPH_OPEN, km,
+                            iterations=open_iterations)
+    if save_debug:
+        cv2.imwrite('debug-mask-3-morph.jpg', gray)
 
     # detect contours
     cnts, _ = cv2.findContours(gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     # sort by size and get largest
     cnt = sorted(cnts, key=lambda c: cv2.contourArea(c), reverse=True)[0]
+    if save_debug:
+        contour_img = img.copy()
+        cv2.drawContours(contour_img, [cnt], -1, [0, 255, 0], thickness=2)
+        cv2.imwrite('debug-mask-4-contour.jpg', contour_img)
 
     # fit bounding box
     rect = cv2.minAreaRect(cnt)

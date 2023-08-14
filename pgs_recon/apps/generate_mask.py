@@ -5,6 +5,7 @@ import cv2
 
 from pgs_recon.utils import educelab
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input-file', '-i', required=True,
@@ -12,6 +13,12 @@ def main():
     parser.add_argument('--output-file', '-o',
                         help='Output mask image path. If not provided, will '
                              'default to {input file}_mask.png')
+    parser.add_argument('--open-iterations', type=int, default=2,
+                        help='The number of morphological open operations to '
+                             'apply to the thresholded image')
+    parser.add_argument('--debug', action='store_true',
+                        help='If provided, save intermediate images for '
+                             'debugging mask generation')
     args = parser.parse_args()
 
     # Load img
@@ -20,7 +27,9 @@ def main():
 
     # Generate mask
     print('Generating mask...')
-    mask = educelab.generate_tray_mask(img)
+    mask = educelab.generate_tray_mask(img,
+                                       open_iterations=args.open_iterations,
+                                       save_debug=args.debug)
 
     # Save image mask
     if args.output_file is None:
