@@ -13,7 +13,7 @@ def main():
     parser.add_argument('--output-file', '-o',
                         help='Output mask image path. If not provided, will '
                              'default to {input file}_mask.png')
-    parser.add_argument('--open-iterations', type=int, default=2,
+    parser.add_argument('--open-iterations', type=int, default=4,
                         help='The number of morphological open operations to '
                              'apply to the thresholded image')
     parser.add_argument('--debug', action='store_true',
