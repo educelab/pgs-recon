@@ -181,7 +181,7 @@ def _detect_educelab_boards(img):
     return boards, kp_ids, kp_pos
 
 
-def generate_tray_mask(img, open_iterations=2, save_debug=False):
+def generate_tray_mask(img, open_iterations=4, save_debug=False):
     # Setup gray scale image
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
@@ -191,11 +191,11 @@ def generate_tray_mask(img, open_iterations=2, save_debug=False):
     kt = kt + 1 if (kt % 2 == 0) else kt
 
     # gaussian kernel size, bilateral sigma
-    kb = max(kt // 2, 3)
+    kb = max(kt, 3)
     kb = kb + 1 if (kb % 2 == 0) else kb
     sigma = max(kb // 4, 9)
-    gray = cv2.bilateralFilter(gray, -1, sigma, sigma)
     gray = cv2.GaussianBlur(gray, (kb, kb), 0)
+    gray = cv2.bilateralFilter(gray, -1, sigma, sigma)
     if save_debug:
         cv2.imwrite('debug-mask-1-blur.jpg', gray)
 
@@ -208,14 +208,19 @@ def generate_tray_mask(img, open_iterations=2, save_debug=False):
     km = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9,9))
     gray = cv2.morphologyEx(gray, cv2.MORPH_OPEN, km,
                             iterations=open_iterations)
+    gray = cv2.bitwise_not(gray)
     if save_debug:
         cv2.imwrite('debug-mask-3-morph.jpg', gray)
 
-    # detect contours
-    cnts, _ = cv2.findContours(gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # detect contours then sort through to find the inner contours
+    cnts, hierarchy = cv2.findContours(gray, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    inner_contours = []
+    for i, cnt in enumerate(cnts):
+        if hierarchy[0, i, 3] != -1:
+            inner_contours.append(cnt)
 
     # sort by size and get largest
-    cnt = sorted(cnts, key=lambda c: cv2.contourArea(c), reverse=True)[0]
+    cnt = sorted(inner_contours, key=lambda c: cv2.contourArea(c), reverse=True)[0]
     if save_debug:
         contour_img = img.copy()
         cv2.drawContours(contour_img, [cnt], -1, [0, 255, 0], thickness=2)
