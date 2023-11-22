@@ -306,6 +306,12 @@ def main():
                         help='If enabled, attempt to detect the EduceLab sample'
                              'square for automatic mesh scaling and '
                              'orientation.')
+    parser.add_argument('--load-transform',
+                        help='If provided, load a centering transform from the '
+                             'given file path.')
+    parser.add_argument('--save-transform',
+                        help='If provided, save the centering transform to the '
+                             'given file path.')
 
     ss_opts = parser.add_argument_group('sample square calibration options')
     ss_opts.add_argument('--use-marker-dirs', action='store_true',
@@ -375,47 +381,53 @@ def main():
         ngen.Update()
         poly_data = ngen.GetOutput()
 
-    # Setup identity transforms
-    trans = np.eye(4, dtype=np.float32)
-    rot = np.eye(4, dtype=np.float32)
-    scale = np.eye(4, dtype=np.float32)
-
-    # calculate OBB
-    print('Computing OBB...')
-    obb_tree = vtkOBBTree()
-    corner = np.array([0., 0., 0.])
-    max_edge = np.array([0., 0., 0.])
-    mid_edge = np.array([0., 0., 0.])
-    min_edge = np.array([0., 0., 0.])
-    sizes = np.array([0., 0., 0.])
-    obb_tree.ComputeOBB(poly_data, corner, max_edge, mid_edge, min_edge, sizes)
-
-    # Center mesh on origin
-    trans[0:3, 3] = -(corner + 0.5 * (max_edge + mid_edge + min_edge))
-
-    # Calculate scale and orientation from sample square
-    detected = False
+    # load or generate transform
     new_img = None
-    if args.sample_square_calibration:
-        edges = None
-        if not args.use_marker_dirs:
-            edges = (max_edge, mid_edge, min_edge)
-        detected, scale, rot[0:3, 0:3], new_img = sample_square_calibration(
-            mesh, img, edges)
+    if args.load_transform is not None:
+        print('Loading transform from file...')
+        tfm_mat = np.load(args.load_transform)
+    else:
+        # Setup identity transforms
+        trans = np.eye(4, dtype=np.float32)
+        rot = np.eye(4, dtype=np.float32)
+        scale = np.eye(4, dtype=np.float32)
 
-    # Fallback to bounding box method if sample square disabled/failed
-    if not args.sample_square_calibration or not detected:
-        print('Starting bounding box calibration...')
-        scale, rot[0:3, 0:3] = bounding_box_calibration(poly_data,
-                                                        max_edge,
-                                                        mid_edge,
-                                                        args.max_dir,
-                                                        args.mid_dir,
-                                                        args.flip_max,
-                                                        args.flip_mid)
+        # calculate OBB
+        print('Computing OBB...')
+        obb_tree = vtkOBBTree()
+        corner = np.array([0., 0., 0.])
+        max_edge = np.array([0., 0., 0.])
+        mid_edge = np.array([0., 0., 0.])
+        min_edge = np.array([0., 0., 0.])
+        sizes = np.array([0., 0., 0.])
+        obb_tree.ComputeOBB(poly_data, corner, max_edge, mid_edge, min_edge,
+                            sizes)
 
-    # Setup transform matrix
-    tfm_mat = scale @ rot @ trans
+        # Center mesh on origin
+        trans[0:3, 3] = -(corner + 0.5 * (max_edge + mid_edge + min_edge))
+
+        # Calculate scale and orientation from sample square
+        detected = False
+        if args.sample_square_calibration:
+            edges = None
+            if not args.use_marker_dirs:
+                edges = (max_edge, mid_edge, min_edge)
+            detected, scale, rot[0:3, 0:3], new_img = sample_square_calibration(
+                mesh, img, edges)
+
+        # Fallback to bounding box method if sample square disabled/failed
+        if not args.sample_square_calibration or not detected:
+            print('Starting bounding box calibration...')
+            scale, rot[0:3, 0:3] = bounding_box_calibration(poly_data,
+                                                            max_edge,
+                                                            mid_edge,
+                                                            args.max_dir,
+                                                            args.mid_dir,
+                                                            args.flip_max,
+                                                            args.flip_mid)
+
+        # Setup transform matrix
+        tfm_mat = scale @ rot @ trans
 
     # transform polydata
     print('Transforming mesh...')
@@ -425,6 +437,11 @@ def main():
     transformer.SetInputData(poly_data)
     transformer.SetTransform(tfm)
     transformer.Update()
+
+    # save transform
+    if args.save_transform is not None:
+        print('Saving transform to file...')
+        np.save(args.save_transform, tfm_mat, allow_pickle=False)
 
     # convert back to WavefrontOBJ
     print('Preparing output obj file...')
