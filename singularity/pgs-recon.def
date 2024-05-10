@@ -119,7 +119,7 @@ From: ubuntu:20.04
     - Example command sequence to build fresh container:
       `cd <path_to_project>/singularity`
       `rm -rf /tmp/pgs-recon`
-      `git clone --branch main https://code.cs.uky.edu/seales-research/pgs-recon.git /tmp/pgs-recon`
+      `git clone --branch main https://gitlab.com/educelab/pgs-recon.git /tmp/pgs-recon`
       `sudo singularity build pgs-recon.sif pgs-recon.def`
 
   Preparing for use:
