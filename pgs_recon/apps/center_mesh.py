@@ -82,23 +82,28 @@ def lookup_uv_to_3d(uv_tree, uv_pt, mesh):
 # If a == b, return identity
 # If -a == b, return 180-degree rotation around c
 def align_vector(a, b, c):
-    # Handle cases where a & b are already closely aligned
-    if np.allclose(a, b, atol=1e-7):
-        print('Warning: Axis already aligned. Using identity rotation.')
-        return np.eye(3)
-    if np.allclose(-a, b, atol=1e-7):
-        print('Warning: Axis aligned to inverse basis. Using 180° rotation.')
-        d = np.copysign((1., 1., 1.), np.abs(c) - 1)
-        return np.diagflat(d)
+    # Identity initial rotation
+    r = np.eye(3)
 
-    # Special form of Rodriguez rotation
+    # First, check for anti-parallel vectors at low precision
+    if np.isclose(a.dot(b), -1., atol=1e-3):
+        d = np.copysign((1., 1., 1.), np.abs(c) - 1)
+        r = np.diagflat(d)
+
+    # Next, return early for parallel vectors at high precision
+    a = r @ a
+    if np.isclose(a.dot(b), 1., atol=1e-7):
+        return r
+
+    # Finally, refine the rotation with a special form of Rodriguez rotation
     # https://math.stackexchange.com/a/476311
     v = np.cross(a, b)
     c = np.dot(a, b)
     vx = np.array([[0, -v[2], v[1]],
                    [v[2], 0, -v[0]],
                    [-v[1], v[0], 0]])
-    return np.eye(3) + vx + np.dot(vx, vx) / (1 + c)
+    rod = np.eye(3) + vx + np.dot(vx, vx) / (1 + c)
+    return rod @ r
 
 
 # Find the closest vector to v in vs
@@ -166,7 +171,8 @@ def sample_square_calibration(mesh, img, edges):
 
     # Detect board
     print('Detecting EduceLab sample square...')
-    detected, boards, ppcm, kp_ids, kp_pixels, flip, rotate = el.detect_sample_square(img)
+    detected, boards, ppcm, kp_ids, kp_pixels, flip, rotate = el.detect_sample_square(
+        img)
 
     # Nothing detected
     if not detected:
