@@ -1,11 +1,10 @@
-# Note: OpenMVS requires cv::String which is removed in OpenCV 4+
 option(BUILD_OPENCV "Build OpenCV" ON)
 if(BUILD_OPENCV)
 externalproject_add(
     opencv
     DEPENDS jpeg
-    URL https://github.com/opencv/opencv/archive/refs/tags/3.4.16.tar.gz
-    URL_HASH SHA512=2fa9243625309a1c12c916737c94f0e2f9566f0828469b148cc1683dd1b8db8d1d58f90a36cfcaa72052964a718929451f04cda5361d8b546a63da69217d040a
+    URL https://github.com/opencv/opencv/archive/refs/tags/4.10.0.tar.gz
+    URL_HASH SHA512=b4f7248f89f1cd146dbbae7860a17131cd29bd3cb81db1e678abfcfbf2d8fa4a7633bfd0edbf50afae7b838c8700e8c0d0bb05828139d5cb5662df6bbf3eb92c
     DOWNLOAD_NO_PROGRESS true
     CMAKE_CACHE_ARGS
         ${GLOBAL_CMAKE_ARGS}

@@ -111,6 +111,7 @@ def main():
                           help='robustly triangulate reconstructed scene')
 
     # MVG hidden opts
+    opts_mvg.add_argument('--cam-db', type=str, help=configargparse.SUPPRESS)
     opts_mvg.add_argument('--sfm-ba', action=argparse.BooleanOptionalAction,
                           help=configargparse.SUPPRESS)
     opts_mvg.add_argument('--robust-ba', action=argparse.BooleanOptionalAction,
@@ -127,6 +128,9 @@ def main():
     opts_mvs.add_argument('--mvs-densify',
                           action=argparse.BooleanOptionalAction,
                           help='Enable point cloud densification step')
+    opts_mvs.add_argument('--mvs-refine', default=True,
+                          action=argparse.BooleanOptionalAction,
+                          help='Enable MVS mesh refinement step')
     opts_mvs.add_argument('--mvs-smooth', type=int, default=2,
                           help='Number of smoothing iterations after initial '
                                'surface reconstruction. 0 is disabled.')
@@ -134,8 +138,17 @@ def main():
                           help='how many times to scale down images before '
                                'DensifyPointCloud')
     opts_mvs.add_argument('--refine-resolution-level', default=None, type=int,
-                          help='how many times to scale down images before '
-                               'RefineMesh')
+                          help='scale input images down N times before')
+    opts_mvs.add_argument('--refine-min-resolution', default=None, type=int,
+                          help='do not scale images\' max dimension smaller '
+                               'than this value when using '
+                               '--refine-resolution-level')
+    opts_mvs.add_argument('--refine-scales', default=3, type=int,
+                          help='number of mesh optimization iterations on '
+                               'multi-scale images')
+    opts_mvs.add_argument('--refine-scale-step', default=None, type=float,
+                          help='image scale factor used at each mesh '
+                               'optimization step')
     opts_mvs.add_argument('--texture-resolution-level', default=None, type=int,
                           help='how many times to scale down images before '
                                'TextureMesh')
@@ -143,6 +156,14 @@ def main():
                           help='Decimation factor in range [0..1] to be '
                                'applied to the input surface before mesh '
                                'refinement (0 - auto, 1 - disabled)')
+    opts_mvs.add_argument('--mask-value', type=int,
+                          help='Label value in the image mask to ignore during '
+                               'mesh densification. By default, image masks '
+                               'are ignored during this step.')
+    opts_mvs.add_argument('--texture-max-size', type=int, default=0,
+                          help='Limits the maximum size (edge length) of the'
+                               'output texture image. If set to 0 (default), '
+                               'the edge length is unbounded.')
     args = parser.parse_args()
 
     logger = logging.getLogger("pgs-recon")
@@ -158,8 +179,11 @@ def main():
         paths['input_calib'] = Path(args.import_calib)
     paths['BIN'] = paths['PATH'] / 'bin'
     paths['MVS_BIN'] = paths['BIN'] / 'OpenMVS'
-    db_path = 'share/openMVG/sensor_width_camera_database.txt'
-    paths['CAM_DB'] = paths['PATH'] / db_path
+    if args.cam_db is None:
+        db_path = 'lib/openMVG/sensor_width_camera_database.txt'
+        paths['CAM_DB'] = paths['PATH'] / db_path
+    else:
+        paths['CAM_DB'] = Path(args.cam_db).resolve()
 
     # Setup output directory names
     paths['mvg'] = paths['output'] / 'mvg'
@@ -180,9 +204,11 @@ def main():
     datetime_str = experiment_start.strftime('%Y%m%d%H%M%S')
     if args.name is None:
         args.name = datetime_str + '_' + str(Path(args.input).stem)
+        config = paths['output'] / f'{args.name}_recon_config.txt'
+    else:
+        config = paths['output'] / f'{datetime_str}_{args.name}_recon_config.txt'
 
     # Write config after all arguments have been changed
-    config = paths['output'] / f'{datetime_str}_{args.name}_recon_config.txt'
     args.config = str(config)
     with config.open(mode='w') as file:
         for arg in vars(args):
@@ -270,26 +296,34 @@ def main():
         logger.info('Densifying point cloud')
         mvs_key = mvs_densify(paths, mvs_key=mvs_key,
                               resolution_lvl=args.densify_resolution_level,
+                              mask_value=args.mask_value,
                               metadata=metadata)
 
     # Reconstruct Scene Mesh
     logger.info('Reconstructing mesh')
-    mvs_key = mvs_reconstruct(paths, mvs_key=mvs_key,
+    mvs_key, mesh_key = mvs_reconstruct(paths, mvs_key=mvs_key,
                               free_space=args.free_space_support,
                               smooth=args.mvs_smooth,
                               metadata=metadata)
 
     # Refine Mesh
     logger.info('Refining mesh')
-    mvs_key = mvs_refine(paths, mvs_key=mvs_key,
-                         decimation_factor=args.decimation_factor,
-                         resolution_lvl=args.refine_resolution_level,
-                         metadata=metadata)
+    if args.mvs_refine:
+        mvs_key, mesh_key = mvs_refine(paths, mvs_key=mvs_key,
+                                       mesh_key=mesh_key,
+                                       decimation_factor=args.decimation_factor,
+                                       resolution_lvl=args.refine_resolution_level,
+                                       min_resolution=args.refine_min_resolution,
+                                       scales=args.refine_scales,
+                                       scale_step=args.refine_scale_step,
+                                       metadata=metadata)
 
     # Texture Mesh
     logger.info('Texturing mesh')
-    mvs_texture(paths, mvs_key=mvs_key, file_format=args.file_type,
+    mvs_texture(paths, mvs_key=mvs_key, mesh_key=mesh_key,
+                file_format=args.file_type,
                 resolution_lvl=args.texture_resolution_level,
+                max_size=args.texture_max_size,
                 metadata=metadata, output_name=args.name)
 
     # Add final timestamp
