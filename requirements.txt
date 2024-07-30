@@ -2,7 +2,7 @@ configargparse
 educelab-imgproc>=0.4
 imageio
 matplotlib
-numpy<2.0.0
+numpy
 opencv-python>=4.7
 PyExifTool
 PySfMUtils

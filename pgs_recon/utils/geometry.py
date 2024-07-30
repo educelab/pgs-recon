@@ -13,10 +13,10 @@ from pgs_recon.utils import wavefront as wobj
 class Mesh:
     """Custom mesh class"""
     vertices: np.ndarray = None
-    faces = np.ndarray = None
-    normals = np.ndarray = None
-    uv_coords = np.ndarray = None
-    mtl_ids = np.ndarray = None
+    faces: np.ndarray = None
+    normals: np.ndarray = None
+    uv_coords: np.ndarray = None
+    mtl_ids: np.ndarray = None
 
 
 def wavefront_to_mesh(obj: wobj.WavefrontOBJ) -> Mesh:
