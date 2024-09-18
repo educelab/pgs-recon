@@ -77,22 +77,24 @@ def lookup_uv_to_3d(uv_tree, uv_pt, mesh):
     else:
         return None
 
+# Default align_vector tolerance
+_ALIGN_ATOL = 2e-3
 
 # calculate rotation matrix that aligns vector a to b
 # If a == b, return identity
 # If -a == b, return 180-degree rotation around c
-def align_vector(a, b, c):
+def align_vector(a, b, c, atol=_ALIGN_ATOL):
     # Identity initial rotation
     r = np.eye(3)
 
-    # First, check for anti-parallel vectors at low precision
-    if np.isclose(a.dot(b), -1., atol=1e-3):
+    # First, check for anti-parallel vectors
+    if np.isclose(a.dot(b), -1., atol=atol):
         d = np.copysign((1., 1., 1.), np.abs(c) - 1)
         r = np.diagflat(d)
 
-    # Next, return early for parallel vectors at high precision
+    # Next, return early for parallel vectors
     a = r @ a
-    if np.isclose(a.dot(b), 1., atol=1e-7):
+    if np.isclose(a.dot(b), 1., atol=atol):
         return r
 
     # Finally, refine the rotation with a special form of Rodriguez rotation
@@ -329,6 +331,9 @@ def main():
                               'instead use the mean directions calculated from '
                               'the sample square markers. These are often less '
                               'globally accurate than the bounding box edges.')
+    ss_opts.add_argument('--parallel-atol', type=float,
+                         help='Tolerance for detecting parallel vectors when '
+                              'calculating vector-to-vector rotation.')
 
     bb_opts = parser.add_argument_group('bounding box calibration options')
     bb_opts.add_argument('--max-dir', type=str.lower, choices=['x', 'y', 'z'],
@@ -386,6 +391,12 @@ def main():
         ngen.SetInputData(poly_data)
         ngen.Update()
         poly_data = ngen.GetOutput()
+
+    # overwrite default parallel vec tolerance
+    # better to pass this as a var all the way through to usage, but I'm lazy
+    if args.parallel_atol:
+        global _ALIGN_ATOL
+        _ALIGN_ATOL = args.parallel_atol
 
     # load or generate transform
     new_img = None
