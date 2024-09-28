@@ -282,6 +282,7 @@ def cluster_connected_components(mesh: Mesh):
 
         # iterate over adjacent faces
         queue = deque([i])
+        face_cluster[i] = c_idx
         while queue:
             qf_i = queue.popleft()
             cluster_faces.append(qf_i)
