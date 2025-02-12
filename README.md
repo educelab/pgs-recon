@@ -7,8 +7,8 @@ required executables.
 The Python script uses executables provided by the OpenMVG and OpenMVS projects. The included CMake project will 
 compile both of these projects as well as their dependencies. Before configuring the CMake project, please preinstall 
 the following dependencies:
-* CMake 3.5+
-* Boost 1.48+
+* CMake 3.16+
+* Boost 1.70+
 * GMP and MPFR
 * ExifTool
 * (Optional) NASM (Required by jpeg-turbo)
@@ -17,10 +17,8 @@ the following dependencies:
 
 After the dependencies have been installed, configure and build the CMake project to compile the required executables:
 ```shell
-mkdir build/
-cd build/
-cmake -DCMAKE_BUILD_TYPE=Release ../dependencies/
-make -j
+cmake -S dependencies -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build/
 ```
 
 **Notes**:
