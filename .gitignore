@@ -7,5 +7,5 @@ venv/*
 .idea/*
 **/*.egg-info
 **/*.sif
-build*
+build*/
 *out.txt

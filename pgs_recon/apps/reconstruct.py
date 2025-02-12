@@ -12,11 +12,12 @@ import configargparse
 from pgs_recon.openmvg import (compute_features, compute_matches,
                                geometric_filter, init_sfm_generic,
                                mvg_colorize_sfm, mvg_compute_known, mvg_sfm,
-                               mvg_to_mvs)
+                               mvg_autoscale, mvg_to_mvs)
 from pgs_recon.openmvs import (mvs_densify, mvs_reconstruct, mvs_refine,
                                mvs_texture)
 from pgs_recon.pgs_data import init_sfm_pgs
 from pgs_recon.utility import current_timestamp
+from pgs_recon.utils.apps import setup_logging
 
 
 def main():
@@ -43,6 +44,8 @@ def main():
                         help='When importing a PGS Scan, merge provided PGS '
                              'calibration file with the imported camera '
                              'configurations.')
+    parser.add_argument('--log-level', default='INFO', type=str.upper,
+                        choices=['ERROR', 'WARNING', 'INFO', 'DEBUG'])
 
     # Hidden opts
     parser.add_argument('--path', type=str, default='/usr/local/',
@@ -52,7 +55,7 @@ def main():
     opts_desc = parser.add_argument_group('describer options')
     opts_desc.add_argument('--describer-method',
                            choices=['SIFT', 'AKAZE_FLOAT', 'AKAZE_MLDB'],
-                           default="SIFT",
+                           default='SIFT',
                            type=str.upper,
                            help="Set the feature descriptors method.")
     opts_desc.add_argument('--describer-preset',
@@ -73,7 +76,7 @@ def main():
                                        'CASCADEHASHINGL2',
                                        'FASTCASCADEHASHINGL2',
                                        'BRUTEFORCEHAMMING'],
-                              default="FASTCASCADEHASHINGL2", type=str.upper,
+                              default='FASTCASCADEHASHINGL2', type=str.upper,
                               help='Feature matching method.')
     opts_matcher.add_argument('--matching-geometric-model',
                               choices=['f', 'e', 'h', 'a', 'u', 'o'],
@@ -109,6 +112,31 @@ def main():
     opts_mvg.add_argument('--mvg-robust', '-r',
                           action=argparse.BooleanOptionalAction,
                           help='robustly triangulate reconstructed scene')
+    opts_mvg.add_argument('--mvg-autoscale', type=float,
+                          help='use pgs-global-scaler to automatically scale '
+                               'aruco markers to the provided size in '
+                               'real world units. see the pgs-global-scaler '
+                               '--marker-size flag for more information')
+    opts_mvg.add_argument('--autoscale-method', default='markers',
+                          choices=['markers', 'sample-square'],
+                          help='marker detection method. see the '
+                               'pgs-global-scaler --detection-method flag '
+                               'for more information'
+                          )
+    opts_mvg.add_argument('--autoscale-marker-pix', type=int,
+                          help="Minimum marker size in pixels. see the "
+                               "pgs-global-scaler --min-marker-size flag "
+                               "for more information")
+    opts_mvg.add_argument('--autoscale-include-from',
+                          help='text file containing a list of scene image '
+                               'files to be exclusively considered during '
+                               'auto-scaling. see the pgs-global-scaler '
+                               '--include-from flag for more information')
+    opts_mvg.add_argument('--autoscale-exclude-from',
+                          help='text file containing a list of scene image '
+                               'files to be excluded during auto-scaling. '
+                               'see the pgs-global-scaler --exclude-from flag '
+                               'for more information')
 
     # MVG hidden opts
     opts_mvg.add_argument('--cam-db', type=str, help=configargparse.SUPPRESS)
@@ -166,6 +194,7 @@ def main():
                                'the edge length is unbounded.')
     args = parser.parse_args()
 
+    setup_logging(args.log_level)
     logger = logging.getLogger("pgs-recon")
 
     # Structure for storing important paths
@@ -272,6 +301,17 @@ def main():
                           refine_intrinsics=args.mvg_refine_intrinsics,
                           initializer=args.mvg_initializer,
                           metadata=metadata)
+
+    # Auto-scale
+    if args.mvg_autoscale is not None:
+        logger.info('Auto-scaling SfM scene')
+        sfm_key = mvg_autoscale(paths=paths,
+                                sfm_key=sfm_key,
+                                marker_size=args.mvg_autoscale,
+                                detection_method=args.autoscale_method,
+                                marker_pix=args.autoscale_marker_pix,
+                                include_from=args.autoscale_include_from,
+                                exclude_from=args.autoscale_exclude_from)
 
     # Colorize reconstructed scene
     logger.info('Colorizing SfM scene')

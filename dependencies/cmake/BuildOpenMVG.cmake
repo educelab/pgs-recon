@@ -14,3 +14,13 @@ ExternalProject_Add(
         -DOpenMVG_BUILD_EXAMPLES:BOOL=OFF
         -DOpenMVG_BUILD_GUI_SOFTWARES:BOOL=OFF
 )
+ExternalProject_Get_Property(openMVG SOURCE_DIR)
+ExternalProject_Add_Step(
+    openMVG
+    extra_patch
+    COMMENT "Performing patch step #2 for 'openMVG'"
+    COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVG-v2.1-FixExpectOpenMP.diff || true
+    WORKING_DIRECTORY ${SOURCE_DIR}
+    DEPENDEES patch
+    DEPENDERS configure
+)

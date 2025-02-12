@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
 #### Initialize cache variables ####
 get_property(multiConfig GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
@@ -69,3 +69,6 @@ include(BuildOpenMVG)
 
 ### openMVS ###
 include(BuildOpenMVS)
+
+### pgs-recon-utilities
+include(BuildPGSUtils)

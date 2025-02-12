@@ -104,6 +104,35 @@ def mvg_sfm(paths: Dict[str, Path], sfm_key: str, engine: str, use_priors=False,
     return 'sfm_recon'
 
 
+def mvg_autoscale(paths: Dict[str, Path], sfm_key: str, marker_size: float,
+                  detection_method: str = 'markers', marker_pix: int = None,
+                  include_from: str = None, exclude_from: str = None,
+                  metadata: Dict = None) -> str:
+    """Run pgs-global-scaler"""
+    out_key = sfm_key + '_scaled'
+    in_path = paths[sfm_key]
+    paths[out_key] = paths['recon_dir'] / (in_path.stem + '_scaled.bin')
+    command = [
+        str(paths['BIN'] / 'pgs-global-scaler'),
+        '-i', str(paths[sfm_key]),
+        '-o', str(paths[out_key]),
+        '-s', str(marker_size),
+        '-m', detection_method,
+        '--save-landmarks', str(paths['recon_dir'] / 'landmarks.ply'),
+        '--save-scaled-landmarks', str(paths['recon_dir'] / 'landmarks_scaled.ply')
+    ]
+    if marker_pix is not None:
+        command.extend(['--min-marker-pix', str(marker_pix)])
+    if include_from is not None:
+        command.extend(['--include-from', str(include_from)])
+    if exclude_from is not None:
+        command.extend(['--exclude-from', str(exclude_from)])
+    if metadata is not None:
+        metadata['commands'][current_timestamp()] = (str(' ').join(command))
+    run_command(command)
+    return out_key
+
+
 def mvg_compute_known(paths: Dict[str, Path], sfm_key: str,
                       direct: bool = False, bundle_adjustment: bool = False,
                       metadata: Dict = None) -> str:
