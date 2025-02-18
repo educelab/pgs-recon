@@ -13,6 +13,13 @@ from sfm_utils.openmvg import __OPENMVG_CAMDB_DEFAULT_PATH
 
 from pgs_recon.utility import current_timestamp
 
+def get_tag_option(tags, opts):
+    """Return the value of the first key in `opts` that is present in `tags`"""
+    for o in opts:
+        if o in tags.keys():
+            return tags[o]
+    raise KeyError(f'key option not found: {opts}')
+
 
 def load_cam_calib(calib_path: Path) -> dict:
     with calib_path.open() as f:
@@ -70,8 +77,8 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict,
         # Setup view
         view = sfm.View()
         view.path = img
-        view.width = tags['File:ImageWidth']
-        view.height = tags['File:ImageHeight']
+        view.width = get_tag_option(tags, ['File:ImageWidth', 'EXIF:ImageWidth'])
+        view.height = get_tag_option(tags, ['File:ImageHeight', 'EXIF:ImageHeight'])
         view.make = tags['EXIF:Make']
         view.model = tags['EXIF:Model']
 

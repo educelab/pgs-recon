@@ -3,7 +3,8 @@ ExternalProject_Add(
     DEPENDS eigen jpeg
     GIT_REPOSITORY https://github.com/openMVG/openMVG.git
     GIT_TAG 6d6b1dd
-    DOWNLOAD_NO_PROGRESS true
+    DOWNLOAD_NO_PROGRESS ON
+    DOWNLOAD_EXTRACT_TIMESTAMP OFF
     SOURCE_SUBDIR src
     PATCH_COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVG-v1.6-UpdateSensorDB.diff || true
     CMAKE_CACHE_ARGS
