@@ -7,7 +7,9 @@ import sys
 from datetime import datetime as dt, timezone as tz
 from pathlib import Path
 
+import exiftool
 import configargparse
+import sfm_utils as sfm
 
 from pgs_recon.openmvg import (compute_features, compute_matches,
                                geometric_filter, init_sfm_generic,
@@ -15,9 +17,80 @@ from pgs_recon.openmvg import (compute_features, compute_matches,
                                mvg_autoscale, mvg_to_mvs)
 from pgs_recon.openmvs import (mvs_densify, mvs_reconstruct, mvs_refine,
                                mvs_texture)
-from pgs_recon.pgs_data import init_sfm_pgs
+from pgs_recon.pgs_data import init_sfm_pgs, get_tag_option
 from pgs_recon.utility import current_timestamp
 from pgs_recon.utils.apps import setup_logging
+
+
+def init_sfm_generic2(scan_dir: Path, sfm_file: Path, camdb_path: Path):
+    """Init an SfM scene from the given directory"""
+    logger = logging.getLogger(__name__)
+    # Load the camera db
+    cam_db = sfm.openmvg_load_camdb(camdb_path)
+
+    # Get a list of files
+    extensions = {'.tif', '.tiff', '.jpg', '.jpeg', '.png'}
+    extensions = extensions.union([ext.upper() for ext in extensions])
+    all_files = list(scan_dir.glob(f'*.*'))
+    all_files.sort()
+    images = []
+    for f in all_files:
+        if 'mask.png' in str(f):
+            logger.warning(f'{str(f.name)} is a mask image')
+        elif Path(f).suffix in extensions:
+            images.append(f)
+        else:
+            logger.debug(f'Ignoring file: {str(f.name)}')
+    if len(images) == 0:
+        logger.error(
+            'Provided scan metadata specifies file pattern, but no files match.')
+        raise RuntimeError()
+
+    # Get image metadata
+    with exiftool.ExifToolHelper() as et:
+        img_metadata = et.get_metadata([str(i) for i in images])
+
+    # Setup sfm
+    scene = sfm.Scene()
+    scene.root_dir = scan_dir
+
+    # Fill out sfm with data
+    for img in images:
+        # Lookup this images tags
+        tags = next((i for i in img_metadata if i['File:FileName'] == img.name),
+                    None)
+        if tags is None:
+            logger.error(f'No tags loaded for image: {str(img.name)}')
+            continue
+
+        # Setup view
+        view = sfm.View()
+        view.path = img
+        view.width = get_tag_option(tags, ['File:ImageWidth', 'EXIF:ImageWidth'])
+        view.height = get_tag_option(tags, ['File:ImageHeight', 'EXIF:ImageHeight'])
+        view.make = tags['EXIF:Make']
+        view.model = tags['EXIF:Model']
+
+        # Setup intrinsic
+        intrinsic = sfm.IntrinsicRadialK3()
+        intrinsic.width = view.width
+        intrinsic.height = view.height
+        intrinsic.focal_length = tags['EXIF:FocalLength']
+        if f'{view.make} {view.model}' in cam_db.keys():
+            intrinsic.sensor_width = cam_db[f'{view.make} {view.model}']
+        elif f'{view.model}' in cam_db.keys():
+            intrinsic.sensor_width = cam_db[f'{view.model}']
+        else:
+            logger.warning(
+                f'Camera not in database: {view.make} {view.model}. Ignoring file: {img.name}')
+            continue
+
+        # Only add everything to the SfM at the end
+        scene.add_view(view)
+        view.intrinsic = scene.add_intrinsic(intrinsic)
+        view.pose = scene.add_pose(sfm.Pose())
+
+    sfm.export_scene(path=sfm_file, scene=scene)
 
 
 def main():
@@ -36,6 +109,8 @@ def main():
                         help='Output format for final textured mesh')
     parser.add_argument('--focal-length', '-f', type=int, default=None,
                         help='focal length in pixels', metavar='n')
+    parser.add_argument('--new-importer', default=False,
+                        action=argparse.BooleanOptionalAction)
     parser.add_argument('--import-pgs-scan', '-p',
                         action=argparse.BooleanOptionalAction,
                         help='Input directory is assumed to be a PGS Scan '
@@ -267,6 +342,10 @@ def main():
     logger.info('Importing dataset')
     if args.import_pgs_scan:
         init_sfm_pgs(paths, metadata=metadata)
+    elif args.new_importer:
+        init_sfm_generic2(paths['input'].resolve(),
+                          sfm_file=paths['sfm'],
+                          camdb_path=paths['CAM_DB'])
     else:
         init_sfm_generic(paths, focal_length=args.focal_length,
                          metadata=metadata)
