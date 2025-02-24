@@ -1,8 +1,10 @@
 import argparse
 import json
 import logging
+import os
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime as dt, timezone as tz
 from pathlib import Path
 
@@ -80,6 +82,11 @@ def main():
     file_opts.add_argument('--filter-cap', type=int, metavar='INT',
                            help='Filter by capture index')
 
+    perf_opts = parser.add_argument_group('performance options')
+    perf_opts.add_argument('--threads', '-t', type=int,
+                           help="Maximum number of threads to use when "
+                                "converting images")
+
     # add the enhancement pipeline options
     enhance_opts = pipeline.add_parser_enhancement_group(parser)
 
@@ -150,6 +157,13 @@ def main():
     # Setup output directory
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # If we're on a SLURM node, os.cpu_count returns the hardware CPUs, which is
+    # not necessarily what's available to the job. To avoid deadlocks, override
+    # the default with what's actually usable.
+    if args.threads is None and 'SLURM_JOB_CPUS_PER_NODE' in os.environ.keys():
+        args.threads = int(os.environ['SLURM_JOB_CPUS_PER_NODE'])
+    logger.debug(f'Max worker threads: {"auto" if args.threads is None else args.threads}')
+
     # Write config before convert
     write_config(args)
 
@@ -162,14 +176,14 @@ def main():
     with meta_path.open('w', encoding='utf8') as f:
         json.dump(meta, f, indent=4)
 
-    # Convert images
-    for img_path in tqdm(images, desc='Converting images'):
+    # Define conversion function
+    def convert_image(p) -> bool:
         # Load image
         try:
-            img = iio.imread(img_path)
+            img = iio.imread(p)
         except ValueError:
-            logger.error(f'Failed to load file: {str(img_path)}')
-            continue
+            logger.error(f'Failed to load file: {str(p)}')
+            return False
         in_dtype = img.dtype
 
         # Convert to float for processing
@@ -198,9 +212,26 @@ def main():
             kwargs['compressionargs'] = {'level': 9}
 
         # Save the image to disk
-        out_file = img_path.with_suffix(f'.{args.file_type}').name
+        out_file = p.with_suffix(f'.{args.file_type}').name
         out_path = output_dir / out_file
         iio.imwrite(out_path, img, **kwargs)
+        return True
+
+    # Convert images (single-threaded)
+    if args.threads == 1:
+        results = []
+        for p in tqdm(images, desc='Converting images'):
+            results.append(convert_image(p))
+    # Convert images (multithreaded)
+    else:
+        with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            futures = executor.map(convert_image, images)
+            results = list(
+                tqdm(futures, total=len(images), desc='Converting images'))
+    # Report success
+    num_failed = results.count(False)
+    if num_failed > 0:
+        logger.warning(f'{num_failed} images failed to convert.')
 
     # Setup metadata copy
     cmd = ['exiftool', '-q', '-P', '-overwrite_original']
