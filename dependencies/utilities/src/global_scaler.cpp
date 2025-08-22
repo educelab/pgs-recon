@@ -1,26 +1,32 @@
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
-#include <map>
-#include <optional>
+#include <numeric>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include <boost/program_options.hpp>
+
 #include <educelab/core/utils/Filesystem.hpp>
 #include <educelab/core/utils/String.hpp>
+
 #include <indicators/progress_bar.hpp>
+
 #include <openMVG/cameras/Camera_Pinhole.hpp>
 #include <openMVG/geometry/Similarity3.hpp>
 #include <openMVG/multiview/triangulation_nview.hpp>
 #include <openMVG/sfm/sfm_data.hpp>
 #include <openMVG/sfm/sfm_data_io.hpp>
 #include <openMVG/sfm/sfm_data_transform.hpp>
+
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/core/eigen.hpp>
@@ -30,7 +36,12 @@
 #include <opencv2/objdetect/aruco_detector.hpp>
 #include <opencv2/objdetect/charuco_detector.hpp>
 
+#include <Eigen/Core>
+#include <Eigen/Geometry>
+
 #include "RANSAC.hpp"
+#include "global_scaler_io.hpp"
+#include "global_scaler_types.hpp"
 
 namespace ar = cv::aruco;
 namespace el = educelab;
@@ -40,59 +51,7 @@ using namespace openMVG;
 using namespace indicators;
 using namespace ransac;
 
-namespace pgs {
-/** Index number of image in SfM */
-using ViewID = openMVG::IndexT;
-/** List of a landmark's observations and the view where it was found */
-using Observations = std::vector<std::pair<ViewID, Vec2>>;
-
-/** Landmark: A collection of 2D observations and the triangulated 3D point */
-struct Landmark {
-  Landmark() = default;
-  explicit Landmark(std::string id) : id{std::move(id)} {}
-  std::string id;
-  Observations obs;
-  std::optional<Vec3> X;
-};
-
-/** Collection of landmarks indexed by ID */
-using Landmarks = std::map<std::string, Landmark>;
-} // namespace pgs
-
 namespace {
-// Known distance maps for the EduceLab Sample Square
-/*
-using IDPair = std::pair<int, int>;
-using DistanceMap = std::map<IDPair, double>;
-
-auto init_distance_map() -> DistanceMap {
-    // relative marker positions in cm
-    std::array<cv::Vec2d, 4> markerPos = {{
-        {0.866666666666667, 0.2},
-        {0.2, 0.866666666666667},
-        {1.533333333333334, 0.866666666666667},
-        {0.866666666666667, 1.533333333333334}
-    }};
-
-    DistanceMap res;
-    for (std::size_t i = 0; i < 4; i++) {
-        for (std::size_t j = 0; j < 4; j++) {
-            if (i == j or res.contains({i, j})) {
-                continue;
-            }
-            const auto d = cv::norm(markerPos[j] - markerPos[i]);
-            res.insert({{i, j}, d});
-            res.insert({{j, i}, d});
-            res.insert({{i + 512, j + 512}, d});
-            res.insert({{j + 512, i + 512}, d});
-        }
-    }
-    return res;
-}
-
-auto DistanceMapCM = init_distance_map();
-*/
-
 /** List of ArUco IDs */
 using IDList = std::vector<int>;
 /** List of a single ArUco marker's corner locations */
@@ -111,9 +70,9 @@ struct DetectionResult {
 struct RansacObservation {
   using Cam = std::shared_ptr<cameras::IntrinsicBase>;
   RansacObservation() = default;
-  RansacObservation(const Vec2 &obs, const Vec3 &pt, const Cam &cam,
-                    const geometry::Pose3 &pose)
-      : obs{obs}, pt{pt}, cam{cam}, pose{pose} {}
+  RansacObservation(Vec2 obs, Vec3 pt, Cam cam, geometry::Pose3 pose)
+      : obs{std::move(obs)}, pt{std::move(pt)}, cam{std::move(cam)},
+        pose{std::move(pose)} {}
   Vec2 obs;
   Vec3 pt;
   Cam cam;
@@ -176,7 +135,7 @@ auto EvalTriangulate(const std::vector<RansacObservation> &x, const Vec3 &X)
   }
 
   // calculate fitness and rmse
-  if (result.inliers.size() > 0) {
+  if (not result.inliers.empty()) {
     result.fitness = static_cast<double>(result.inliers.size()) /
                      static_cast<double>(x.size());
     result.inlier_rmse =
@@ -308,7 +267,7 @@ auto UndistortImage(const cv::Mat &image, cameras::IntrinsicBase *cam)
   }
 
   // Calculate the new matrix for cv::undistort
-  cv::Size size(image.cols, image.rows);
+  const cv::Size size(image.cols, image.rows);
   cv::Rect roi;
   mtx = cv::getOptimalNewCameraMatrix(mtx, dist, size, 0., size, &roi);
   cv::Mat result;
@@ -329,79 +288,165 @@ void ScaleLandmarks(pgs::Landmarks &ldms, const double scale) {
   }
 }
 
-void WriteOBJ(const fs::path &path, const pgs::Landmarks &ldms) {
-  // Open the file
-  std::ofstream file{path};
-  if (not file.is_open()) {
-    throw std::runtime_error("Cannot open file for writing: " + path.string());
-  }
+struct ScaleStats {
+  /** per-marker scale estimates */
+  std::vector<double> scales;
+  /** final scale factor (the median or mean, depending on method) */
+  double summary{1};
+};
 
-  // Write vertices
-  for (const auto &[_, ldm] : ldms) {
-    if (ldm.X) {
-      const auto &pt = ldm.X.value();
-      file << "v " << pt.x() << " " << pt.y() << " " << pt.z() << "\n";
+/**
+ * Compute per‐marker scale estimates via Umeyama + weighted median.
+ */
+auto ComputeUmeyamaScaleStats(const pgs::Landmarks &landmarks,
+                              const std::set<int> &markerIDs,
+                              double markerSize) -> ScaleStats
+{
+  // Helper type for collecting measurements
+  struct SW {
+    double scale, weight;
+  };
+  std::vector<SW> sws;
+  sws.reserve(markerIDs.size());
+
+  // Reference corner positions in marker‐local frame:
+  const std::array<Vec3,4> refCorners = {{
+    {0.0,          0.0,         0.0},
+    {markerSize,   0.0,         0.0},
+    {markerSize,   markerSize,  0.0},
+    {0.0,          markerSize,  0.0}
+  }};
+
+  // Build one similarity per marker
+  for (const auto &mID : markerIDs) {
+    std::vector<Vec3> P_ref, P_obs;
+    P_ref.reserve(4);
+    P_obs.reserve(4);
+
+    for (int c = 0; c < 4; ++c) {
+      auto it = landmarks.find(GetLandmarkID(mID, c));
+      if (it != landmarks.end() && it->second.X) {
+        P_ref.push_back(refCorners[c]);
+        P_obs.push_back(it->second.X.value());
+      }
     }
-  }
-
-  // Close file
-  file.flush();
-  file.close();
-  if (file.fail()) {
-    throw std::runtime_error("Failed to write file: " + path.string());
-  }
-}
-
-void WritePLY(const fs::path &path, const pgs::Landmarks &ldms) {
-  // Iterate the vertices first
-  std::size_t numVs{0};
-  std::stringstream ss;
-  for (const auto &[_, ldm] : ldms) {
-    if (ldm.X) {
-      ++numVs;
-      const auto &pt = ldm.X.value();
-      ss << pt.x() << " " << pt.y() << " " << pt.z() << " ";
-      ss << 255 << " " << 255 << " " << 0 << "\n";
+    if (P_obs.size() < 3) {
+      // need ≥3 to solve
+      continue;
     }
+
+    // Pack into 3×N mats
+    const auto N = P_obs.size();
+    Mat3X M_ref(3, static_cast<int>(N)), M_obs(3, static_cast<int>(N));
+    for (std::size_t i = 0; i < N; ++i) {
+      M_ref.col(static_cast<int>(i)) = P_ref[i];
+      M_obs.col(static_cast<int>(i)) = P_obs[i];
+    }
+
+    // Umeyama obs→ref
+    Eigen::Matrix4d T = Eigen::umeyama(M_obs, M_ref, true);
+
+    // Extract scale = norm of first column of R*s
+    const double s = T.block<3, 3>(0, 0).col(0).norm();
+    sws.push_back({s, static_cast<double>(N)});
   }
 
-  // Open the file
-  std::ofstream file{path};
-  if (not file.is_open()) {
-    throw std::runtime_error("Cannot open file for writing: " + path.string());
+  ScaleStats stats;
+  // collect just the scales for the histogram
+  stats.scales.reserve(sws.size());
+  for (auto &[scale, weight] : sws) {
+    stats.scales.push_back(scale);
   }
-  // Write the header
-  file << "ply\n";
-  file << "format ascii 1.0\n";
-  file << "element vertex " << numVs << "\n";
-  file << "property float x\n";
-  file << "property float y\n";
-  file << "property float z\n";
-  file << "property uchar red\n";
-  file << "property uchar green\n";
-  file << "property uchar blue\n";
-  file << "end_header\n";
 
-  // Write vertices
-  file << ss.rdbuf();
-
-  // Close file
-  file.flush();
-  file.close();
-  if (file.fail()) {
-    throw std::runtime_error("Failed to write file: " + path.string());
-  }
-}
-
-void WriteMesh(const fs::path &path, const pgs::Landmarks &ldms) {
-  if (el::is_file_type(path, "obj")) {
-    WriteOBJ(path, ldms);
-  } else if (el::is_file_type(path, "ply")) {
-    WritePLY(path, ldms);
+  if (sws.empty()) {
+    // no valid markers
+    std::cerr << "WARNING: no markers yielded ≥3 corners; defaulting scale=1\n";
+    stats.summary = 1.0;
   } else {
-    throw std::runtime_error("ERROR: Unrecognized mesh type: " +
-                             path.extension().string());
+    // sort by scale
+    std::sort(sws.begin(), sws.end(),
+              [](auto &a, auto &b) { return a.scale < b.scale; });
+
+    // total weight
+    const auto W = std::accumulate(
+        sws.begin(), sws.end(), 0.0,
+        [](const auto &l, const auto &r) { return l + r.weight; });
+    const auto half = 0.5 * W;
+
+    // precompute weighted mean (fallback)
+    auto mean_s = std::accumulate(
+        sws.begin(), sws.end(), 0.0,
+        [](const auto &l, const auto &r) { return l + r.scale * r.weight; });
+    mean_s /= W;
+
+    // default to mean
+    stats.summary = mean_s;
+
+    // try weighted median
+    double cum = 0.0;
+    bool found = false;
+    for (const auto &[scale, weight] : sws) {
+      cum += weight;
+      if (cum >= half) {
+        stats.summary = scale;
+        found = true;
+        break;
+      }
+    }
+
+    if (not found) {
+      std::cerr << "WARNING: weighted median failed! falling back to weighted "
+                   "mean: "
+                << stats.summary << "\n";
+    }
   }
+
+  return stats;
+}
+
+/**
+ * Compute scale by measuring each marker’s edge length vs. the known
+ * markerSize.
+ *
+ * landmarks   : map from “markerID.cornerID” → triangulated Vec3
+ * markerIDs   : set of all detected marker IDs
+ * markerSize  : the *true* length (in your desired world units) of each marker
+ * edge
+ *
+ * Returns a list of (expected/observed) scale factors for every adjacent‐corner
+ * pair plus their mean.
+ */
+auto ComputeEdgeScaleStats(const pgs::Landmarks &landmarks,
+                           const std::set<int> &markerIDs,
+                           const double markerSize) -> ScaleStats {
+  ScaleStats stats;
+  for (const auto &markerID : markerIDs) {
+    // Keep a list of observed and expected distances
+    for (int i = 0; i < 4; i++) {
+      const auto nI = (i + 1) % 4;
+      auto c0 = landmarks.at(GetLandmarkID(markerID, i)).X;
+      auto c1 = landmarks.at(GetLandmarkID(markerID, nI)).X;
+      if (not c0 or not c1) {
+        continue;
+      }
+
+      const auto distExpected = markerSize;
+      const auto distObserved = (c1.value() - c0.value()).norm();
+      stats.scales.emplace_back(distExpected / distObserved);
+    }
+  }
+  if (stats.scales.empty()) {
+    std::cerr
+        << "WARNING: No landmark distances calculated! Defaulting to scale=1\n";
+    stats.summary = 1.0;
+  } else {
+    std::cout << "Calculating scale factor from " << stats.scales.size()
+              << " distance measurements\n";
+    const auto sum =
+        std::accumulate(stats.scales.begin(), stats.scales.end(), 0.0);
+    stats.summary = sum / static_cast<double>(stats.scales.size());
+  }
+  return stats;
 }
 
 enum EXIT_CODE {
@@ -412,7 +457,7 @@ enum EXIT_CODE {
   NO_LDMS = 4,
   NO_SCALES = 5
 };
-}
+} // namespace
 
 auto LoadFilterFile(const fs::path &path) {
   // Open the file
@@ -439,6 +484,10 @@ auto main(int argc, char* argv[]) -> int
     ("help,h", "print help message")
     ("input-scene,i", po::value<std::string>()->required(), "input sfm scene file")
     ("output-scene,o", po::value<std::string>(), "output sfm scene file")
+    ("scale-method", po::value<std::string>()->default_value("umeyama"), R"(scale method: "umeyama" (weighted-median) or "edge" (mean of edge lengths))")
+    ("input-mesh",  po::value<std::string>(), "input mesh file (ascii .ply only)")
+    ("output-mesh", po::value<std::string>(), "output (scaled) mesh file (.ply)")
+    ("histogram-out",         po::value<std::string>(), "where to write the scale‐histogram SVG")
     ("marker-size,s", po::value<double>()->required(), "ArUco marker size in desired world units")
     ("detection-method,m", po::value<std::string>()->default_value("markers"), "detection method: markers, sample-square")
     ("sfm-root", po::value<std::string>(), "use the given directory as the sfm root when loading image files")
@@ -463,11 +512,19 @@ auto main(int argc, char* argv[]) -> int
   }
   po::notify(args);
 
+  auto scaleMethod = el::to_lower_copy(args["scale-method"].as<std::string>());
+  if (scaleMethod != "umeyama" && scaleMethod != "edge") {
+    std::cerr << "ERROR: --scale-method must be \"umeyama\" or \"edge\"\n";
+    return BAD_ARG;
+  }
   // Get the input and output files
   fs::path sfmPath = args["input-scene"].as<std::string>();
 
   // Marker size (0.47 cm for the sample square)
   auto markerSize = args["marker-size"].as<double>();
+
+  // Write a histogram if requested
+  bool doHistogram = args.count("histogram-out") > 0;
 
   // Detection method
   auto method = el::to_lower_copy(args["detection-method"].as<std::string>());
@@ -483,7 +540,8 @@ auto main(int argc, char* argv[]) -> int
   ar::DetectorParameters params;
   params.useAruco3Detection = true;
   params.detectInvertedMarker = args["detect-inverted"].as<bool>();
-  auto minMarkerSize = static_cast<double>(args["min-marker-pix"].as<int>());
+  params.cornerRefinementMethod = ar::CORNER_REFINE_SUBPIX;
+  auto minMarkerSize = static_cast<float>(args["min-marker-pix"].as<int>());
 
   // Boolean options
   auto undistortImages = args["undistort-images"].as<bool>();
@@ -584,7 +642,7 @@ auto main(int argc, char* argv[]) -> int
 
     // Detect markers
     params.minMarkerLengthRatioOriginalImg =
-        minMarkerSize / static_cast<double>(std::max(image.rows, image.cols));
+        minMarkerSize / static_cast<float>(std::max(image.rows, image.cols));
     auto res = detect(image, params);
 
     if (not res.markerIds.empty()) {
@@ -688,48 +746,38 @@ auto main(int argc, char* argv[]) -> int
     return NO_LDMS;
   }
 
-  // Measure marker sizes
-  std::cout << "Measuring landmark distances\n";
-  std::vector<double> scales;
-  for (const auto &markerID : markerIDs) {
-    // Keep a list of observed and expected distances
-    for (int i = 0; i < 4; i++) {
-      const auto nI = i == 3 ? 0 : i + 1;
-      auto c0 = landmarks[GetLandmarkID(markerID, i)].X;
-      auto c1 = landmarks[GetLandmarkID(markerID, nI)].X;
-      if (not c0 or not c1) {
-        continue;
-      }
-
-      auto distExpected = markerSize;
-      auto distObserved = (c1.value() - c0.value()).norm();
-      scales.emplace_back(distExpected / distObserved);
-    }
-  }
-  if (scales.empty()) {
-    std::cout << "ERROR: No landmark distances calculated!\n";
-    return NO_SCALES;
+  // Decide which stats to compute
+  ScaleStats stats;
+  if (scaleMethod == "edge") {
+    stats = ComputeEdgeScaleStats(landmarks, markerIDs, markerSize);
+    std::cout << "Edge-length mean scale: " << stats.summary << "\n";
+  } else {
+    stats = ComputeUmeyamaScaleStats(landmarks, markerIDs, markerSize);
+    std::cout << "Umeyama median scale:   " << stats.summary << "\n";
   }
 
-  // Calculate the scale
-  std::cout << "Calculating scale factor from " << scales.size()
-            << " distance measurements\n";
-  if (scales.size() < 10) {
-    std::cout << "WARNING: Final scale factor may be sensitive to noise!\n";
+  // Save a histogram file
+  if (doHistogram) {
+    fs::path histPath = args["histogram-out"].as<std::string>();
+    auto label = (scaleMethod == "edge") ? "mean" : "median";
+    std::cout << "Saving histogram file: " << histPath << "\n";
+    pgs::WriteScaleHistogram(histPath, stats.scales, stats.summary, label);
   }
-  auto scale =
-      std::accumulate(scales.begin(), scales.end(), 0.,
-                      [&scales](const auto &a, const auto &b) {
-                        return a + b / static_cast<double>(scales.size());
-                      });
-  std::cout << "Calculated scale factor: " << scale << "\n";
 
   // Scale and save the scene
   if (args.count("output-scene") > 0) {
     fs::path outPath = args["output-scene"].as<std::string>();
     std::cout << "Saving scaled SfM data\n";
-    sfm::ApplySimilarity({{}, scale}, sfmData);
+    sfm::ApplySimilarity({{}, stats.summary}, sfmData);
     sfm::Save(sfmData, outPath.string(), sfm::ALL);
+  }
+
+  // Scale and save a mesh
+  if (args.count("input-mesh") && args.count("output-mesh")) {
+    fs::path inPath = args["input-mesh"].as<std::string>();
+    fs::path outPath = args["output-mesh"].as<std::string>();
+    std::cout << "Saving scaled mesh: " << outPath << "\n";
+    pgs::ScalePLYMesh(inPath, outPath, stats.summary);
   }
 
   // Write the landmarks mesh
@@ -737,16 +785,16 @@ auto main(int argc, char* argv[]) -> int
     std::cout << "Saving unscaled landmark mesh\n";
     fs::path ldmMesh = args["save-landmarks"].as<std::string>();
     fs::create_directories(fs::weakly_canonical(ldmMesh).parent_path());
-    WriteMesh(ldmMesh, landmarks);
+    pgs::WriteMesh(ldmMesh, landmarks);
   }
 
-  // Write the landmarks mesh
+  // Write the scaled landmarks mesh
   if (args.count("save-scaled-landmarks") > 0 and not markerIDs.empty()) {
     std::cout << "Saving scaled landmark mesh\n";
     fs::path ldmMesh = args["save-scaled-landmarks"].as<std::string>();
-    ScaleLandmarks(landmarks, scale);
+    ScaleLandmarks(landmarks, stats.summary);
     fs::create_directories(fs::weakly_canonical(ldmMesh).parent_path());
-    WriteMesh(ldmMesh, landmarks);
+    pgs::WriteMesh(ldmMesh, landmarks);
   }
   std::cout << "Done.\n";
 }

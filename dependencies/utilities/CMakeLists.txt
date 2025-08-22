@@ -6,27 +6,32 @@ project(pgs-recon-utils VERSION 1.0.0)
 find_package(OpenMVG REQUIRED)
 find_package(OpenCV 4.7 REQUIRED)
 find_package(Eigen3 3.3 REQUIRED)
-find_package(Boost 1.70 CONFIG REQUIRED COMPONENTS system program_options)
+find_package(Boost 1.70 CONFIG REQUIRED COMPONENTS program_options)
 
 # header-only dependencies
 include(FetchContent)
 FetchContent_Declare(
-        libcore
-        GIT_REPOSITORY https://github.com/educelab/libcore.git
-        GIT_TAG c061afd
-        EXCLUDE_FROM_ALL
+    libcore
+    GIT_REPOSITORY https://github.com/educelab/libcore.git
+    GIT_TAG c061afd
+    EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(libcore)
 FetchContent_Declare(
-        indicators
-        GIT_REPOSITORY https://github.com/p-ranav/indicators.git
-        GIT_TAG ac6c93e
-        EXCLUDE_FROM_ALL
+    indicators
+    GIT_REPOSITORY https://github.com/p-ranav/indicators.git
+    GIT_TAG 3872f37
+    EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(indicators)
 
 # global scaler utility
-add_executable(global_scaler src/RANSAC.hpp src/global_scaler.cpp)
+add_executable(global_scaler
+        src/RANSAC.hpp
+        src/global_scaler.cpp
+        src/global_scaler_types.hpp
+        src/global_scaler_io.hpp
+        src/global_scaler_io.cpp)
 target_include_directories(global_scaler
     PUBLIC
         $<BUILD_INTERFACE:${libcore_SOURCE_DIR}/include>
