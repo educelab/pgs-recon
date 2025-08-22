@@ -16,3 +16,13 @@ ExternalProject_Add(
         -DOpenMVS_USE_SSE:BOOL=${HAS_SSE}
         -DENABLE_PRECOMPILED_HEADERS:BOOL=OFF
 )
+ExternalProject_Get_Property(openMVS SOURCE_DIR)
+ExternalProject_Add_Step(
+    openMVS
+    extra_patch
+    COMMENT "Performing patch step #2 for 'openMVS'"
+    COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVS-v2.3-FixFindBoost.diff || true
+    WORKING_DIRECTORY ${SOURCE_DIR}
+    DEPENDEES patch
+    DEPENDERS configure
+)

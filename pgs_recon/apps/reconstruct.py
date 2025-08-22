@@ -381,7 +381,13 @@ def main():
                           initializer=args.mvg_initializer,
                           metadata=metadata)
 
-    # Auto-scale
+    # Robust SfM
+    if args.mvg_robust:
+        logger.info('Performing robust triangulation')
+        sfm_key = mvg_compute_known(paths, sfm_key=sfm_key,
+                                    bundle_adjustment=args.robust_ba,
+                                    metadata=metadata)
+        
     if args.mvg_autoscale is not None:
         logger.info('Auto-scaling SfM scene')
         sfm_key = mvg_autoscale(paths=paths,
@@ -391,19 +397,9 @@ def main():
                                 marker_pix=args.autoscale_marker_pix,
                                 include_from=args.autoscale_include_from,
                                 exclude_from=args.autoscale_exclude_from)
-
-    # Colorize reconstructed scene
+            
     logger.info('Colorizing SfM scene')
     mvg_colorize_sfm(paths, sfm_key=sfm_key, metadata=metadata)
-
-    # Robust SfM
-    if args.mvg_robust:
-        logger.info('Performing robust triangulation')
-        sfm_key = mvg_compute_known(paths, sfm_key=sfm_key,
-                                    bundle_adjustment=args.robust_ba,
-                                    metadata=metadata)
-        logger.info('Colorizing SfM scene')
-        mvg_colorize_sfm(paths, sfm_key=sfm_key, metadata=metadata)
 
     # Convert MVG -> MVS
     logger.info('Converting MVG scene to MVS scene')

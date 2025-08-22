@@ -6,6 +6,7 @@ ExternalProject_Add(
     DOWNLOAD_NO_PROGRESS ON
     DOWNLOAD_EXTRACT_TIMESTAMP OFF
     BUILD_IN_SOURCE ON
+    PATCH_COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/VCG-RemoveTemplate.diff || true
     CONFIGURE_COMMAND mkdir -p ${CMAKE_INSTALL_PREFIX}/include/vcg
     BUILD_COMMAND ""
     INSTALL_COMMAND cp -R . ${CMAKE_INSTALL_PREFIX}/include/vcg
