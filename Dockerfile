@@ -1,4 +1,7 @@
-FROM ubuntu:22.04
+ARG BASE_IMAGE=ubuntu:22.04
+ARG USE_CUDA=OFF
+
+FROM ${BASE_IMAGE}
 LABEL org.opencontainers.image.authors="Seth Parker <c.seth.parker@uky.edu>"
 LABEL org.opencontainers.image.title="PGS Recon"
 LABEL org.opencontainers.image.description="A photogrammetry reconstruction pipeline"
@@ -11,8 +14,8 @@ ENV LC_ALL=en_US.UTF-8
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Install apt dependencies and build photogrammetry dependencies
-RUN apt update && \
-    DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+RUN apt update \
+    && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
       build-essential \
       bzip2 \
       cmake \
@@ -21,6 +24,7 @@ RUN apt update && \
       git \
       graphviz \
       imagemagick \
+      libatlas-base-dev \
       libboost-iostreams-dev \
       libboost-program-options-dev \
       libboost-serialization-dev \
@@ -33,6 +37,7 @@ RUN apt update && \
       libmpfr-dev \
       libqt5svg5-dev \
       libqt5x11extras5-dev \
+      libsuitesparse-dev \
       locales \
       nano \
       ninja-build \
@@ -54,15 +59,29 @@ RUN apt update && \
 
 # Install PGS Recon dependencies
 COPY . /usr/local/educelab/pgs-recon
-RUN cmake \
+RUN if [[ "${USE_CUDA}" == "ON" ]]; then  \
+       export CUDACXX="/usr/local/cuda/bin/nvcc"; \
+    fi \
+    && cmake \
       -S /usr/local/educelab/pgs-recon/dependencies/ \
       -B /usr/local/educelab/build/ \
       -DCMAKE_INSTALL_PREFIX=/usr/local/ \
       -DCMAKE_BUILD_TYPE=Release \
       -DBUILD_JPEG=OFF \
+      -DBUILD_CERES=ON \
+      -DUSE_CUDA=${USE_CUDA} \
+      -DCMAKE_CUDA_ARCHITECTURES='60;61;70;90' \
       -GNinja  \
     && cmake --build /usr/local/educelab/build/ \
-    && rm -rf /usr/local/educelab/build
+    && rm -rf /usr/local/educelab/build \
+    && python3 -m venv /usr/local/educelab/pgs-recon/.venv \
+    && . /usr/local/educelab/pgs-recon/.venv/bin/activate \
+    && python3 -m pip install --upgrade pip wheel setuptools \
+    && python3 -m pip install --editable /usr/local/educelab/pgs-recon \
+    && chmod --recursive a+rw /usr/local/educelab/pgs-recon/ \
+    && chmod a+rw /usr/local/lib/openMVG/sensor_width_camera_database.txt \
+    && git config --global credential.helper "cache --timeout=3600" \
+    && git config --global --add safe.directory /usr/local/educelab/pgs-recon/
 
 # Install ExifTool
 RUN mkdir -p /usr/local/educelab/exiftool/  \
@@ -71,16 +90,6 @@ RUN mkdir -p /usr/local/educelab/exiftool/  \
     && curl -O -L https://exiftool.org/Image-ExifTool-${EXIFTOOL_VER}.tar.gz \
     && tar -xzf Image-ExifTool-${EXIFTOOL_VER}.tar.gz && cd Image-ExifTool-${EXIFTOOL_VER}/ \
     && perl Makefile.PL && make test && make install
-
-# Make venv and cleanup
-RUN python3 -m venv /usr/local/educelab/pgs-recon/.venv \
-    && . /usr/local/educelab/pgs-recon/.venv/bin/activate \
-    && python3 -m pip install --upgrade pip wheel setuptools \
-    && python3 -m pip install --editable /usr/local/educelab/pgs-recon \
-    && chmod --recursive a+rw /usr/local/educelab/pgs-recon/ \
-    && chmod a+rw /usr/local/lib/openMVG/sensor_width_camera_database.txt \
-    && git config --global credential.helper "cache --timeout=3600" \
-    && git config --global --add safe.directory /usr/local/educelab/pgs-recon/ 
 
 ENV PATH="/usr/local/educelab/pgs-recon/.venv/bin:$PATH"
 CMD ["pgs-recon", "--help"]

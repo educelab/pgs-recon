@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.17 FATAL_ERROR)
 
 #### Initialize cache variables ####
 get_property(multiConfig GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
@@ -49,8 +49,26 @@ else()
     message(STATUS "Detecting SSE support - failed")
 endif()
 
+# Detect CUDA support
+message(STATUS "Detecting CUDA support")
+find_package(CUDAToolkit)
+cmake_dependent_option(USE_CUDA "Enable CUDA support" OFF "CUDAToolkit_FOUND" OFF)
+if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(GLOBAL_CUDA_ARGS
+      "-DCMAKE_LIBRARY_PATH:PATH=/usr/local/cuda/lib64/stubs/"
+      "-DCUDA_TOOLKIT_ROOT_DIR:PATH=/usr/local/cuda/"
+      "-DCUDA_INCLUDE_DIRS:PATH=/usr/local/cuda/include/"
+      "-DCUDA_CUDART_LIBRARY:PATH=/usr/local/cuda/lib64"
+      "-DCUDA_NVCC_EXECUTABLE:PATH=/usr/local/cuda/bin/"
+      "-DCMAKE_CUDA_ARCHITECTURES:STRING=${CMAKE_CUDA_ARCHITECTURES}"
+    )
+endif()
+
 ### Eigen ###
 include(BuildEigen)
+
+### Ceres ###
+include(BuildCeres)
 
 ### jpeg ###
 include(BuildJPEG)

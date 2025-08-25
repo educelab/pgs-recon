@@ -1,12 +1,11 @@
-# Note: Must use the cdcseacave repo
+# The recommended way to install is to copy the files to ${PREFIX}/include/
 ExternalProject_Add(
     VCG
-    URL https://github.com/cdcseacave/VCG/archive/10d73fc.tar.gz
-    URL_HASH SHA512=391b0fe7633553755a53dd1b1d6dea8c6308eba80d534fd365b899ebecfe8bbc791b40f20afe54361e52215b654278d3aca009b6c62d7fcc6bc38073eb368ed6
+    URL https://github.com/cnr-isti-vclab/vcglib/archive/refs/tags/2025.07.tar.gz
+    URL_HASH SHA512=6533dfdc48a8ee0f904c49edcd25a3c06a945cec7baa047ddbba78ae48fbf7b490718fe15eb7c729f9c097114b798ec5204302b37011906a0bed4de819616717
     DOWNLOAD_NO_PROGRESS ON
     DOWNLOAD_EXTRACT_TIMESTAMP OFF
     BUILD_IN_SOURCE ON
-    PATCH_COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/VCG-RemoveTemplate.diff || true
     CONFIGURE_COMMAND mkdir -p ${CMAKE_INSTALL_PREFIX}/include/vcg
     BUILD_COMMAND ""
     INSTALL_COMMAND cp -R . ${CMAKE_INSTALL_PREFIX}/include/vcg
