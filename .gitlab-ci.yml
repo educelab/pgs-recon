@@ -20,19 +20,6 @@ stages:
     - source venv/bin/activate
     - python -m pip install .
 
-test:ubuntu:20.04:
-  extends: .build
-  stage: test
-  variables:
-    PACKAGE_LIST: ci/apt-ubuntu-focal
-    PYTHON_EXE: "python3.9"
-  image: ubuntu:20.04
-  before_script:
-    - apt update
-    - apt install -y --no-install-recommends $(cat $PACKAGE_LIST)
-    - curl https://bootstrap.pypa.io/get-pip.py | ${PYTHON_EXE}
-    - ${PYTHON_EXE} -m pip install --upgrade pip setuptools wheel
-
 test:ubuntu:22.04:
   extends: .build
   stage: test

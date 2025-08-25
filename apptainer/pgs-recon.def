@@ -1,5 +1,9 @@
 Bootstrap: docker
-From: ubuntu:22.04
+From: {{ BASE_IMAGE }}
+
+%arguments
+  BASE_IMAGE=ubuntu:22.04
+  USE_CUDA=OFF
 
 %labels
   MAINTAINER Seth Parker <c.seth.parker@uky.edu>
@@ -12,6 +16,9 @@ From: ubuntu:22.04
   # Restore container PATH
   export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+  # Report image type
+  echo "Build CUDA image: " {{ USE_CUDA }}
+
   # apt dependencies
   apt update
   DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
@@ -23,6 +30,7 @@ From: ubuntu:22.04
     git \
     graphviz \
     imagemagick \
+    libatlas-base-dev \
     libboost-iostreams-dev \
     libboost-program-options-dev \
     libboost-serialization-dev \
@@ -35,6 +43,7 @@ From: ubuntu:22.04
     libmpfr-dev \
     libqt5svg5-dev \
     libqt5x11extras5-dev \
+    libsuitesparse-dev \
     locales \
     nano \
     ninja-build \
@@ -51,13 +60,21 @@ From: ubuntu:22.04
 
   # Build photogrammetry dependencies
   mkdir -p /usr/local/educelab/build/ && cd /usr/local/educelab/build/
+  if [ {{ USE_CUDA }} = "ON" ]; then
+    export CUDACXX="/usr/local/cuda/bin/nvcc"
+  fi
   cmake \
+    -S /usr/local/educelab/pgs-recon/dependencies/ \
+    -B /usr/local/educelab/build/ \
     -DCMAKE_INSTALL_PREFIX=/usr/local/ \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_JPEG=OFF \
-    -GNinja \
-    /usr/local/educelab/pgs-recon/dependencies/
-  ninja
+    -DBUILD_CERES=ON \
+    -DUSE_CUDA={{ USE_CUDA }} \
+    -DCMAKE_CUDA_ARCHITECTURES='60;61;70;90' \
+    -GNinja
+  cmake --build /usr/local/educelab/build/
+  rm -rf /usr/local/educelab/build
 
   # Fix locales
   locale-gen en_US en_US.UTF-8
