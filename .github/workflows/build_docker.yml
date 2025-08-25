@@ -16,12 +16,14 @@ jobs:
           - base_image: "ubuntu:22.04"
             use_cuda: "OFF"
             tag_suffix: ""
-          - base_image: "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04"
-            use_cuda: "ON"
-            tag_suffix: "-cuda12.4"
-          - base_image: "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04"
-            use_cuda: "ON"
-            tag_suffix: "-cuda12.8"
+# These images are disabled because building them requires more disk space than
+# the standard GitHub Actions runners make available
+#          - base_image: "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04"
+#            use_cuda: "ON"
+#            tag_suffix: "-cuda12.4"
+#          - base_image: "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04"
+#            use_cuda: "ON"
+#            tag_suffix: "-cuda12.8"
     steps:
       - name: Free up disk space
         run: |
