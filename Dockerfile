@@ -3,9 +3,11 @@ ARG USE_CUDA=OFF
 
 FROM ${BASE_IMAGE}
 LABEL org.opencontainers.image.authors="Seth Parker <c.seth.parker@uky.edu>"
-LABEL org.opencontainers.image.title="PGS Recon"
+LABEL org.opencontainers.image.title="pgs-recon"
 LABEL org.opencontainers.image.description="A photogrammetry reconstruction pipeline"
-LABEL org.opencontainers.image.source="https://gitlab.com/educelab/pgs-recon"
+LABEL org.opencontainers.image.source="https://github.com/educelab/pgs-recon"
+LABEL org.opencontainers.image.url="https://github.com/educelab/pgs-recon"
+LABEL org.opencontainers.image.licenses=AGPL-3.0
 
 # Set environment variables
 ENV LANG=en_US.UTF-8
