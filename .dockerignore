@@ -9,3 +9,5 @@ venv/*
 **/*.sif
 build*/
 *out.txt
+# Don't include the README in the image
+README.md
