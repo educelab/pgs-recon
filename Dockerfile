@@ -61,7 +61,7 @@ RUN apt update \
 
 # Install PGS Recon dependencies
 COPY . /usr/local/educelab/pgs-recon
-RUN if [[ "${USE_CUDA}" == "ON" ]]; then  \
+RUN if [ "${USE_CUDA}" = "ON" ]; then  \
        export CUDACXX="/usr/local/cuda/bin/nvcc"; \
     fi \
     && cmake \
