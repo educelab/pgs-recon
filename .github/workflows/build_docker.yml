@@ -11,8 +11,6 @@ jobs:
   docker:
     name: Build Docker image
     runs-on: ubuntu-22.04-arm
-    permissions:
-      packages: write
     strategy:
       matrix:
         include:
