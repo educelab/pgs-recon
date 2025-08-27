@@ -1,3 +1,4 @@
+.github/
 dependencies/build/*
 dependencies/installed/*
 out/*
@@ -5,7 +6,8 @@ venv/*
 .venv/*
 **/__pycache__/*
 .idea/*
-**/*.egg-info
+**/*.egg-info/
+*.egg-info/
 **/*.sif
 build*/
 *out.txt
