@@ -13,7 +13,7 @@ docker pull ghcr.io/educelab/pgs-recon:latest
 
 # Run reconstruction on a directory of images in the current working directory
 # Flags:
-#  -v .:/working       - Mounts the current working directory to `/working` 
+#  -v .:/working       - Mounts the current working directory to '/working' 
 #                        inside the container
 #  -i /working/images  - Path to the images inside the container
 #  -o /working/recon   - Output directory inside the container

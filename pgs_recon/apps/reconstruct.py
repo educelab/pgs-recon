@@ -169,6 +169,7 @@ def main():
     opts_mvg = parser.add_argument_group('mvg reconstruction options')
     opts_mvg.add_argument('--mvg-recon-method', '-m',
                           choices=['global',
+                                   'stellar',
                                    'incremental',
                                    'incrementalv2',
                                    'direct'],
@@ -259,15 +260,18 @@ def main():
                           help='Decimation factor in range [0..1] to be '
                                'applied to the input surface before mesh '
                                'refinement (0 - auto, 1 - disabled)')
-    opts_mvs.add_argument('--mask-value', type=int,
+    opts_mvs.add_argument('--mask-value', type=int, default=0,
                           help='Label value in the image mask to ignore during '
                                'mesh densification. By default, image masks '
-                               'are ignored during this step.')
+                               'are ignored during this step. Set to a value '
+                               '< 0 to ignore masks during this step.')
     opts_mvs.add_argument('--texture-max-size', type=int, default=0,
                           help='Limits the maximum size (edge length) of the'
                                'output texture image. If set to 0 (default), '
                                'the edge length is unbounded.')
     args = parser.parse_args()
+    if args.mask_value is not None and args.mask_value < 0:
+        args.mask_value = None
 
     setup_logging(args.log_level)
     logger = logging.getLogger("pgs-recon")
