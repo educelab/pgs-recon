@@ -1,5 +1,10 @@
 #! /bin/bash
 
+# NOTE: This script was created when it seemed like GitHub Actions wasn't going
+# to be able to build the pgs-recon images without timing out or running out
+# of disk space. Since that is no longer an issue, this script is largely kept
+# around for reference. - CSP 08/2025
+
 set -e
 
 echo "!!!WARNING!!!"
@@ -22,8 +27,8 @@ REV=$(git rev-list -n 1 ${REF})
 
 CFGS=(\
 #  "ubuntu:22.04 OFF " \ # GitHub Actions handles CPU-only builds
-  "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 ON -cuda12.4" \
-  "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 ON -cuda12.8" \
+  "nvidia/cuda:12.4.1-devel-ubuntu22.04 ON -cuda12.4" \
+  "nvidia/cuda:12.8.1-devel-ubuntu24.04 ON -cuda12.8" \
 )
 
 timestamp() {
