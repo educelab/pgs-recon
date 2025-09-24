@@ -165,6 +165,15 @@ def main():
                                    'essential matrix')
     opts_matcher.add_argument('--matching-ratio', type=float, default=None,
                               help='Nearest-Neighbor distance ratio')
+    opts_matcher.add_argument('--matching-pairs-file', type=str, default='auto',
+                              help='NONE, AUTO, or path to an OpenMVG view '
+                                   'pairs file. If AUTO (default), use the '
+                                   'view pairs file created when importing a '
+                                   'PGS scan. If NONE, do not use a view pairs '
+                                   'file.')
+    opts_matcher.add_argument('--matching-pairs-radius', type=int, default=2,
+                              help='The neighbor search radius when '
+                                   'automatically generating a view pairs file')
 
     opts_mvg = parser.add_argument_group('mvg reconstruction options')
     opts_mvg.add_argument('--mvg-recon-method', '-m',
@@ -226,6 +235,8 @@ def main():
                           type=str.upper, help=configargparse.SUPPRESS)
 
     opts_mvs = parser.add_argument_group('openmvs options')
+    opts_mvs.add_argument('--mvs', action=argparse.BooleanOptionalAction,
+                          default=True, help='Enable all MVS stages')
     opts_mvs.add_argument('--free-space-support',
                           action=argparse.BooleanOptionalAction,
                           help='use free-space support in ReconstructMesh')
@@ -345,7 +356,9 @@ def main():
     # Initialize the mvg project
     logger.info('Importing dataset')
     if args.import_pgs_scan:
-        init_sfm_pgs(paths, metadata=metadata)
+        init_sfm_pgs(paths,
+                     pairs_file_radius=args.matching_pairs_radius,
+                     metadata=metadata)
     elif args.new_importer:
         init_sfm_generic2(paths['input'].resolve(),
                           sfm_file=paths['sfm'],
@@ -363,13 +376,22 @@ def main():
 
     # Match features/Compute Structure
     logger.info('Matching image features')
+    pairs_file = args.matching_pairs_file
+    if pairs_file.lower() == 'none':
+        pairs_file = None
+    elif pairs_file.lower() == 'auto':
+        if args.import_pgs_scan:
+            pairs_file = paths.get('view_pairs', None)
+        else:
+            pairs_file = None
+    paths['view_pairs'] = pairs_file
     compute_matches(paths, method=args.matching_method,
-                    ratio=args.matching_ratio, metadata=metadata)
+                    ratio=args.matching_ratio, pairs_file=pairs_file,
+                    metadata=metadata)
 
     # Filter matches
     logger.info('Filtering image features')
-    geometric_filter(paths, model=args.matching_geometric_model,
-                     metadata=metadata)
+    geometric_filter(paths, model=args.matching_geometric_model, metadata=metadata)
 
     # MVG scene computation
     if args.mvg_recon_method == 'direct':
@@ -404,6 +426,13 @@ def main():
             
     logger.info('Colorizing SfM scene')
     mvg_colorize_sfm(paths, sfm_key=sfm_key, metadata=metadata)
+
+    # Exit early
+    if not args.mvs:
+        current_time = current_timestamp()
+        metadata['commands'][current_time] = "Processing complete"
+        logger.info(f'Processing complete. Results saved to: {paths["output"]}')
+        return
 
     # Convert MVG -> MVS
     logger.info('Converting MVG scene to MVS scene')

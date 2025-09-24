@@ -1,6 +1,8 @@
 import argparse
+import itertools
 import json
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Dict
@@ -12,6 +14,7 @@ from scipy.spatial.transform import Rotation as Rot
 from sfm_utils.openmvg import __OPENMVG_CAMDB_DEFAULT_PATH
 
 from pgs_recon.utility import current_timestamp
+
 
 def get_tag_option(tags, opts):
     """Return the value of the first key in `opts` that is present in `tags`"""
@@ -27,8 +30,59 @@ def load_cam_calib(calib_path: Path) -> dict:
     return calib
 
 
+def neighbor_lookup_gridscan(scan_meta):
+    """
+    Create a neighbor lookup function for a PGS Grid Scan
+    :param scan_meta: The 'scan' section of a PGS Scan metadata file
+    :return:
+    """
+    logger = logging.getLogger(__name__)
+    # Validate that it's a grid scan
+    path = scan_meta['path']
+    if not path.startswith('ROW_'):
+        raise ValueError(f'Scan path is not a recognized grid scan: {path}')
+
+    # Calculate the grid geometry
+    dim_x, dim_y, dim_z = scan_meta['dims']
+    step_x, step_y, step_z = scan_meta['stepsize']
+    depth = math.ceil(dim_z / step_z) + 1
+    cols = math.ceil(dim_x / step_x) + 1
+    rows = math.ceil(dim_y / step_y) + 1
+
+    # Validate against the number of captured positions
+    num_positions = len(scan_meta['capture_positions'])
+    num_expected = cols * rows * depth
+    if num_expected != num_positions:
+        logger.warning(f'Number of logged positions does not match expected: '
+                       f'{num_positions} != {num_expected}')
+
+    # Lookup table
+    lut = np.zeros((depth, rows, cols), dtype=np.int64)
+    pos = 0
+    for d in range(depth):
+        for r in range(rows):
+            c_range = range(cols)
+            if path == 'ROW_CONTINUOUS' and r & 1:
+                c_range = reversed(c_range)
+            for c in c_range:
+                lut[d, r, c] = pos
+                pos += 1
+
+    # Neighbor lookup function
+    def get_neighbors(pos_idx, radius):
+        # Only search in XY
+        _, y, x = [a.item() for a in np.where(lut == pos_idx)]
+        ly, hy = max(0, y - radius), min(rows, y + radius + 1)
+        lx, hx = max(0, x - radius), min(cols, x + radius + 1)
+        n = lut[:, ly:hy, lx:hx].flatten()
+        return n
+
+    return get_neighbors
+
+
 def import_pgs_scan(scan_dir: Path, cam_db: dict,
-                    cam_calib: dict = None) -> sfm.Scene:
+                    cam_calib: dict = None,
+                    pairs_file_radius: int = 2) -> tuple[sfm.Scene, list]:
     logger = logging.getLogger(__name__)
     # Load scan metadata
     meta_path = scan_dir / 'metadata.json'
@@ -63,6 +117,9 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict,
     # Setup sfm
     scene = sfm.Scene()
     scene.root_dir = scan_dir
+
+    # view IDs per pose
+    position_views = dict()
 
     # Fill out sfm with data
     intrinsics = {}
@@ -149,7 +206,7 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict,
             pose.rotation = rotation.as_matrix().round(15)
 
         # Only add everything to the SfM at the end
-        scene.add_view(view)
+        view = scene.add_view(view)
         # One intrinsic per camera, not per body and lens combo
         if cam_idx in intrinsics.keys():
             view.intrinsic = intrinsics[cam_idx]
@@ -158,11 +215,49 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict,
             intrinsics[cam_idx] = view.intrinsic
         view.pose = scene.add_pose(pose)
 
+        # Add this view to the list of views for this position
+        ps = position_views.get(pos_idx, list())
+        ps.append(view.id)
+        position_views[pos_idx] = ps
+
+    # Get a neighbor lookup function
+    neighbor_lookup = neighbor_lookup_gridscan(scan_meta['scan'])
+
+    # Compile the list of view pairs
+    # For each position for which we have at least one view...
+    view_pairs = set()
+    for pos_idx, view_list in position_views.items():
+        # Get the neighbor positions
+        neighbors = neighbor_lookup(pos_idx, pairs_file_radius)
+
+        # Calculate the view pairs this position to all neighbor positions
+        for n in neighbors:
+            neighbor_list = position_views.get(n, [])
+            pairs = []
+            for a, b in itertools.product(view_list, neighbor_list):
+                # never compare a view with itself
+                if a == b:
+                    continue
+                # smallest view ID first for set union to work
+                pairs.append((b, a) if b < a else (a, b))
+            view_pairs = view_pairs.union(pairs)
+
+    # Sort the view pairs
+    view_pairs = list(view_pairs)
+    view_pairs.sort()
+
     # Return the filled out sfm
-    return scene
+    return scene, view_pairs
 
 
-def init_sfm_pgs(paths: Dict[str, Path], metadata: Dict = None):
+def export_view_pairs(path: Path, view_pairs: list):
+    with path.open('w') as f:
+        for a, b in view_pairs:
+            f.write(f'{a} {b}\n')
+
+
+def init_sfm_pgs(paths: Dict[str, Path], pairs_file_radius: int = 2,
+                 metadata: Dict = None):
     """Init an SfM from a PGS Scan"""
     logger = logging.getLogger(__name__)
     # Load the camera db
@@ -178,16 +273,25 @@ def init_sfm_pgs(paths: Dict[str, Path], metadata: Dict = None):
         calib = load_cam_calib(paths['input_calib'])
 
     # Load the pgs file
-    scene = import_pgs_scan(paths['input'].resolve(), cam_db=cam_db,
-                            cam_calib=calib)
+    scene, view_pairs = import_pgs_scan(paths['input'].resolve(), cam_db=cam_db,
+                                        cam_calib=calib,
+                                        pairs_file_radius=pairs_file_radius)
     if metadata is not None:
-        cmd = f'import_pgs_scan {str(paths["input"])} {str(paths["CAM_DB"])}'
+        cmd = (f'import_pgs_scan(scan_dir={str(paths["input"])}, '
+               f'cam_db={str(paths["CAM_DB"])}, '
+               f'cam_calib={str(paths.get("input_calib", None))}, '
+               f'pairs_file_radius={pairs_file_radius})')
         if calib:
             cmd += f' {str(paths["input_calib"])}'
         metadata['commands'][current_timestamp()] = cmd
 
     # Write the SFM
     sfm.export_scene(path=paths['sfm'], scene=scene)
+
+    # Write the view pairs
+    if view_pairs is not None:
+        paths['view_pairs'] = paths['matches_dir'] / 'pgs_view_pairs.txt'
+        export_view_pairs(paths['view_pairs'], view_pairs)
 
 
 def main():
@@ -197,8 +301,10 @@ def main():
     parser.add_argument('--cam-db', '-d', default=__OPENMVG_CAMDB_DEFAULT_PATH,
                         help='Camera database path')
     parser.add_argument('--cam-calib', '-c', help="Camera calibrations file")
-    parser.add_argument('--output-sfm', '-o', default='sfm_data.json',
-                        help='Output SFM file')
+    parser.add_argument('--output-sfm', '-o', type=Path,
+                        default='sfm_data.json', help='Output SFM file')
+    parser.add_argument('--view-pairs', '-v', type=Path,
+                        default='pgs_view_pairs.txt', help='Output view pairs file')
     args = parser.parse_args()
 
     # Logger
@@ -218,11 +324,16 @@ def main():
     # Load the pgs file
     logger.info('Loading PGS Scan')
     pgs_dir_path = Path(args.pgs_dir)
-    scene = import_pgs_scan(pgs_dir_path, cam_db, calib)
+    scene, view_pairs = import_pgs_scan(pgs_dir_path, cam_db, calib)
 
     # Write the SFM
     logger.info('Exporting SfM scene')
     sfm.export_scene(path=args.output_sfm, scene=scene)
+
+    # Write the view pairs file
+    if view_pairs is not None:
+        logger.info('Exporting view pairs')
+        export_view_pairs(args.view_pairs, view_pairs)
 
     logger.info('Done.')
 

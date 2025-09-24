@@ -42,7 +42,7 @@ def compute_features(paths: Dict[str, Path], method: str, preset: str,
 
 
 def compute_matches(paths: Dict[str, Path], method: str,
-                    ratio: float = None,
+                    ratio: float = None, pairs_file: Path = None,
                     metadata: Dict = None):
     """Compute image feature matches"""
     command = [
@@ -53,13 +53,15 @@ def compute_matches(paths: Dict[str, Path], method: str,
     ]
     if ratio is not None:
         command.extend(['-r', str(ratio)])
+    if pairs_file is not None:
+        command.extend(['-p', str(pairs_file)])
     if metadata is not None:
         metadata['commands'][current_timestamp()] = (str(' ').join(command))
     run_command(command)
 
 
 def geometric_filter(paths: Dict[str, Path], model: str = None,
-                     metadata: Dict = None):
+                     pairs_file: Path = None, metadata: Dict = None):
     filtered = paths['matches_file']
     filtered = filtered.parent / (filtered.stem + '_filtered' + filtered.suffix)
     paths['matches_file_filtered'] = filtered
@@ -71,6 +73,8 @@ def geometric_filter(paths: Dict[str, Path], model: str = None,
     ]
     if model is not None:
         command.extend(['-g', model.lower()])
+    if pairs_file is not None:
+        command.extend(['-p', str(pairs_file)])
     if metadata is not None:
         metadata['commands'][current_timestamp()] = (str(' ').join(command))
     run_command(command)
