@@ -45,7 +45,7 @@ def mesh_to_wavefront(mesh: Mesh, obj: wobj.WavefrontOBJ = None):
 
 
 def segment_plane(mesh, dist_threshold=0.1, point_samples=3, iterations=1000,
-                  prob=0.99999999):
+                  prob=0.99999999, seed=None):
     class RANSACResult:
         inliers: List[int]
         error: float
@@ -100,7 +100,7 @@ def segment_plane(mesh, dist_threshold=0.1, point_samples=3, iterations=1000,
     best_model = np.zeros((4,))
 
     # Iterate up to some max iterations
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(seed=seed)
     break_it = iterations
     for i in range(iterations):
         # Break early based on fitness/rmse
@@ -299,10 +299,21 @@ def cluster_connected_components(mesh: Mesh):
     return face_cluster, cluster_metrics
 
 
-def keep_largest_connected_component(mesh: Mesh, filter_vertices=False):
+def keep_largest_connected_component(mesh: Mesh, filter_vertices=True):
     _, metrics = cluster_connected_components(mesh)
     metrics = sorted(metrics, key=lambda m: m['area'], reverse=True)
     keep_triangles_by_mask(mesh, metrics[0]['faces'])
+    if filter_vertices:
+        remove_unreferenced_vertices(mesh)
+
+
+def remove_connected_components_by_size(mesh: Mesh, num_faces: int, filter_vertices=True):
+    _, metrics = cluster_connected_components(mesh)
+    faces = set()
+    for metric in metrics:
+        if len(metric['faces']) >= num_faces:
+            faces = faces.union(metric['faces'])
+    keep_triangles_by_mask(mesh, list(faces))
     if filter_vertices:
         remove_unreferenced_vertices(mesh)
 
