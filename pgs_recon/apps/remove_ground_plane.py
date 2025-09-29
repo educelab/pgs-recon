@@ -3,6 +3,15 @@ import argparse
 import pgs_recon.utils.wavefront as wobj
 from pgs_recon.utils import geometry as geom
 
+def parse_filter_cc(arg: str):
+    arg = arg.lower()
+    if arg == 'none':
+        return 0
+    elif arg == 'largest':
+        return -1
+    else:
+        return int(arg)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -17,6 +26,13 @@ def main():
                              'considered inliers if their distance from the '
                              'plane is less than the distance threshold. This '
                              'should be tuned based on the point density.')
+    parser.add_argument('--filter-cc', default='largest', type=parse_filter_cc,
+                        help="Filter the mesh's connected components after "
+                             "removing the ground plane:\n"
+                             " - 'none': No filtering\n"
+                             " - 'largest': keep only the largest connected component\n"
+                             " - N: remove all connected components with fewer than N faces")
+    parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
 
     # Load the mesh
@@ -30,11 +46,17 @@ def main():
 
     print('Fitting plane...')
     _, plane_inliers = geom.segment_plane(mesh,
-                                          dist_threshold=args.distance_threshold)
+                                          dist_threshold=args.distance_threshold,
+                                          seed=args.seed)
+    print('Removing plane...')
     geom.remove_vertices_by_index(mesh, plane_inliers)
 
-    print('Removing small connected components...')
-    geom.keep_largest_connected_component(mesh, filter_vertices=True)
+    if args.filter_cc > 0:
+        print(f'Removing connected components smaller than {args.filter_cc} faces...')
+        geom.remove_connected_components_by_size(mesh, num_faces=args.filter_cc)
+    elif args.filter_cc < 0:
+        print('Keeping largest connected component...')
+        geom.keep_largest_connected_component(mesh, filter_vertices=True)
 
     print('Saving mesh...')
     obj = geom.mesh_to_wavefront(mesh, obj)

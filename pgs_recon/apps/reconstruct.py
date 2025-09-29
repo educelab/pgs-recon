@@ -273,9 +273,8 @@ def main():
                                'refinement (0 - auto, 1 - disabled)')
     opts_mvs.add_argument('--mask-value', type=int, default=0,
                           help='Label value in the image mask to ignore during '
-                               'mesh densification. By default, image masks '
-                               'are ignored during this step. Set to a value '
-                               '< 0 to ignore masks during this step.')
+                               'mesh densification. Set to a value < 0 to '
+                               'ignore masks during this step.')
     opts_mvs.add_argument('--texture-max-size', type=int, default=0,
                           help='Limits the maximum size (edge length) of the'
                                'output texture image. If set to 0 (default), '
