@@ -60,6 +60,7 @@ RUN apt update \
     && apt clean && apt autoremove -y --purge && rm -rf /var/lib/apt/lists/*
 
 # Install PGS Recon dependencies
+ARG USE_CUDA
 COPY . /usr/local/educelab/pgs-recon
 RUN if [ "${USE_CUDA}" = "ON" ]; then  \
        export CUDACXX="/usr/local/cuda/bin/nvcc"; \
