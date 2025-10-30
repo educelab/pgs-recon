@@ -39,6 +39,7 @@ RUN apt update \
       libmpfr-dev \
       libqt5svg5-dev \
       libqt5x11extras5-dev \
+      libssh-4 \
       libsuitesparse-dev \
       locales \
       nano \
