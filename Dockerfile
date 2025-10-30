@@ -17,7 +17,7 @@ ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Install apt dependencies and build photogrammetry dependencies
 RUN apt update \
-    && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+    && DEBIAN_FRONTEND=noninteractive apt install -y --fix-missing --no-install-recommends \
       build-essential \
       bzip2 \
       cmake \

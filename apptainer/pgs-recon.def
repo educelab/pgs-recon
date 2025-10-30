@@ -21,7 +21,7 @@ From: {{ BASE_IMAGE }}
 
   # apt dependencies
   apt update
-  DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+  DEBIAN_FRONTEND=noninteractive apt install -y --fix-missing --no-install-recommends \
     build-essential \
     bzip2 \
     cmake \
