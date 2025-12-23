@@ -24,22 +24,6 @@ jobs:
             use_cuda: "ON"
             tag_suffix: "-cuda12.8"
     steps:
-      - name: Free up disk space
-        run: |
-          # Remove specific Docker images that are no longer needed
-          docker rmi $(docker images -f "dangling=true" -q) || true
-
-          # Prune unused Docker objects (images, containers, volumes, and networks)
-          docker system prune -f || true
-
-          # Clean up specific directories known to consume a lot of space
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-          npm cache clean --force || true
-
-          # Show disk space usage
-          df -h
-
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -54,10 +38,12 @@ jobs:
             type=edge
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to GitHub Container Registry
         if: github.event_name != 'pull_request'
@@ -68,7 +54,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v3
+        uses: docker/build-push-action@v6
         with:
           build-args: |
             BASE_IMAGE=${{ matrix.base_image }}

@@ -99,7 +99,7 @@ From: {{ BASE_IMAGE }}
   # Activate virtualenv
   . /usr/local/educelab/pgs-recon/.venv/bin/activate
   # Update pip
-  python3 -m pip install --upgrade pip wheel
+  python3 -m pip install --upgrade pip setuptools wheel
 
   # Install PGSRecon
   python3 -m pip install --editable /usr/local/educelab/pgs-recon
