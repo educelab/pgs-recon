@@ -7,9 +7,15 @@ on:
 
 concurrency: docker
 
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
 jobs:
   build_platform_images:
-    name: Build Docker platform images
+    name: Build platform images
     strategy:
       matrix:
         include:
