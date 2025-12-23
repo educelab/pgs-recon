@@ -94,8 +94,6 @@ jobs:
           platforms: linux/${{ matrix.architecture }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-to: type=gha,mode=max
-          cache-from: type=gha
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v3
