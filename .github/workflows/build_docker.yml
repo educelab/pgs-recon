@@ -10,7 +10,7 @@ concurrency: docker
 jobs:
   docker:
     name: Build Docker image
-    runs-on: ubuntu-22.04
+    runs-on: macos-15
     strategy:
       matrix:
         include:
@@ -24,6 +24,10 @@ jobs:
             use_cuda: "ON"
             tag_suffix: "-cuda12.8"
     steps:
+      - name: Setup Docker on macOS
+        id: setup-docker
+        uses: douglascamata/setup-docker-macos-action@v1.0.1
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -36,11 +40,6 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=edge
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: linux/amd64,linux/arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
