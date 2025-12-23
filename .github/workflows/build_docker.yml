@@ -19,27 +19,27 @@ jobs:
     strategy:
       matrix:
         include:
-          - architecture: linux/amd64
+          - architecture: "amd64"
             base_image: "ubuntu:22.04"
             use_cuda: "OFF"
             tag_suffix: ""
-          - architecture: linux/amd64
+          - architecture: "amd64"
             base_image: "nvidia/cuda:12.4.1-devel-ubuntu22.04"
             use_cuda: "ON"
             tag_suffix: "-cuda12.4"
-          - architecture: linux/amd64
+          - architecture: "amd64"
             base_image: "nvidia/cuda:12.8.1-devel-ubuntu22.04"
             use_cuda: "ON"
             tag_suffix: "-cuda12.8"
-          - architecture: linux/arm64
+          - architecture: "arm64"
             base_image: "ubuntu:22.04"
             use_cuda: "OFF"
             tag_suffix: ""
-          - architecture: linux/arm64
+          - architecture: "arm64"
             base_image: "nvidia/cuda:12.4.1-devel-ubuntu22.04"
             use_cuda: "ON"
             tag_suffix: "-cuda12.4"
-          - architecture: linux/arm64
+          - architecture: "arm64"
             base_image: "nvidia/cuda:12.8.1-devel-ubuntu22.04"
             use_cuda: "ON"
             tag_suffix: "-cuda12.8"
@@ -67,6 +67,13 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/educelab/pgs-recon
+          flavor: |
+            suffix=-${{ matrix.architecture }}${{ matrix.tag_suffix }},onlatest=true
+          tags: |
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=edge
 
       - name: Login to GitHub Container Registry
         if: github.event_name != 'pull_request'
@@ -83,7 +90,7 @@ jobs:
             BASE_IMAGE=${{ matrix.base_image }}
             USE_CUDA=${{ matrix.use_cuda }}
           push: ${{ github.event_name != 'pull_request' }}
-          platforms: ${{ matrix.architecture }}
+          platforms: linux/${{ matrix.architecture }}
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v3
