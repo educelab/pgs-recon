@@ -147,7 +147,7 @@ docker build -t pgs-recon:dev \
 While this can theoretically be set to any Ubuntu and CUDA version, this has 
 only been tested on:
  - CUDA 12.4, Ubuntu 22.04 (with and without CUDNN)
- - CUDA 12.8, Ubuntu 24.04 (with and without CUDNN)
+ - CUDA 12.8, Ubuntu 22.04 (with and without CUDNN)
 
 `USE_CUDA` should be either `ON` or `OFF [default]`. If `USE_CUDA=OFF`, CUDA 
 will not be used even if you provide a CUDA-enabled base image.

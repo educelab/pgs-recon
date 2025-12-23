@@ -20,7 +20,7 @@ jobs:
           - base_image: "nvidia/cuda:12.4.1-devel-ubuntu22.04"
             use_cuda: "ON"
             tag_suffix: "-cuda12.4"
-          - base_image: "nvidia/cuda:12.8.1-devel-ubuntu24.04"
+          - base_image: "nvidia/cuda:12.8.1-devel-ubuntu22.04"
             use_cuda: "ON"
             tag_suffix: "-cuda12.8"
     steps:
