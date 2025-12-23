@@ -10,7 +10,7 @@ concurrency: docker
 jobs:
   docker:
     name: Build Docker image
-    runs-on: ubuntu-22.04-arm
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         include:
