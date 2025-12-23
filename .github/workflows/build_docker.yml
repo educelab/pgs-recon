@@ -94,6 +94,8 @@ jobs:
           platforms: linux/${{ matrix.architecture }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-to: type=gha,mode=max
+          cache-from: type=gha
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v3
@@ -114,7 +116,7 @@ jobs:
         if: ${{ github.event_name != 'pull_request' }}
         uses: actions/upload-artifact@v4
         with:
-          name: digests-linux-${{ matrix.architecture }}
+          name: digests-linux-${{ matrix.architecture }}${{ matrix.tag_suffix }}
           path: ${{ runner.temp }}/digests${{ matrix.tag_suffix }}/*
           if-no-files-found: error
           retention-days: 1
