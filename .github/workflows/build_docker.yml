@@ -136,11 +136,11 @@ jobs:
             use_cuda: "ON"
             tag_suffix: "-cuda12.8"
     steps:
-      - name: Download Digests
+      - name: Download digests
         uses: actions/download-artifact@v4
         with:
           path: ${{ runner.temp }}/digests${{ matrix.tag_suffix }}
-          pattern: digests-*
+          pattern: digests-*${{ matrix.tag_suffix }}
           merge-multiple: true
 
       - name: Extract Docker metadata
