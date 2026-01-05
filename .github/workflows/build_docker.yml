@@ -7,6 +7,10 @@ on:
 
 concurrency: docker
 
+env:
+  REGISTRY: ghcr.io
+  REGISTRY_IMAGE: educelab/pgs-recon
+
 permissions:
   contents: read
   packages: write
@@ -17,6 +21,7 @@ jobs:
   build_platform_images:
     name: Build platform images
     strategy:
+      fail-fast: false
       matrix:
         include:
           - architecture: "amd64"
@@ -66,20 +71,13 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/educelab/pgs-recon
-          flavor: |
-            suffix=-${{ matrix.architecture }}${{ matrix.tag_suffix }},onlatest=true
-          tags: |
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=edge
+          images: ${{ env.REGISTRY }}/${{ env.REGISTRY_IMAGE }}
 
       - name: Login to GitHub Container Registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v2
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -92,16 +90,9 @@ jobs:
             USE_CUDA=${{ matrix.use_cuda }}
           push: ${{ github.event_name != 'pull_request' }}
           platforms: linux/${{ matrix.architecture }}
-          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
-      - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v3
-        if: ${{ github.event_name != 'pull_request' }}
-        with:
-          subject-name: ghcr.io/educelab/pgs-recon
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
+          tags: ${{ env.REGISTRY }}/${{ env.REGISTRY_IMAGE }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
         if: ${{ github.event_name != 'pull_request' }}
@@ -147,7 +138,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/educelab/pgs-recon
+          images: ${{ env.REGISTRY }}/${{ env.REGISTRY_IMAGE }}
           flavor: |
             suffix=${{ matrix.tag_suffix }},onlatest=true
           tags: |
@@ -163,7 +154,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v2
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -171,8 +162,8 @@ jobs:
         working-directory: ${{ runner.temp }}/digests${{ matrix.tag_suffix }}
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/educelab/pgs-recon@sha256:%s ' *)
+            $(printf '${{ env.REGISTRY }}/${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
 
       - name: Inspect Image
         run: |
-          docker buildx imagetools inspect ghcr.io/educelab/pgs-recon:${{ steps.meta.outputs.version }}
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
