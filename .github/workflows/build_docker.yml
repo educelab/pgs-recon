@@ -91,7 +91,6 @@ jobs:
           build-args: |
             BASE_IMAGE=${{ matrix.base_image }}
             USE_CUDA=${{ matrix.use_cuda }}
-          push: true
           platforms: linux/${{ matrix.architecture }}
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ env.REGISTRY }}/${{ env.REGISTRY_IMAGE }}
@@ -106,7 +105,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-linux-${{ matrix.architecture }}${{ matrix.tag_suffix }}
+          name: digests-${{ matrix.architecture }}-${{ matrix.tag_suffix }}
           path: ${{ runner.temp }}/digests${{ matrix.tag_suffix }}/*
           if-no-files-found: error
           retention-days: 1
@@ -132,7 +131,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: ${{ runner.temp }}/digests${{ matrix.tag_suffix }}
-          pattern: digests-*${{ matrix.tag_suffix }}
+          pattern: digests-*-${{ matrix.tag_suffix }}
           merge-multiple: true
 
       - name: Extract Docker metadata
