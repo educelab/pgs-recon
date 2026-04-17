@@ -177,13 +177,13 @@ def main():
         json.dump(meta, f, indent=4)
 
     # Define conversion function
-    def convert_image(p) -> bool:
+    def convert_image(p) -> tuple[bool, Path]:
         # Load image
         try:
             img = iio.imread(p)
-        except ValueError:
+        except (OSError, ValueError):
             logger.error(f'Failed to load file: {str(p)}')
-            return False
+            return False, p.name
         in_dtype = img.dtype
 
         # Convert to float for processing
@@ -215,11 +215,11 @@ def main():
         out_file = p.with_suffix(f'.{args.file_type}').name
         out_path = output_dir / out_file
         iio.imwrite(out_path, img, **kwargs)
-        return True
+        return True, p.name
 
     # Convert images (single-threaded)
+    results = []
     if args.threads == 1:
-        results = []
         for p in tqdm(images, desc='Converting images'):
             results.append(convert_image(p))
     # Convert images (multithreaded)
@@ -229,9 +229,12 @@ def main():
             results = list(
                 tqdm(futures, total=len(images), desc='Converting images'))
     # Report success
-    num_failed = results.count(False)
-    if num_failed > 0:
-        logger.warning(f'{num_failed} images failed to convert.')
+    failed_files = [r[1] for r in results if not r[0]]
+    if len(failed_files) > 0:
+        logger.warning(f'{len(failed_files)} images failed to convert.')
+        meta['conversion']['failed'] = failed_files
+        with meta_path.open('w', encoding='utf8') as f:
+            json.dump(meta, f, indent=4)
 
     # Setup metadata copy
     cmd = ['exiftool', '-q', '-P', '-overwrite_original']

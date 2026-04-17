@@ -111,7 +111,7 @@ def main():
                         help='focal length in pixels', metavar='n')
     parser.add_argument('--new-importer', default=False,
                         action=argparse.BooleanOptionalAction)
-    parser.add_argument('--import-pgs-scan', '-p',
+    parser.add_argument('--import-pgs-scan', '-p', default=False,
                         action=argparse.BooleanOptionalAction,
                         help='Input directory is assumed to be a PGS Scan '
                              'directory')
@@ -137,7 +137,7 @@ def main():
                            choices=['NORMAL', 'HIGH', 'ULTRA'], default='HIGH',
                            type=str.upper,
                            help='Set the description detail level.')
-    opts_desc.add_argument('--describer-upright', '-u',
+    opts_desc.add_argument('--describer-upright', '-u', default=False,
                            action=argparse.BooleanOptionalAction,
                            help='Disable rotational invariance for feature '
                                 'detection step. Useful if the camera is '
@@ -185,7 +185,8 @@ def main():
                           type=str.lower, default='global',
                           help='MVG scene reconstruction method. Note: direct '
                                'requires an sfm file with camera poses.')
-    opts_mvg.add_argument('--mvg-priors', action=argparse.BooleanOptionalAction,
+    opts_mvg.add_argument('--mvg-priors', default=False,
+                          action=argparse.BooleanOptionalAction,
                           help='Use pose priors with SfM reconstruction')
     opts_mvg.add_argument('--mvg-refine-intrinsics', type=str.upper,
                           help='SfM intrinsic refinement options: NONE, '
@@ -194,7 +195,7 @@ def main():
                                'Note: Quoted options can be combined with '
                                '\'|\' (e.g. '
                                '\'ADJUST_FOCAL_LENGTH|ADJUST_DISTORTION\')')
-    opts_mvg.add_argument('--mvg-robust', '-r',
+    opts_mvg.add_argument('--mvg-robust', '-r', default=False,
                           action=argparse.BooleanOptionalAction,
                           help='robustly triangulate reconstructed scene')
     opts_mvg.add_argument('--mvg-autoscale', type=float,
@@ -225,9 +226,11 @@ def main():
 
     # MVG hidden opts
     opts_mvg.add_argument('--cam-db', type=str, help=configargparse.SUPPRESS)
-    opts_mvg.add_argument('--sfm-ba', action=argparse.BooleanOptionalAction,
+    opts_mvg.add_argument('--sfm-ba', default=False,
+                          action=argparse.BooleanOptionalAction,
                           help=configargparse.SUPPRESS)
-    opts_mvg.add_argument('--robust-ba', action=argparse.BooleanOptionalAction,
+    opts_mvg.add_argument('--robust-ba', default=False,
+                          action=argparse.BooleanOptionalAction,
                           help=configargparse.SUPPRESS)
     opts_mvg.add_argument('--mvg-initializer',
                           choices=['EXISTING_POSE', 'MAX_PAIR', 'AUTO_PAIR',
@@ -237,10 +240,10 @@ def main():
     opts_mvs = parser.add_argument_group('openmvs options')
     opts_mvs.add_argument('--mvs', action=argparse.BooleanOptionalAction,
                           default=True, help='Enable all MVS stages')
-    opts_mvs.add_argument('--free-space-support',
+    opts_mvs.add_argument('--free-space-support', default=False,
                           action=argparse.BooleanOptionalAction,
                           help='use free-space support in ReconstructMesh')
-    opts_mvs.add_argument('--mvs-densify',
+    opts_mvs.add_argument('--mvs-densify', default=False,
                           action=argparse.BooleanOptionalAction,
                           help='Enable point cloud densification step')
     opts_mvs.add_argument('--mvs-refine', default=True,
