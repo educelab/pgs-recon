@@ -232,7 +232,7 @@ def main():
     failed_files = [r[1] for r in results if not r[0]]
     if len(failed_files) > 0:
         logger.warning(f'{len(failed_files)} images failed to convert.')
-        meta['conversion']['failed'] = failed_files
+        meta['conversion'] = {'failed': failed_files}
         with meta_path.open('w', encoding='utf8') as f:
             json.dump(meta, f, indent=4)
 

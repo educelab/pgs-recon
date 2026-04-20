@@ -3,7 +3,7 @@ educelab-imgproc>=0.4
 imageio
 matplotlib
 numpy>=2
-opencv-python>=4.10
+opencv-python-headless>=4.10
 PyExifTool
 PySfMUtils
 scikit-image
