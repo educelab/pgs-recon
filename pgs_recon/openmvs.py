@@ -83,9 +83,23 @@ def mvs_refine(paths: Dict[str, Path], mvs_key: str, mesh_key: str,
 
 def mvs_texture(paths: Dict[str, Path], mvs_key: str, mesh_key: str,
                 file_format: str = 'ply', resolution_lvl: int = None,
-                max_size: int = 0, metadata: Dict = None,
-                output_name: str = None) -> str:
-    """Texture a mesh"""
+                max_size: int = 0, empty_color: int = None,
+                global_seam_leveling: int = None,
+                local_seam_leveling: int = None, output_name: str = None,
+                metadata: Dict = None) -> str:
+    """Texture a mesh.
+
+    ``mesh_key`` names a path in ``paths`` that lives in the ``mvs`` working dir
+    (it is referenced by basename). A caller texturing an externally produced
+    mesh should stage it into the working dir first (see retexture's
+    ``ensure_ply_mesh``).
+
+    Seam leveling and ``empty_color`` are left at OpenMVS defaults unless set.
+    Passing ``*_seam_leveling=0`` disables the per-patch brightness
+    normalization that hides seams, preserving the source radiometry — which
+    matters when texturing a scientific modality where pixel intensities are
+    the signal.
+    """
     out_key = mvs_key + '_texture'
     in_path = paths[mvs_key]
     if output_name is not None:
@@ -104,7 +118,13 @@ def mvs_texture(paths: Dict[str, Path], mvs_key: str, mesh_key: str,
     ]
     if resolution_lvl is not None:
         command.extend(['--resolution-level', str(resolution_lvl)])
+    if empty_color is not None:
+        command.extend(['--empty-color', str(empty_color)])
+    if global_seam_leveling is not None:
+        command.extend(['--global-seam-leveling', str(global_seam_leveling)])
+    if local_seam_leveling is not None:
+        command.extend(['--local-seam-leveling', str(local_seam_leveling)])
     if metadata is not None:
         metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command)
+    run_command(command, cwd=paths['mvs'])
     return out_key
