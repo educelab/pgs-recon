@@ -81,6 +81,11 @@ struct RansacObservation {
 
 auto Triangulate(const std::vector<RansacObservation> &x)
     -> std::pair<bool, Vec3> {
+  // Need at least two views to triangulate
+  if (x.size() < 2) {
+    return {false, {}};
+  }
+
   // Unzip
   std::vector<Vec3> pts;
   std::vector<Mat34> poses;
@@ -126,20 +131,20 @@ auto EvalTriangulate(const std::vector<RansacObservation> &x, const Vec3 &X)
     if (not chirality) {
       return Result{};
     }
-    // Accumulate the residual error
+    // Accumulate the squared residual error for inliers
     const auto err = ro.cam->residual(ro.pose(X), ro.obs).norm();
     if (err < threshold) {
-      result.error += err;
+      result.error += err * err;
       result.inliers.push_back(ro);
     }
   }
 
-  // calculate fitness and rmse
+  // calculate fitness and RMSE
   if (not result.inliers.empty()) {
     result.fitness = static_cast<double>(result.inliers.size()) /
                      static_cast<double>(x.size());
     result.inlier_rmse =
-        result.error / std::sqrt(static_cast<double>(result.inliers.size()));
+        std::sqrt(result.error / static_cast<double>(result.inliers.size()));
   }
   result.success = true;
   return result;
@@ -291,8 +296,10 @@ void ScaleLandmarks(pgs::Landmarks &ldms, const double scale) {
 struct ScaleStats {
   /** per-marker scale estimates */
   std::vector<double> scales;
-  /** final scale factor (the median or mean, depending on method) */
+  /** final scale factor */
   double summary{1};
+  /** label for the summary statistic (e.g. for the histogram) */
+  std::string summaryLabel{"median"};
 };
 
 /**
@@ -358,46 +365,28 @@ auto ComputeUmeyamaScaleStats(const pgs::Landmarks &landmarks,
     stats.scales.push_back(scale);
   }
 
+  // No valid markers; the caller treats empty scales as a fatal error.
   if (sws.empty()) {
-    // no valid markers
-    std::cerr << "WARNING: no markers yielded ≥3 corners; defaulting scale=1\n";
-    stats.summary = 1.0;
-  } else {
-    // sort by scale
-    std::sort(sws.begin(), sws.end(),
-              [](auto &a, auto &b) { return a.scale < b.scale; });
+    return stats;
+  }
 
-    // total weight
-    const auto W = std::accumulate(
-        sws.begin(), sws.end(), 0.0,
-        [](const auto &l, const auto &r) { return l + r.weight; });
-    const auto half = 0.5 * W;
+  // sort by scale
+  std::sort(sws.begin(), sws.end(),
+            [](auto &a, auto &b) { return a.scale < b.scale; });
 
-    // precompute weighted mean (fallback)
-    auto mean_s = std::accumulate(
-        sws.begin(), sws.end(), 0.0,
-        [](const auto &l, const auto &r) { return l + r.scale * r.weight; });
-    mean_s /= W;
+  // total weight
+  const auto W = std::accumulate(
+      sws.begin(), sws.end(), 0.0,
+      [](const auto &l, const auto &r) { return l + r.weight; });
+  const auto half = 0.5 * W;
 
-    // default to mean
-    stats.summary = mean_s;
-
-    // try weighted median
-    double cum = 0.0;
-    bool found = false;
-    for (const auto &[scale, weight] : sws) {
-      cum += weight;
-      if (cum >= half) {
-        stats.summary = scale;
-        found = true;
-        break;
-      }
-    }
-
-    if (not found) {
-      std::cerr << "WARNING: weighted median failed! falling back to weighted "
-                   "mean: "
-                << stats.summary << "\n";
+  // weighted median
+  double cum = 0.0;
+  for (const auto &[scale, weight] : sws) {
+    cum += weight;
+    if (cum >= half) {
+      stats.summary = scale;
+      break;
     }
   }
 
@@ -432,20 +421,26 @@ auto ComputeEdgeScaleStats(const pgs::Landmarks &landmarks,
 
       const auto distExpected = markerSize;
       const auto distObserved = (c1.value() - c0.value()).norm();
+      // Skip degenerate pairs to avoid division by (near-)zero
+      if (distObserved < 1e-9) {
+        continue;
+      }
       stats.scales.emplace_back(distExpected / distObserved);
     }
   }
+  // No usable distances; the caller treats empty scales as a fatal error.
   if (stats.scales.empty()) {
-    std::cerr
-        << "WARNING: No landmark distances calculated! Defaulting to scale=1\n";
-    stats.summary = 1.0;
-  } else {
-    std::cout << "Calculating scale factor from " << stats.scales.size()
-              << " distance measurements\n";
-    const auto sum =
-        std::accumulate(stats.scales.begin(), stats.scales.end(), 0.0);
-    stats.summary = sum / static_cast<double>(stats.scales.size());
+    return stats;
   }
+
+  std::cout << "Calculating scale factor from " << stats.scales.size()
+            << " distance measurements\n";
+  // Use the median for resilience against outlier measurements
+  auto sorted = stats.scales;
+  std::sort(sorted.begin(), sorted.end());
+  const auto n = sorted.size();
+  stats.summary = (n % 2 == 1) ? sorted[n / 2]
+                               : 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]);
   return stats;
 }
 
@@ -484,7 +479,7 @@ auto main(int argc, char* argv[]) -> int
     ("help,h", "print help message")
     ("input-scene,i", po::value<std::string>()->required(), "input sfm scene file")
     ("output-scene,o", po::value<std::string>(), "output sfm scene file")
-    ("scale-method", po::value<std::string>()->default_value("umeyama"), R"(scale method: "umeyama" (weighted-median) or "edge" (mean of edge lengths))")
+    ("scale-method", po::value<std::string>()->default_value("umeyama"), R"(scale method: "umeyama" (weighted-median) or "edge" (median of edge lengths))")
     ("input-mesh",  po::value<std::string>(), "input mesh file (ascii .ply only)")
     ("output-mesh", po::value<std::string>(), "output (scaled) mesh file (.ply)")
     ("histogram-out",         po::value<std::string>(), "where to write the scale‐histogram SVG")
@@ -522,6 +517,10 @@ auto main(int argc, char* argv[]) -> int
 
   // Marker size (0.47 cm for the sample square)
   auto markerSize = args["marker-size"].as<double>();
+  if (markerSize <= 0.0) {
+    std::cerr << "ERROR: --marker-size must be a positive value\n";
+    return BAD_ARG;
+  }
 
   // Write a histogram if requested
   bool doHistogram = args.count("histogram-out") > 0;
@@ -622,17 +621,18 @@ auto main(int argc, char* argv[]) -> int
         option::MaxProgress{numIters});
   }
   for (const auto &[viewID, view] : views) {
-    // Ignore if it doesn't pass the filter
-    if (not filter(view)) {
+    // Load the image (views were already filtered above)
+    auto path = view->s_Img_path;
+    fs::path fullPath = sfmRoot / path;
+    auto image = cv::imread(fullPath);
+    if (image.empty()) {
+      std::cout << "WARNING: Could not load image, skipping: "
+                << fullPath.string() << "\n";
       if (bar) {
         bar->tick();
       }
       continue;
     }
-
-    // Load the image
-    auto path = view->s_Img_path;
-    auto image = cv::imread(sfmRoot / path);
 
     // Undistort the images
     if (undistortImages) {
@@ -668,10 +668,10 @@ auto main(int argc, char* argv[]) -> int
 
       // Track the marker corner observations
       const auto &corners = res.markerCorners[idx];
-      for (int i = 0; i < corners.size(); i++) {
+      for (std::size_t i = 0; i < corners.size(); i++) {
         // Get the stored landmark
         pgs::Landmark *ldm;
-        const auto cornerID = GetLandmarkID(markerID, i);
+        const auto cornerID = GetLandmarkID(markerID, static_cast<int>(i));
         if (landmarks.count(cornerID) == 0) {
           landmarks.insert({cornerID, {}});
         }
@@ -724,7 +724,7 @@ auto main(int argc, char* argv[]) -> int
     // Triangulate
     bool success{false};
     Vec3 X;
-    if (not args["no-ransac"].as<bool>()) {
+    if (useRansac) {
       std::tie(success, X) = TriangulateRansac(x);
     } else {
       std::tie(success, X) = Triangulate(x);
@@ -750,18 +750,25 @@ auto main(int argc, char* argv[]) -> int
   ScaleStats stats;
   if (scaleMethod == "edge") {
     stats = ComputeEdgeScaleStats(landmarks, markerIDs, markerSize);
-    std::cout << "Edge-length mean scale: " << stats.summary << "\n";
+    std::cout << "Edge-length median scale: " << stats.summary << "\n";
   } else {
     stats = ComputeUmeyamaScaleStats(landmarks, markerIDs, markerSize);
-    std::cout << "Umeyama median scale:   " << stats.summary << "\n";
+    std::cout << "Umeyama median scale:     " << stats.summary << "\n";
+  }
+
+  // Bail out if no marker yielded a usable scale estimate, rather than
+  // silently applying the default scale of 1.0
+  if (stats.scales.empty()) {
+    std::cout << "ERROR: Could not estimate scale from the detected markers!\n";
+    return NO_SCALES;
   }
 
   // Save a histogram file
   if (doHistogram) {
     fs::path histPath = args["histogram-out"].as<std::string>();
-    auto label = (scaleMethod == "edge") ? "mean" : "median";
     std::cout << "Saving histogram file: " << histPath << "\n";
-    pgs::WriteScaleHistogram(histPath, stats.scales, stats.summary, label);
+    pgs::WriteScaleHistogram(histPath, stats.scales, stats.summary,
+                             stats.summaryLabel);
   }
 
   // Scale and save the scene

@@ -61,7 +61,7 @@ auto RANSAC(const Xs &x, const FitFunc &fit, const EvalFunc &eval,
     // Update our best models
     auto improvedFitness = result.fitness > bestResult.fitness;
     auto improvedRMSE = result.fitness == bestResult.fitness and
-                        result.inlier_rmse > bestResult.inlier_rmse;
+                        result.inlier_rmse < bestResult.inlier_rmse;
     if (improvedFitness or improvedRMSE) {
       bestResult = result;
       bestModel = model;
@@ -75,6 +75,14 @@ auto RANSAC(const Xs &x, const FitFunc &fit, const EvalFunc &eval,
       }
     } // if improved
   } // for nIters
+
+  // If we never found a usable model, report failure rather than refitting on
+  // an empty inlier set with an uninitialized model (which is undefined
+  // behavior in the fit function).
+  if (not bestResult.success or bestResult.inliers.empty()) {
+    bestResult.success = false;
+    return std::make_pair(bestModel, bestResult);
+  }
 
   // Finalize the best result and model
   bestResult = eval(x, bestModel);
