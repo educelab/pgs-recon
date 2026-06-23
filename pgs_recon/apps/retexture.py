@@ -157,6 +157,251 @@ def convert_modality_images(pos_map: Dict[int, Path], out_dir: Path,
     return out_names
 
 
+def prepare_8bit_image(src: Path, out_dir: Path) -> Path:
+    """Write an 8-bit sRGB copy of a single image via ImageMagick ``convert``.
+
+    Unlike ``convert_modality_images`` (which keeps a *set* of frames mutually
+    consistent with a uniform bit-shift for atlas texturing), this handles ONE
+    standalone overhead image that becomes its own texture. ImageMagick reads
+    the embedded colorspace and bit depth, so it correctly handles 16-bit and
+    non-RGB inputs such as the EduceLab CIELab TIFFs (which OpenCV would
+    misread channel-for-channel). Per-image tone mapping is fine here because
+    each modality image is textured independently. Returns the output path.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f'{src.stem}.jpg'
+    command = [
+        'convert', str(src.resolve()),
+        '-colorspace', 'sRGB', '-depth', '8', '-type', 'TrueColor',
+        '-quality', '100', str(out.resolve()),
+    ]
+    run_command(command)
+    if not out.is_file():
+        sys.exit(f'Failed to prepare 8-bit image from {src}')
+    logger.info(f'Prepared 8-bit image: {out}')
+    return out
+
+
+def repoint_calibration(calibration_json: Path, image: Path,
+                        out_json: Path) -> None:
+    """Re-point a single-view ``pgs-calibrate`` calibration at ``image``.
+
+    The calibration carries one localized view (pose + intrinsic) in the solved
+    frame. Texturing a different modality from the same physical pose is just a
+    pixel swap: set the lone view's filename to ``image`` and root the scene at
+    its directory. The modality image MUST match the calibrated intrinsic's pixel
+    dimensions (same camera, same resolution), or undistortion/projection in
+    openMVG2openMVS would be wrong; this is validated and aborts on mismatch.
+
+    OpenMVS TextureMesh rejects a single-image scene ("invalid project",
+    verified against v2.3.0), so an inert 1x1 dummy view is appended to satisfy
+    its >=2 image requirement. A 1x1 image has effectively zero resolution, so
+    OpenMVS's view-quality ranking never selects it for any face (verified: it
+    textures 0 faces) — it only pads the image count, and costs ~nothing on disk
+    (vs. copying the full-size modality image). The dummy gets its own 1x1
+    intrinsic so openMVG2openMVS undistorts it trivially.
+
+    ``image`` must be a path inside a writable work directory: a sibling file
+    ``__retex_dummy__.png`` is created there. Do not pass a path into a
+    read-only source tree.
+    """
+    data = json.loads(calibration_json.read_text())
+    views = data.get('views', [])
+    intrinsics = data.get('intrinsics', [])
+    if len(views) != 1 or len(data.get('extrinsics', [])) != 1 \
+            or len(intrinsics) != 1:
+        sys.exit(f'Calibration {calibration_json} must contain exactly one '
+                 f'view, pose and intrinsic; is this a pgs-calibrate output?')
+    vd = views[0]['value']['ptr_wrapper']['data']
+
+    img = cv2.imread(str(image), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        sys.exit(f'Could not read modality image: {image}')
+    h, w = img.shape[:2]
+    if (w, h) != (vd['width'], vd['height']):
+        sys.exit(f'Modality image {image.name} is {w}x{h} but the calibration '
+                 f'was solved for {vd["width"]}x{vd["height"]}. All modalities '
+                 f'must share the calibrated camera\'s resolution.')
+
+    vd['filename'] = image.name
+    vd['local_path'] = ''
+
+    # Append an inert 1x1 dummy view (with its own 1x1 intrinsic + a copied
+    # pose) so OpenMVS sees a >=2 image scene. New keys/cereal ptr ids are
+    # placed above everything already present to avoid collisions.
+    dummy_img = image.with_name('__retex_dummy__.png')
+    cv2.imwrite(str(dummy_img), np.zeros((1, 1, 3), np.uint8))
+    new_view_key = max(v['key'] for v in views) + 1
+    new_intr_key = max(i['key'] for i in intrinsics) + 1
+    next_ptr = max(e['value']['ptr_wrapper']['id']
+                   for e in views + intrinsics) + 1
+
+    dummy_view = json.loads(json.dumps(views[0]))  # deep copy
+    dummy_view['key'] = new_view_key
+    dvd = dummy_view['value']['ptr_wrapper']['data']
+    dvd['id_view'] = new_view_key
+    dvd['id_pose'] = new_view_key
+    dvd['id_intrinsic'] = new_intr_key
+    dvd['filename'] = dummy_img.name
+    dvd['local_path'] = ''
+    dvd['width'] = dvd['height'] = 1
+    dummy_view['value']['ptr_wrapper']['id'] = next_ptr
+    data['views'].append(dummy_view)
+
+    dummy_intr = json.loads(json.dumps(intrinsics[0]))
+    dummy_intr['key'] = new_intr_key
+    dummy_intr['value']['ptr_wrapper']['id'] = next_ptr + 1
+    did = dummy_intr['value']['ptr_wrapper']['data']
+    did['width'] = did['height'] = 1
+    did['focal_length'] = 1.0
+    did['principal_point'] = [0.5, 0.5]
+    # Reference the already-registered polymorphic type by bare id (drop the
+    # registration bit + name; intrinsics[0] is the registering instance).
+    dummy_intr['value']['polymorphic_id'] = \
+        intrinsics[0]['value'].get('polymorphic_id', 0) & ~_POLY_FLAG
+    dummy_intr['value'].pop('polymorphic_name', None)
+    data['intrinsics'].append(dummy_intr)
+
+    dummy_pose = json.loads(json.dumps(data['extrinsics'][0]))
+    dummy_pose['key'] = new_view_key
+    data['extrinsics'].append(dummy_pose)
+
+    data['root_path'] = str(image.parent.resolve())
+    data['structure'] = []
+    data['control_points'] = []
+    out_json.write_text(json.dumps(data, indent=2))
+    logger.info(f'Re-pointed calibration at {image.name} ({w}x{h}); '
+                f'wrote scene (+1x1 dummy view) -> {out_json}')
+
+
+def load_obj_mesh(mesh_path: Path):
+    """Load an OBJ as (vertices Nx3 float64, triangles Mx3 int), ignoring any
+    existing texture coords/normals/materials (we regenerate UVs). Polygons are
+    fan-triangulated; face vertex references use the first (position) index."""
+    verts = []
+    faces = []
+    with mesh_path.open() as fh:
+        for line in fh:
+            if line.startswith('v '):
+                p = line.split()
+                verts.append((float(p[1]), float(p[2]), float(p[3])))
+            elif line.startswith('f '):
+                idx = [int(t.split('/')[0]) - 1 for t in line.split()[1:]]
+                for i in range(1, len(idx) - 1):
+                    faces.append((idx[0], idx[i], idx[i + 1]))
+    return np.asarray(verts, dtype=np.float64), np.asarray(faces, dtype=np.int64)
+
+
+def _camera_from_calibration(calibration_json: Path):
+    """Extract (R, C, f, cx, cy, W, H, disto) from a one-view calibration."""
+    cal = json.loads(calibration_json.read_text())
+    did = cal['intrinsics'][0]['value']['ptr_wrapper']['data']
+    f = did['focal_length']
+    cx, cy = did['principal_point']
+    W, H = did['width'], did['height']
+    disto = None
+    if 'disto_k3' in did:               # [k1, k2, k3]
+        disto = list(did['disto_k3'])
+    elif 'disto_k1' in did:             # [k1]
+        disto = list(did['disto_k1']) + [0.0, 0.0]
+    e = cal['extrinsics'][0]['value']
+    R = np.asarray(e['rotation'], dtype=np.float64)   # X_cam = R (X - C)
+    C = np.asarray(e['center'], dtype=np.float64)
+    return R, C, f, cx, cy, W, H, disto
+
+
+def project_texture_mesh(calibration_json: Path, texture_image: Path,
+                         mesh_path: Path, out_obj: Path,
+                         backface_cull: bool = True,
+                         metadata: Dict = None) -> None:
+    """Texture a mesh by projecting it through the calibrated view, so the OBJ's
+    UVs index the *original* modality image directly (no OpenMVS atlas, no
+    resampling). Because the UVs depend only on the camera + mesh — identical
+    across modalities — every modality reuses these UVs and only swaps ``map_Kd``.
+
+    Each vertex is projected with the calibrated pose/intrinsic to a pixel, then
+    to a UV (image origin is top-left, OBJ's is bottom-left, so v is flipped).
+    A triangle is textured only if all three vertices are in front of the camera
+    and inside the image, and (if ``backface_cull``) the face points toward the
+    camera — which drops a closed mesh's hidden underside and grazing edges.
+    Triangles outside the view are omitted (that surface was not imaged), the
+    single-view analogue of OpenMVS' empty-color.
+
+    NOTE: this does not do depth-based occlusion, so a surface that overhangs
+    itself would project the foreground onto the hidden region. For the open
+    surface meshes this targets the effect is negligible; use ``--use-openmvs``
+    when true occlusion handling is required.
+    """
+    R, C, f, cx, cy, W, H, disto = _camera_from_calibration(calibration_json)
+    V, F = load_obj_mesh(mesh_path)
+    if len(V) == 0 or len(F) == 0:
+        sys.exit(f'Mesh {mesh_path} has no geometry to texture')
+
+    Xc = (R @ (V - C).T).T
+    Z = Xc[:, 2]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        x = Xc[:, 0] / Z
+        y = Xc[:, 1] / Z
+    if disto is not None:
+        r2 = x * x + y * y
+        rad = 1.0 + disto[0] * r2 + disto[1] * r2 * r2 + disto[2] * r2 ** 3
+        x, y = x * rad, y * rad
+    u = f * x + cx
+    v = f * y + cy
+
+    valid = (Z > 1e-9) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    keep = valid[F].all(axis=1)
+    if backface_cull:
+        v0, v1, v2 = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
+        normal = np.cross(v1 - v0, v2 - v0)
+        centroid = (v0 + v1 + v2) / 3.0
+        keep &= np.einsum('ij,ij->i', normal, C - centroid) > 0
+    Fk = F[keep]
+    if len(Fk) == 0:
+        logger.warning('No triangles fall within the calibrated view; '
+                       'the output mesh will have no texture '
+                       '(is the calibration for this mesh?).')
+
+    # OBJ texture coords: flip v; clamp tiny FP overshoot.
+    uv = np.column_stack([np.clip(u / W, 0.0, 1.0),
+                          np.clip(1.0 - v / H, 0.0, 1.0)])
+
+    out_obj.parent.mkdir(parents=True, exist_ok=True)
+    # Copy the original image beside the mesh, renamed to match the mesh stem so
+    # the texture is consistently named and easy to pair with its OBJ. The
+    # original's extension/format is preserved (no conversion).
+    tex_dst = out_obj.parent / f'{out_obj.stem}{texture_image.suffix}'
+    if texture_image.resolve() != tex_dst.resolve():
+        shutil.copy(texture_image, tex_dst)
+    mtl = out_obj.with_suffix('.mtl')
+    with mtl.open('w') as fh:
+        fh.write('newmtl material_0\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nillum 1\n')
+        fh.write(f'map_Kd {tex_dst.name}\n')
+    with out_obj.open('w') as fh:
+        fh.write(f'mtllib {mtl.name}\n')
+        np.savetxt(fh, V, fmt='v %.6f %.6f %.6f')
+        np.savetxt(fh, uv, fmt='vt %.6f %.6f')
+        fh.write('usemtl material_0\n')
+        # In-view faces: textured (v/vt/vt references).
+        if len(Fk) > 0:
+            f1k = Fk + 1                  # OBJ indices are 1-based
+            face_cols = np.column_stack([f1k[:, 0], f1k[:, 0], f1k[:, 1], f1k[:, 1],
+                                         f1k[:, 2], f1k[:, 2]])
+            np.savetxt(fh, face_cols, fmt='f %d/%d %d/%d %d/%d')
+        # Out-of-view faces: preserved without UV (v references only).
+        Fu = F[~keep]
+        if len(Fu) > 0:
+            np.savetxt(fh, Fu + 1, fmt='f %d %d %d')
+
+    if metadata is not None:
+        metadata['commands'][current_timestamp()] = (
+            f'project_texture_mesh mesh={mesh_path.name} '
+            f'texture={tex_dst.name} -> {out_obj.name}')
+    logger.info(f'Projected texture: {len(Fk)}/{len(F)} triangles textured '
+                f'({100.0 * len(Fk) / len(F):.1f}% of mesh in view); '
+                f'map_Kd={tex_dst.name} -> {out_obj}')
+
+
 def sfm_to_json(sfm_path: Path, out_json: Path, bin_dir: Path,
                 metadata: Dict = None) -> Path:
     """Export an OpenMVG SfM_Data (.bin/.json) to JSON with only views,
@@ -367,17 +612,43 @@ def main():
     parser.add_argument('--config', '-c', is_config_file=True,
                         help='Config file path')
     parser.add_argument('--modality-images', '-i', required=True,
-                        help='Directory of modality images (tif/jpg/png) for '
-                             'one camera. 16-bit images are converted to 8-bit. '
-                             'Filenames MUST follow the PGS-scan convention '
-                             '{prefix}_{camera}_{position}_{capture}; images are '
-                             'matched to SfM views by (camera, position).')
+                        help='Modality image input. Without --calibration: a '
+                             'DIRECTORY of images for one rig camera, matched to '
+                             'SfM views by the PGS-scan filename convention '
+                             '{prefix}_{camera}_{position}_{capture}. With '
+                             '--calibration: a SINGLE image file captured from '
+                             'the calibrated pose (any filename).')
+    parser.add_argument('--calibration', default=None,
+                        help='A pgs-calibrate calibration .json (one localized '
+                             'view). Textures the mesh from that new pose with '
+                             'the single image given by -i, instead of reusing a '
+                             'rig camera\'s positions. --camera-index/--sfm-data '
+                             'are ignored in this mode.')
+    parser.add_argument('--use-openmvs', action='store_true',
+                        help='With --calibration, texture via OpenMVS TextureMesh '
+                             '(regenerates UVs into a resampled atlas; does true '
+                             'occlusion) instead of the default projective UV '
+                             'mapping (UVs point at the original full-res image, '
+                             'reused across modalities).')
+    parser.add_argument('--no-backface-cull', action='store_true',
+                        help='With projective UV mapping, keep faces pointing '
+                             'away from the camera (default culls them, dropping '
+                             'a closed mesh\'s hidden underside).')
+    parser.add_argument('--convert-texture', action='store_true',
+                        help='With projective UV mapping and --calibration: '
+                             'convert the modality image to 8-bit sRGB via '
+                             'ImageMagick before copying it as the texture. '
+                             'Needed for CIELab TIFFs and other non-sRGB '
+                             'inputs that would render with wrong colors in '
+                             'standard viewers. Default: copy the original '
+                             'file as-is (full fidelity for standard sRGB).')
     parser.add_argument('--recon-dir', '-r', required=True,
                         help='A completed pgs-recon output directory. The solved '
                              'SfM and the textured mesh are located from its '
                              'metadata.json (override with --sfm-data). The recon '
                              'must have used PGS-named images (its SfM view '
-                             'filenames must match the convention above).')
+                             'filenames must match the convention above). With '
+                             '--calibration only the mesh is taken from here.')
     parser.add_argument('--sfm-data', '-s', default=None,
                         help='Override the solved OpenMVG SfM_Data (.bin/.json) '
                              'to texture from. Defaults to the SfM that produced '
@@ -428,13 +699,16 @@ def main():
     global logger
     logger = logging.getLogger('pgs-retexture')
 
-    modality_dir = Path(args.modality_images)
+    modality_input = Path(args.modality_images)
     recon_dir = Path(args.recon_dir)
+    calibration = Path(args.calibration) if args.calibration else None
     if args.name is None:
-        args.name = modality_dir.resolve().name
+        # Calibration mode is a single image; the legacy mode is a directory.
+        args.name = (modality_input.resolve().stem if calibration
+                     else modality_input.resolve().name)
 
-    # Locate the SfM solution and mesh from the reconstruction (unless the SfM
-    # is overridden); the mesh always comes from the reconstruction.
+    # The mesh always comes from the reconstruction. The SfM does too in the
+    # legacy mode; in calibration mode the calibration .json is the scene.
     sfm_default, mesh_in = resolve_recon_inputs(recon_dir)
     sfm_data = Path(args.sfm_data) if args.sfm_data else sfm_default
 
@@ -477,22 +751,54 @@ def main():
 
     write_metadata()
 
-    # 1. Index + convert modality images
-    logger.info('Indexing modality images')
-    camera_index, pos_map = index_modality_images(modality_dir,
-                                                  args.camera_index)
-    logger.info('Preparing 8-bit modality images')
-    pos_to_name = convert_modality_images(pos_map, paths['modality_8bit'],
-                                          args.bit_shift)
-
-    # 2. Export + filter the SfM solution
-    logger.info('Exporting SfM solution to JSON')
-    sfm_to_json(sfm_data, paths['sfm_full'], paths['BIN'],
-                metadata=metadata)
-    logger.info('Filtering SfM scene to the modality camera')
-    filter_sfm_for_camera(paths['sfm_full'], camera_index,
-                          paths['modality_8bit'], pos_to_name,
-                          paths['sfm_filtered'])
+    # 1-2. Build the single-camera SfM scene to texture from. Two modes:
+    if calibration is not None:
+        # New pose from pgs-calibrate: texture from one localized view, swapping
+        # in the chosen modality image. No filename convention is needed.
+        if not modality_input.is_file():
+            sys.exit('--calibration mode expects -i to be a single image file, '
+                     f'got: {modality_input}')
+        if not args.use_openmvs:
+            # Default: project the mesh into the calibrated view so the OBJ's UVs
+            # point straight at the image (no OpenMVS atlas resampling; UVs
+            # reused across modalities). Projection reads only pose + mesh.
+            if args.file_type != 'obj':
+                logger.warning('Projective UV mapping writes OBJ with an '
+                               'external texture; ignoring --file-type '
+                               f'{args.file_type}.')
+            out_obj = paths['mvs'] / f'{args.name}.obj'
+            tex_img = modality_input
+            if args.convert_texture:
+                logger.info('Converting modality image to 8-bit sRGB')
+                tex_img = prepare_8bit_image(modality_input,
+                                             paths['modality_8bit'])
+            logger.info('Projecting mesh into calibrated view for UV mapping')
+            project_texture_mesh(calibration, tex_img, mesh_in, out_obj,
+                                 backface_cull=not args.no_backface_cull,
+                                 metadata=metadata)
+            logger.info(f'Done. Re-textured mesh: {out_obj}')
+            return
+        # OpenMVS path: undistortion reads pixels, so it needs an 8-bit image.
+        logger.info('Preparing 8-bit modality image')
+        conv = prepare_8bit_image(modality_input, paths['modality_8bit'])
+        logger.info('Re-pointing calibration at the modality image')
+        repoint_calibration(calibration, conv, paths['sfm_filtered'])
+    else:
+        # Legacy mode: reuse a rig camera's solved positions, matched by the
+        # PGS-scan filename convention.
+        logger.info('Indexing modality images')
+        camera_index, pos_map = index_modality_images(modality_input,
+                                                      args.camera_index)
+        logger.info('Preparing 8-bit modality images')
+        pos_to_name = convert_modality_images(pos_map, paths['modality_8bit'],
+                                              args.bit_shift)
+        logger.info('Exporting SfM solution to JSON')
+        sfm_to_json(sfm_data, paths['sfm_full'], paths['BIN'],
+                    metadata=metadata)
+        logger.info('Filtering SfM scene to the modality camera')
+        filter_sfm_for_camera(paths['sfm_full'], camera_index,
+                              paths['modality_8bit'], pos_to_name,
+                              paths['sfm_filtered'])
 
     # 3. MVG -> MVS (undistorts modality images with original intrinsics)
     logger.info('Building MVS scene from modality views')
