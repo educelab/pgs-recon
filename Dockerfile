@@ -88,11 +88,24 @@ RUN if [ "${USE_CUDA}" = "ON" ]; then  \
     && git config --global --add safe.directory /usr/local/educelab/pgs-recon/
 
 # Install ExifTool
-RUN mkdir -p /usr/local/educelab/exiftool/  \
+# exiftool.org has intermittent hosting outages, so prefer the SourceForge
+# mirror (which is reliable with retries) and fall back to exiftool.org. The
+# SourceForge mirror redirector can hand back HTML error pages instead of the
+# tarball, so validate the download with `gzip -t` before extracting.
+RUN set -eux \
+    && mkdir -p /usr/local/educelab/exiftool/ \
     && cd /usr/local/educelab/exiftool/ \
-    && export EXIFTOOL_VER=$(curl --silent https://exiftool.org/ver.txt) \
-    && curl -O -L https://exiftool.org/Image-ExifTool-${EXIFTOOL_VER}.tar.gz \
-    && tar -xzf Image-ExifTool-${EXIFTOOL_VER}.tar.gz && cd Image-ExifTool-${EXIFTOOL_VER}/ \
+    && EXIFTOOL_VER="$(curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://exiftool.sourceforge.net/ver.txt \
+        || curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://exiftool.org/ver.txt)" \
+    && echo "Installing ExifTool ${EXIFTOOL_VER}" \
+    && TARBALL="Image-ExifTool-${EXIFTOOL_VER}.tar.gz" \
+    && ( curl -fSL --retry 5 --retry-delay 3 --retry-all-errors -o "${TARBALL}" \
+            "https://downloads.sourceforge.net/project/exiftool/${TARBALL}" \
+         || curl -fSL --retry 5 --retry-delay 3 --retry-all-errors -o "${TARBALL}" \
+            "https://exiftool.org/${TARBALL}" ) \
+    && gzip -t "${TARBALL}" \
+    && tar -xzf "${TARBALL}" \
+    && cd "Image-ExifTool-${EXIFTOOL_VER}/" \
     && perl Makefile.PL && make test && make install
 
 ENV PATH="/usr/local/educelab/pgs-recon/.venv/bin:$PATH"
