@@ -1,7 +1,25 @@
+from enum import IntEnum
 from pathlib import Path
 from typing import Dict
 
 from pgs_recon.utility import current_timestamp, run_command
+
+
+class CameraModel(IntEnum):
+    PINHOLE = 1
+    RADIAL_1 = 2
+    RADIAL_3 = 3
+    RADIAL_3_TANGENTIAL = 4
+    FISHEYE = 5
+
+
+class ResectionMethod(IntEnum):
+    DLT = 0
+    P3P_KE = 1
+    P3P_KNEIP = 2
+    P3P_NORDBERG = 3
+    UP2P = 4
+    P3P_KNEIP_UPNP = 5
 
 
 def init_sfm_generic(paths: Dict[str, Path], focal_length=None,
@@ -177,6 +195,53 @@ def mvg_colorize_sfm(paths: Dict[str, Path], sfm_key: str,
         metadata['commands'][current_timestamp()] = (str(' ').join(command))
     run_command(command)
     return sfm_colorized_key
+
+
+def mvg_localize(paths: Dict[str, Path], sfm_key: str, query_key: str,
+                 out_key: str, match_out_key: str,
+                 camera_model: int = None, resection_method: int = None,
+                 residual_error: float = None, single_intrinsics: bool = False,
+                 export_structure: bool = False, threads: int = None,
+                 metadata: Dict = None) -> str:
+    """Localize new image(s) into an existing SfM reconstruction.
+
+    Resections each image in the ``query_key`` directory against the database
+    scene ``sfm_key`` (which must carry structure) using the database regions in
+    ``paths['matches_dir']``. New query regions are written to ``match_out_key``
+    so the original matches directory is left untouched. Writes
+    ``sfm_data_expanded.json`` (database views plus the localized query views) to
+    the ``out_key`` directory; returns the key of that file.
+
+    For an uncalibrated camera leave ``single_intrinsics`` off so a fresh
+    intrinsic is estimated. ``resection_method=0`` (DLT) does not require known
+    intrinsics and so recovers focal length as part of the pose; the P3P methods
+    assume a calibrated camera.
+    """
+    command = [
+        str(paths['BIN'] / 'openMVG_main_SfM_Localization'),
+        '-i', str(paths[sfm_key].resolve()),
+        '-m', str(paths['matches_dir'].resolve()),
+        '-u', str(paths[match_out_key].resolve()),
+        '-o', str(paths[out_key].resolve()),
+        '-q', str(paths[query_key].resolve()),
+    ]
+    if camera_model is not None:
+        command.extend(['-c', str(camera_model)])
+    if resection_method is not None:
+        command.extend(['-R', str(resection_method)])
+    if residual_error is not None:
+        command.extend(['-r', str(residual_error)])
+    if single_intrinsics:
+        command.append('-s')
+    if export_structure:
+        command.append('-e')
+    if threads is not None:
+        command.extend(['-n', str(threads)])
+    if metadata is not None:
+        metadata['commands'][current_timestamp()] = (str(' ').join(command))
+    run_command(command)
+    paths['sfm_expanded'] = paths[out_key] / 'sfm_data_expanded.json'
+    return 'sfm_expanded'
 
 
 def mvg_to_mvs(paths: Dict[str, Path], sfm_key: str, threads: int = None,
