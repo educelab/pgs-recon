@@ -166,7 +166,7 @@ def bounding_box_calibration(polydata, max_edge, mid_edge, max_dir, mid_dir,
 
 # automatically scale and orient a mesh by detecting the EL sample square
 # assumes the texture image has been reordered
-def sample_square_calibration(mesh, img, edges):
+def sample_square_calibration(mesh, img, edges, compute_scale=True):
     # Defaults
     scale = np.eye(4, dtype=np.float32)
     r = np.eye(3, dtype=np.float32)
@@ -254,6 +254,10 @@ def sample_square_calibration(mesh, img, edges):
         print('Warning: No markers detected. Cannot calculate orientation.')
 
     # SCALE
+    if not compute_scale:
+        print('Skipping scale (--no-scale).')
+        return detected, scale, r, img if flip is not None or rotate is not None else None
+
     print('Calculating scale...')
     # Convert pixels to 3D points
     kp_pos = []
@@ -320,6 +324,10 @@ def main():
     parser.add_argument('--save-transform',
                         help='If provided, save the centering transform to the '
                              'given file path.')
+    parser.add_argument('--no-scale', action='store_true',
+                        help='If provided, suppress scaling: only translation '
+                             'and rotation are applied. Has no effect when '
+                             '--load-transform is used.')
 
     ss_opts = parser.add_argument_group('sample square calibration options')
     ss_opts.add_argument('--use-marker-dirs', action='store_true',
@@ -430,7 +438,7 @@ def main():
             if not args.use_marker_dirs:
                 edges = (max_edge, mid_edge, min_edge)
             detected, scale, rot[0:3, 0:3], new_img = sample_square_calibration(
-                mesh, img, edges)
+                mesh, img, edges, compute_scale=not args.no_scale)
 
         # Fallback to bounding box method if sample square disabled/failed
         if not args.sample_square_calibration or not detected:
