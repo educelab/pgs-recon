@@ -20,28 +20,21 @@
 
 #include <indicators/progress_bar.hpp>
 
-#include <openMVG/cameras/Camera_Pinhole.hpp>
 #include <openMVG/geometry/Similarity3.hpp>
-#include <openMVG/multiview/triangulation_nview.hpp>
 #include <openMVG/sfm/sfm_data.hpp>
 #include <openMVG/sfm/sfm_data_io.hpp>
 #include <openMVG/sfm/sfm_data_transform.hpp>
 
-#include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
-#include <opencv2/core/eigen.hpp>
 #include <opencv2/imgcodecs.hpp>
-#include <opencv2/imgproc.hpp>
-#include <opencv2/objdetect/aruco_board.hpp>
 #include <opencv2/objdetect/aruco_detector.hpp>
 #include <opencv2/objdetect/charuco_detector.hpp>
 
 #include <Eigen/Core>
-#include <Eigen/Geometry>
 
-#include "RANSAC.hpp"
 #include "global_scaler_io.hpp"
-#include "global_scaler_types.hpp"
+#include "marker_detection.hpp"
+#include "marker_types.hpp"
 
 namespace ar = cv::aruco;
 namespace el = educelab;
@@ -49,241 +42,9 @@ namespace fs = std::filesystem;
 namespace po = boost::program_options;
 using namespace openMVG;
 using namespace indicators;
-using namespace ransac;
+using namespace pgs;
 
 namespace {
-/** List of ArUco IDs */
-using IDList = std::vector<int>;
-/** List of a single ArUco marker's corner locations */
-using CornersList = std::vector<cv::Point2f>;
-/** List of ArUco markers */
-using CornersArray = std::vector<CornersList>;
-/** Result from running an ArUco detection method */
-struct DetectionResult {
-    IDList charucoIDs;
-    CornersList charucoCorners;
-    IDList markerIds;
-    CornersArray markerCorners;
-    CornersArray rejected;
-};
-
-struct RansacObservation {
-  using Cam = std::shared_ptr<cameras::IntrinsicBase>;
-  RansacObservation() = default;
-  RansacObservation(Vec2 obs, Vec3 pt, Cam cam, geometry::Pose3 pose)
-      : obs{std::move(obs)}, pt{std::move(pt)}, cam{std::move(cam)},
-        pose{std::move(pose)} {}
-  Vec2 obs;
-  Vec3 pt;
-  Cam cam;
-  geometry::Pose3 pose;
-};
-
-auto Triangulate(const std::vector<RansacObservation> &x)
-    -> std::pair<bool, Vec3> {
-  // Need at least two views to triangulate
-  if (x.size() < 2) {
-    return {false, {}};
-  }
-
-  // Unzip
-  std::vector<Vec3> pts;
-  std::vector<Mat34> poses;
-  pts.reserve(x.size());
-  poses.reserve(x.size());
-  for (const auto &ro : x) {
-    pts.push_back(ro.pt);
-    poses.push_back(ro.pose.asMatrix());
-  }
-
-  // Fit
-  const Map<const Mat3X> mtx(pts[0].data(), 3, pts.size());
-  Vec4 Xh;
-  if (not TriangulateNViewAlgebraic(mtx, poses, &Xh)) {
-    return {false, {}};
-  }
-  Vec3 X = Xh.hnormalized();
-
-  if (X.hasNaN()) {
-    return {false, {}};
-  }
-
-  // Test validity (in front of the cameras)
-  for (const auto &ro : x) {
-    auto chirality = ro.pt.dot(ro.pose(X)) > 0.0;
-    if (not chirality) {
-      return {false, {}};
-    }
-  }
-
-  return {true, X};
-}
-
-auto EvalTriangulate(const std::vector<RansacObservation> &x, const Vec3 &X)
-    -> RANSACResult<RansacObservation, double> {
-  using Result = RANSACResult<RansacObservation, double>;
-  Result result;
-  result.error = 0.;
-  constexpr double threshold = 0.1;
-  for (const auto &ro : x) {
-    // If any views fail chirality, it's a bad model
-    const auto chirality = ro.pt.dot(ro.pose(X)) > 0.0;
-    if (not chirality) {
-      return Result{};
-    }
-    // Accumulate the squared residual error for inliers
-    const auto err = ro.cam->residual(ro.pose(X), ro.obs).norm();
-    if (err < threshold) {
-      result.error += err * err;
-      result.inliers.push_back(ro);
-    }
-  }
-
-  // calculate fitness and RMSE
-  if (not result.inliers.empty()) {
-    result.fitness = static_cast<double>(result.inliers.size()) /
-                     static_cast<double>(x.size());
-    result.inlier_rmse =
-        std::sqrt(result.error / static_cast<double>(result.inliers.size()));
-  }
-  result.success = true;
-  return result;
-}
-
-auto TriangulateRansac(const std::vector<RansacObservation> &x)
-    -> std::pair<bool, Vec3> {
-  constexpr std::size_t nIters = 1000;
-  constexpr std::size_t nSamples = 2;
-  // fixed seed for reproducibility
-  constexpr std::uint_fast32_t seed = 0;
-  const auto [X, res] =
-      RANSAC(x, Triangulate, EvalTriangulate, nSamples, nIters, seed);
-  return {res.success, X};
-}
-
-/** Detect ArUco markers */
-auto DetectMarkers(const cv::Mat &image, const ar::DetectorParameters &params)
-    -> DetectionResult {
-  const auto dict = ar::getPredefinedDictionary(ar::DICT_ARUCO_ORIGINAL);
-  const ar::ArucoDetector detector(dict, params);
-
-  DetectionResult res;
-  detector.detectMarkers(image, res.markerCorners, res.markerIds, res.rejected);
-
-  return res;
-}
-
-/** (EduceLab Sample Square only) Generate a ChArUco board */
-auto GenerateBoard(int offset = 0) {
-    auto dict = ar::getPredefinedDictionary(ar::DICT_ARUCO_ORIGINAL);
-    dict.bytesList = dict.bytesList({offset, offset + 4}, cv::Range::all());
-    auto board = ar::CharucoBoard({3, 3}, 10, 7, dict);
-    return board;
-}
-
-/** Detect a ChArUco board */
-auto DetectBoard(const cv::Mat &image, const ar::CharucoBoard &board,
-                 const ar::DetectorParameters &params) -> DetectionResult {
-  // Adjust detector scale relative to largest dimension
-
-  ar::CharucoParameters charucoParams;
-  charucoParams.tryRefineMarkers = true;
-
-  // Detect the Aruco markers
-  const ar::CharucoDetector detector(board, charucoParams, params);
-  DetectionResult res;
-  detector.detectBoard(image, res.charucoCorners, res.charucoIDs,
-                       res.markerCorners, res.markerIds);
-
-  return res;
-}
-
-/** Detect the EduceLab Sample Square */
-auto DetectSampleSquare(const cv::Mat &image,
-                        const ar::DetectorParameters &params)
-    -> DetectionResult {
-  static const auto boardTop = GenerateBoard();
-  auto res = DetectBoard(image, boardTop, params);
-  if (res.charucoIDs.empty()) {
-    res = DetectionResult();
-  }
-
-  static const auto boardBot = GenerateBoard(512);
-  const auto res2 = DetectBoard(image, boardBot, params);
-  if (res2.charucoIDs.empty()) {
-    return res;
-  }
-
-  // Merge landmarks and IDs
-  for (std::size_t idx = 0; idx < res2.markerIds.size(); ++idx) {
-    res.markerIds.push_back(res2.markerIds[idx] + 512);
-    res.markerCorners.push_back(res2.markerCorners[idx]);
-  }
-  for (std::size_t idx = 0; idx < res2.charucoIDs.size(); ++idx) {
-    res.charucoIDs.push_back(res2.charucoIDs[idx] + 512);
-    res.charucoCorners.push_back(res2.charucoCorners[idx]);
-  }
-
-  return res;
-}
-
-/**
- * Helper function to build the ID for a specific ArUco marker corner.
- *
- * CornerID:
- *  - 0: TL
- *  - 1: TR
- *  - 2: BR
- *  - 3: BL
- */
-auto GetLandmarkID(const int arucoID, const int cornerID) -> std::string {
-  return std::to_string(arucoID) + "." + std::to_string(cornerID);
-}
-
-/** Undistort an image using cv::undistort */
-auto UndistortImage(const cv::Mat &image, cameras::IntrinsicBase *cam)
-    -> cv::Mat {
-  // Only support pinhole cameras
-  if (not cameras::isPinhole(cam->getType())) {
-    std::cout << "WARNING: Unsupported camera type! Undistortion skipped\n";
-    return image;
-  }
-
-  // Basic pinhole has no distortion
-  if (cam->getType() == cameras::PINHOLE_CAMERA) {
-    return image;
-  }
-
-  // Get the intrinsic matrix
-  auto pCam = dynamic_cast<cameras::Pinhole_Intrinsic *>(cam);
-  cv::Mat mtx;
-  cv::eigen2cv(pCam->K(), mtx);
-
-  // Get the distortion parameters
-  auto dist = cam->getParams();
-  if (cam->getType() == cameras::PINHOLE_CAMERA_RADIAL1) {
-    dist = {dist[3], 0., 0., 0.};
-  } else if (cam->getType() == cameras::PINHOLE_CAMERA_RADIAL3) {
-    dist = {dist[3], dist[4], 0., 0., dist[5]};
-  } else if (cam->getType() == cameras::PINHOLE_CAMERA_BROWN) {
-    dist = {dist[3], dist[4], dist[6], dist[7], dist[5]};
-  } else if (cam->getType() == cameras::PINHOLE_CAMERA_FISHEYE) {
-    dist = {dist[3], dist[4], 0., 0., dist[5], dist[6]};
-  }
-
-  // Calculate the new matrix for cv::undistort
-  const cv::Size size(image.cols, image.rows);
-  cv::Rect roi;
-  mtx = cv::getOptimalNewCameraMatrix(mtx, dist, size, 0., size, &roi);
-  cv::Mat result;
-  cv::undistort(image, result, mtx, dist);
-
-  // Crop to the ROI
-  cv::Mat ret;
-  result(roi).copyTo(ret);
-
-  return ret;
-}
 
 void ScaleLandmarks(pgs::Landmarks &ldms, const double scale) {
   for (auto &[_, ldm] : ldms) {
@@ -291,157 +52,6 @@ void ScaleLandmarks(pgs::Landmarks &ldms, const double scale) {
       ldm.X.value() *= scale;
     }
   }
-}
-
-struct ScaleStats {
-  /** per-marker scale estimates */
-  std::vector<double> scales;
-  /** final scale factor */
-  double summary{1};
-  /** label for the summary statistic (e.g. for the histogram) */
-  std::string summaryLabel{"median"};
-};
-
-/**
- * Compute per‐marker scale estimates via Umeyama + weighted median.
- */
-auto ComputeUmeyamaScaleStats(const pgs::Landmarks &landmarks,
-                              const std::set<int> &markerIDs,
-                              double markerSize) -> ScaleStats
-{
-  // Helper type for collecting measurements
-  struct SW {
-    double scale, weight;
-  };
-  std::vector<SW> sws;
-  sws.reserve(markerIDs.size());
-
-  // Reference corner positions in marker‐local frame:
-  const std::array<Vec3,4> refCorners = {{
-    {0.0,          0.0,         0.0},
-    {markerSize,   0.0,         0.0},
-    {markerSize,   markerSize,  0.0},
-    {0.0,          markerSize,  0.0}
-  }};
-
-  // Build one similarity per marker
-  for (const auto &mID : markerIDs) {
-    std::vector<Vec3> P_ref, P_obs;
-    P_ref.reserve(4);
-    P_obs.reserve(4);
-
-    for (int c = 0; c < 4; ++c) {
-      auto it = landmarks.find(GetLandmarkID(mID, c));
-      if (it != landmarks.end() && it->second.X) {
-        P_ref.push_back(refCorners[c]);
-        P_obs.push_back(it->second.X.value());
-      }
-    }
-    if (P_obs.size() < 3) {
-      // need ≥3 to solve
-      continue;
-    }
-
-    // Pack into 3×N mats
-    const auto N = P_obs.size();
-    Mat3X M_ref(3, static_cast<int>(N)), M_obs(3, static_cast<int>(N));
-    for (std::size_t i = 0; i < N; ++i) {
-      M_ref.col(static_cast<int>(i)) = P_ref[i];
-      M_obs.col(static_cast<int>(i)) = P_obs[i];
-    }
-
-    // Umeyama obs→ref
-    Eigen::Matrix4d T = Eigen::umeyama(M_obs, M_ref, true);
-
-    // Extract scale = norm of first column of R*s
-    const double s = T.block<3, 3>(0, 0).col(0).norm();
-    sws.push_back({s, static_cast<double>(N)});
-  }
-
-  ScaleStats stats;
-  // collect just the scales for the histogram
-  stats.scales.reserve(sws.size());
-  for (auto &[scale, weight] : sws) {
-    stats.scales.push_back(scale);
-  }
-
-  // No valid markers; the caller treats empty scales as a fatal error.
-  if (sws.empty()) {
-    return stats;
-  }
-
-  // sort by scale
-  std::sort(sws.begin(), sws.end(),
-            [](auto &a, auto &b) { return a.scale < b.scale; });
-
-  // total weight
-  const auto W = std::accumulate(
-      sws.begin(), sws.end(), 0.0,
-      [](const auto &l, const auto &r) { return l + r.weight; });
-  const auto half = 0.5 * W;
-
-  // weighted median
-  double cum = 0.0;
-  for (const auto &[scale, weight] : sws) {
-    cum += weight;
-    if (cum >= half) {
-      stats.summary = scale;
-      break;
-    }
-  }
-
-  return stats;
-}
-
-/**
- * Compute scale by measuring each marker’s edge length vs. the known
- * markerSize.
- *
- * landmarks   : map from “markerID.cornerID” → triangulated Vec3
- * markerIDs   : set of all detected marker IDs
- * markerSize  : the *true* length (in your desired world units) of each marker
- * edge
- *
- * Returns a list of (expected/observed) scale factors for every adjacent‐corner
- * pair plus their mean.
- */
-auto ComputeEdgeScaleStats(const pgs::Landmarks &landmarks,
-                           const std::set<int> &markerIDs,
-                           const double markerSize) -> ScaleStats {
-  ScaleStats stats;
-  for (const auto &markerID : markerIDs) {
-    // Keep a list of observed and expected distances
-    for (int i = 0; i < 4; i++) {
-      const auto nI = (i + 1) % 4;
-      auto c0 = landmarks.at(GetLandmarkID(markerID, i)).X;
-      auto c1 = landmarks.at(GetLandmarkID(markerID, nI)).X;
-      if (not c0 or not c1) {
-        continue;
-      }
-
-      const auto distExpected = markerSize;
-      const auto distObserved = (c1.value() - c0.value()).norm();
-      // Skip degenerate pairs to avoid division by (near-)zero
-      if (distObserved < 1e-9) {
-        continue;
-      }
-      stats.scales.emplace_back(distExpected / distObserved);
-    }
-  }
-  // No usable distances; the caller treats empty scales as a fatal error.
-  if (stats.scales.empty()) {
-    return stats;
-  }
-
-  std::cout << "Calculating scale factor from " << stats.scales.size()
-            << " distance measurements\n";
-  // Use the median for resilience against outlier measurements
-  auto sorted = stats.scales;
-  std::sort(sorted.begin(), sorted.end());
-  const auto n = sorted.size();
-  stats.summary = (n % 2 == 1) ? sorted[n / 2]
-                               : 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]);
-  return stats;
 }
 
 enum EXIT_CODE {
@@ -483,7 +93,7 @@ auto main(int argc, char* argv[]) -> int
     ("input-mesh",  po::value<std::string>(), "input mesh file (ascii .ply only)")
     ("output-mesh", po::value<std::string>(), "output (scaled) mesh file (.ply)")
     ("histogram-out",         po::value<std::string>(), "where to write the scale‐histogram SVG")
-    ("marker-size,s", po::value<double>()->required(), "ArUco marker size in desired world units")
+    ("marker-size,s", po::value<double>(), "ArUco marker size in desired world units (required unless --detection-method sample-square, which has a known fixed size)")
     ("detection-method,m", po::value<std::string>()->default_value("markers"), "detection method: markers, sample-square")
     ("sfm-root", po::value<std::string>(), "use the given directory as the sfm root when loading image files")
     ("include-from", po::value<std::string>(), "only consider image files listed by name in the provided txt file")
@@ -515,16 +125,6 @@ auto main(int argc, char* argv[]) -> int
   // Get the input and output files
   fs::path sfmPath = args["input-scene"].as<std::string>();
 
-  // Marker size (0.47 cm for the sample square)
-  auto markerSize = args["marker-size"].as<double>();
-  if (markerSize <= 0.0) {
-    std::cerr << "ERROR: --marker-size must be a positive value\n";
-    return BAD_ARG;
-  }
-
-  // Write a histogram if requested
-  bool doHistogram = args.count("histogram-out") > 0;
-
   // Detection method
   auto method = el::to_lower_copy(args["detection-method"].as<std::string>());
   std::function detect = DetectMarkers;
@@ -536,6 +136,26 @@ auto main(int argc, char* argv[]) -> int
     std::cout << "ERROR: Unrecognized detection method: \'" << method << "\'\n";
     return BAD_ARG;
   }
+
+  // Marker size. The PGS sample square is a fixed-size physical target, so its
+  // edge length (0.47 cm) is known a priori and need not be supplied.
+  static constexpr double kSampleSquareSize = 0.47;
+  const bool sampleSquare = method == "sample-square";
+  if (!sampleSquare && args.count("marker-size") == 0) {
+    std::cerr << "ERROR: --marker-size is required unless --detection-method "
+                 "sample-square\n";
+    return BAD_ARG;
+  }
+  auto markerSize = args.count("marker-size")
+                        ? args["marker-size"].as<double>()
+                        : kSampleSquareSize;
+  if (markerSize <= 0.0) {
+    std::cerr << "ERROR: --marker-size must be a positive value\n";
+    return BAD_ARG;
+  }
+
+  // Write a histogram if requested
+  bool doHistogram = args.count("histogram-out") > 0;
   ar::DetectorParameters params;
   params.useAruco3Detection = true;
   params.detectInvertedMarker = args["detect-inverted"].as<bool>();

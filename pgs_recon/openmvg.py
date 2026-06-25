@@ -14,12 +14,14 @@ class CameraModel(IntEnum):
 
 
 class ResectionMethod(IntEnum):
+    # Values mirror openMVG::resection::SolverType (solver_resection.hpp).
+    # Only DLT estimates the focal; the rest require a known intrinsic.
     DLT = 0
     P3P_KE = 1
     P3P_KNEIP = 2
     P3P_NORDBERG = 3
-    UP2P = 4
-    P3P_KNEIP_UPNP = 5
+    P3P_DING = 4
+    UP2P = 5
 
 
 def init_sfm_generic(paths: Dict[str, Path], focal_length=None,

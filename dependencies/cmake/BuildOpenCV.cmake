@@ -11,6 +11,7 @@ externalproject_add(
         ${GLOBAL_CMAKE_ARGS}
         -DWITH_VTK:BOOL=OFF
         -DBUILD_JPEG:BOOL=OFF
+        -DBUILD_PNG:BOOL=OFF
         -DBUILD_TESTS:BOOL=OFF
         -DBUILD_PERF_TESTS:BOOL=OFF
         -DBUILD_EXAMPLES:BOOL=OFF

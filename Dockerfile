@@ -37,6 +37,7 @@ RUN apt update \
       libjpeg-turbo8-dev \
       libqt5opengl5-dev \
       libmpfr-dev \
+      libpng-dev \
       libqt5svg5-dev \
       libqt5x11extras5-dev \
       libssh-4 \
@@ -62,7 +63,7 @@ RUN apt update \
 
 # Install PGS Recon dependencies
 ARG USE_CUDA
-COPY . /usr/local/educelab/pgs-recon
+COPY ./dependencies /usr/local/educelab/pgs-recon/dependencies
 RUN if [ "${USE_CUDA}" = "ON" ]; then  \
        export CUDACXX="/usr/local/cuda/bin/nvcc"; \
     fi \
@@ -75,17 +76,17 @@ RUN if [ "${USE_CUDA}" = "ON" ]; then  \
       -DBUILD_CERES=ON \
       -DUSE_CUDA=${USE_CUDA} \
       -DCMAKE_CUDA_ARCHITECTURES='60;61;70;90' \
-      -GNinja  \
-    && cmake --build /usr/local/educelab/build/ \
-    && rm -rf /usr/local/educelab/build \
-    && python3 -m venv /usr/local/educelab/pgs-recon/.venv \
+      -GNinja \
+      && cmake --build /usr/local/educelab/build/ \
+      && rm -rf /usr/local/educelab/build
+
+COPY . /usr/local/educelab/pgs-recon
+RUN python3 -m venv /usr/local/educelab/pgs-recon/.venv \
     && . /usr/local/educelab/pgs-recon/.venv/bin/activate \
     && python3 -m pip install --upgrade pip wheel setuptools \
     && python3 -m pip install --editable /usr/local/educelab/pgs-recon \
     && chmod --recursive a+rw /usr/local/educelab/pgs-recon/ \
-    && chmod a+rw /usr/local/lib/openMVG/sensor_width_camera_database.txt \
-    && git config --global credential.helper "cache --timeout=3600" \
-    && git config --global --add safe.directory /usr/local/educelab/pgs-recon/
+    && chmod a+rw /usr/local/lib/openMVG/sensor_width_camera_database.txt
 
 # Install ExifTool
 # exiftool.org has intermittent hosting outages, so prefer the SourceForge

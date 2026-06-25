@@ -201,8 +201,12 @@ def repoint_calibration(calibration_json: Path, image: Path,
     (vs. copying the full-size modality image). The dummy gets its own 1x1
     intrinsic so openMVG2openMVS undistorts it trivially.
 
+    The dummy is written as a tiny JPEG (not PNG): openMVG2openMVS undistorts it
+    to an output file of the same format, and its libpng writer fails on a 1x1
+    image ("bad parameters to zlib"), whereas the libjpeg path handles it fine.
+
     ``image`` must be a path inside a writable work directory: a sibling file
-    ``__retex_dummy__.png`` is created there. Do not pass a path into a
+    ``__retex_dummy__.jpg`` is created there. Do not pass a path into a
     read-only source tree.
     """
     data = json.loads(calibration_json.read_text())
@@ -229,7 +233,7 @@ def repoint_calibration(calibration_json: Path, image: Path,
     # Append an inert 1x1 dummy view (with its own 1x1 intrinsic + a copied
     # pose) so OpenMVS sees a >=2 image scene. New keys/cereal ptr ids are
     # placed above everything already present to avoid collisions.
-    dummy_img = image.with_name('__retex_dummy__.png')
+    dummy_img = image.with_name('__retex_dummy__.jpg')
     cv2.imwrite(str(dummy_img), np.zeros((1, 1, 3), np.uint8))
     new_view_key = max(v['key'] for v in views) + 1
     new_intr_key = max(i['key'] for i in intrinsics) + 1
@@ -455,6 +459,35 @@ def _fix_polymorphic_registration(all_items, kept_items):
     return kept_items
 
 
+def transform_extrinsic(R, C, sfm_transform):
+    """Transform an OpenMVG extrinsic (R, C) from the original SfM frame to
+    the frame defined by sfm_transform (4x4 similarity matrix from pgs-center
+    --save-transform). The scale is stripped from the upper-left 3x3 block so
+    R_new remains a proper rotation matrix. C_new uses the full (scaled) block
+    since centers are points, not directions."""
+    s = np.linalg.norm(sfm_transform[:3, 0])
+    R_T = sfm_transform[:3, :3] / s
+    R_new = R @ R_T.T
+    C_new = sfm_transform[:3, :3] @ C + sfm_transform[:3, 3]
+    return R_new, C_new
+
+
+def transform_sfm_extrinsics(sfm_json: Path, sfm_transform) -> None:
+    """Rewrite all extrinsics in an SfM JSON file to the frame defined by
+    sfm_transform. Edits the file in-place."""
+    data = json.loads(sfm_json.read_text())
+    for e in data.get('extrinsics', []):
+        val = e['value']
+        R = np.asarray(val['rotation'], dtype=np.float64)
+        C = np.asarray(val['center'], dtype=np.float64)
+        R_new, C_new = transform_extrinsic(R, C, sfm_transform)
+        val['rotation'] = R_new.tolist()
+        val['center'] = C_new.tolist()
+    sfm_json.write_text(json.dumps(data, indent=2))
+    logger.info(f'Transformed {len(data.get("extrinsics", []))} '
+                f'extrinsics to centered frame')
+
+
 def filter_sfm_for_camera(sfm_json: Path, camera_index: int,
                           modality_dir: Path,
                           pos_to_name: Dict[int, str],
@@ -506,7 +539,30 @@ def filter_sfm_for_camera(sfm_json: Path, camera_index: int,
     return len(kept)
 
 
-def ensure_ply_mesh(mesh_path: Path, work_dir: Path) -> Path:
+def relocate_textured_mesh(produced, produced_mesh: Path, target: Path) -> Path:
+    """Move a freshly textured mesh and its sidecar files into ``target``'s dir.
+
+    ``produced`` is the set of files TextureMesh just wrote (mesh + .mtl +
+    texture image(s)); they all share ``target``'s stem because the stem was
+    derived from --output-mesh, so basenames are preserved and the OBJ/MTL's
+    relative references stay valid — only the directory changes. The caller
+    must restrict ``produced`` to stem-matching files so unrelated artifacts
+    TextureMesh drops in the work dir (e.g. its ``TextureMesh-*.log``) are not
+    swept along. Returns the moved mesh path.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    moved_mesh = None
+    for src in produced:
+        dst = target.parent / src.name
+        if src.resolve() != dst.resolve():
+            shutil.move(str(src), str(dst))
+        if src.name == produced_mesh.name:
+            moved_mesh = dst
+    return moved_mesh or (target.parent / produced_mesh.name)
+
+
+def ensure_ply_mesh(mesh_path: Path, work_dir: Path,
+                    out_stem: str = None) -> Path:
     """Stage a mesh into ``work_dir`` in a form OpenMVS can reliably load.
 
     OpenMVS' OBJ reader is strict (and mis-resolves a relative ``mtllib`` when
@@ -514,11 +570,14 @@ def ensure_ply_mesh(mesh_path: Path, work_dir: Path) -> Path:
     binary PLY (vertices + triangles). Texture coordinates/materials are
     irrelevant here because TextureMesh regenerates its own UVs. PLY inputs are
     copied through unchanged. Either way the result lives in ``work_dir`` so
-    TextureMesh can reference it by basename.
+    TextureMesh can reference it by basename. ``out_stem``, if given, names the
+    staged file ``<out_stem>_input.ply`` so it cannot clash with the recon's
+    own files in a shared working dir.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
+    out_name = f'{out_stem}_input.ply' if out_stem else None
     if mesh_path.suffix.lower() == '.ply':
-        out = work_dir / mesh_path.name
+        out = work_dir / (out_name or mesh_path.name)
         if mesh_path.resolve() != out.resolve():
             shutil.copy(mesh_path, out)
         return out
@@ -537,7 +596,7 @@ def ensure_ply_mesh(mesh_path: Path, work_dir: Path) -> Path:
 
     v = np.asarray(verts, dtype='<f4')
     fcs = np.asarray(faces, dtype='<i4')
-    out = work_dir / (mesh_path.stem + '.ply')
+    out = work_dir / (out_name or (mesh_path.stem + '.ply'))
     header = (
         'ply\n'
         'format binary_little_endian 1.0\n'
@@ -654,12 +713,33 @@ def main():
                              'to texture from. Defaults to the SfM that produced '
                              'the mesh in --recon-dir. NOT the rig-prior import '
                              'scene.')
-    parser.add_argument('--output', '-o', default=None,
-                        help='Output directory (default: '
-                             '<recon-dir>/retexture/<name>)')
-    parser.add_argument('--name', '-n', default=None,
-                        help='Output mesh basename (default derived from the '
-                             'modality directory name)')
+    parser.add_argument('--sfm-transform', default=None,
+                        help='4x4 .npy transform matrix saved by pgs-center '
+                             '--save-transform. In non-calibration mode, '
+                             're-expresses SfM camera poses in the centered mesh '
+                             'coordinate frame before building the MVS scene. '
+                             'Must be paired with --mesh pointing at the centered '
+                             'mesh. Ignored in --calibration mode (run '
+                             'pgs-calibrate with --sfm-transform instead to embed '
+                             'the transform in the calibration).')
+    parser.add_argument('--mesh', default=None,
+                        help='Override the mesh to texture. Use to supply a '
+                             'centered or ground-plane-removed mesh in place of '
+                             'the original reconstruction output.')
+    parser.add_argument('--working-dir', '-w', default=None,
+                        help='Directory for retexture artifacts (default: '
+                             '--recon-dir). Outputs are written into its mvg/ '
+                             'and mvs/ as <stem>-prefixed siblings of the '
+                             'reconstruction and never overwrite recon files.')
+    parser.add_argument('--output-mesh', '-o', default=None,
+                        help='Exact path + filename of the final textured mesh; '
+                             'its extension sets the output format (overrides '
+                             '--file-type). The mesh, its .mtl, and the texture '
+                             'image are written together there. Default: '
+                             '<working-dir>/mvs/<stem>.<file-type>. The <stem> '
+                             '(prefixed onto every scratch artifact) is this '
+                             'file\'s stem if given, else the modality input '
+                             'name.')
     parser.add_argument('--camera-index', '-k', type=int, default=None,
                         help='Camera index the modality images correspond to. '
                              'Inferred from filenames if omitted.')
@@ -702,18 +782,60 @@ def main():
     modality_input = Path(args.modality_images)
     recon_dir = Path(args.recon_dir)
     calibration = Path(args.calibration) if args.calibration else None
-    if args.name is None:
-        # Calibration mode is a single image; the legacy mode is a directory.
-        args.name = (modality_input.resolve().stem if calibration
-                     else modality_input.resolve().name)
 
     # The mesh always comes from the reconstruction. The SfM does too in the
     # legacy mode; in calibration mode the calibration .json is the scene.
     sfm_default, mesh_in = resolve_recon_inputs(recon_dir)
     sfm_data = Path(args.sfm_data) if args.sfm_data else sfm_default
 
-    output = Path(args.output) if args.output else recon_dir / 'retexture' / args.name
-    output.mkdir(parents=True, exist_ok=True)
+    sfm_transform = None
+    if args.sfm_transform is not None:
+        sfm_transform = np.load(args.sfm_transform)
+        if sfm_transform.shape != (4, 4):
+            sys.exit(f'--sfm-transform: expected a 4x4 matrix, '
+                     f'got shape {sfm_transform.shape}')
+        if calibration is not None:
+            logger.warning('--sfm-transform is ignored in --calibration mode; '
+                           'run pgs-calibrate --sfm-transform to embed the '
+                           'transform in the calibration instead')
+            sfm_transform = None
+
+    if args.mesh is not None:
+        mesh_in = Path(args.mesh)
+        if not mesh_in.is_file():
+            sys.exit(f'--mesh: file not found: {mesh_in}')
+
+    # The transformed poses are expressed in the centered mesh frame, so the
+    # mesh being textured must be the centered one too. (calibration mode
+    # already nulled sfm_transform above, so this only guards legacy mode.)
+    if sfm_transform is not None and args.mesh is None:
+        sys.exit('--sfm-transform requires --mesh pointing at the centered mesh '
+                 '(the transformed camera poses must match a centered mesh)')
+
+    # Resolve the final mesh path + format and derive the artifact stem.
+    # --output-mesh sets the exact deliverable; its extension wins over
+    # --file-type. The stem is prefixed onto every scratch artifact so they
+    # coexist with the recon's files (there is no --name flag): the
+    # --output-mesh stem if given, else the modality input's name (the image
+    # directory in the default mode, the image stem in --calibration mode).
+    output_mesh = Path(args.output_mesh) if args.output_mesh else None
+    if output_mesh is not None:
+        ext = output_mesh.suffix.lstrip('.').lower()
+        if ext not in ('obj', 'ply', 'glb', 'gltf'):
+            sys.exit(f'--output-mesh: unsupported extension '
+                     f'{output_mesh.suffix!r} (use .obj/.ply/.glb/.gltf)')
+        if ext != args.file_type:
+            logger.warning(f'--output-mesh extension .{ext} overrides '
+                           f'--file-type {args.file_type}')
+        file_format = ext
+        stem = output_mesh.stem
+    else:
+        file_format = args.file_type
+        stem = (modality_input.resolve().stem if calibration
+                else modality_input.resolve().name)
+
+    working_dir = Path(args.working_dir) if args.working_dir else recon_dir
+    working_dir.mkdir(parents=True, exist_ok=True)
 
     paths: Dict[str, Path] = {
         'PATH': Path(args.path).resolve(),
@@ -721,19 +843,30 @@ def main():
     paths['BIN'] = paths['PATH'] / 'bin'
     paths['MVS_BIN'] = paths['BIN'] / 'OpenMVS'
 
-    # Working layout
-    paths['output'] = output
-    paths['modality_8bit'] = output / f'{args.name}_modality'
-    paths['mvs'] = output / 'mvs'
+    # Artifacts integrate into the recon's existing mvg/ and mvs/, prefixed by
+    # <stem> so they sit beside the recon's files without overwriting them.
+    paths['working'] = working_dir
+    paths['mvg'] = working_dir / 'mvg'
+    paths['mvs'] = working_dir / 'mvs'
+    paths['mvg'].mkdir(parents=True, exist_ok=True)
     paths['mvs'].mkdir(parents=True, exist_ok=True)
-    paths['mvs_scene'] = paths['mvs'] / f'{args.name}_scene.mvs'
-    paths['mvs_images'] = paths['mvs'] / 'undistorted_images'
-    paths['sfm_full'] = output / 'sfm_full.json'
-    paths['sfm_filtered'] = output / f'{args.name}_sfm.json'
+    paths['modality_8bit'] = paths['mvs'] / f'{stem}_modality'
+    paths['mvs_scene'] = paths['mvs'] / f'{stem}_scene.mvs'
+    paths['mvs_images'] = paths['mvs'] / f'{stem}_undistorted_images'
+    paths['sfm_full'] = paths['mvg'] / f'{stem}_sfm_full.json'
+    paths['sfm_filtered'] = paths['mvg'] / f'{stem}_sfm.json'
 
-    # Config + metadata, mirroring pgs-recon conventions
+    # Final mesh: --output-mesh if given, else mvs/<stem>.<file_format>.
+    paths['output_mesh'] = (output_mesh if output_mesh is not None
+                            else paths['mvs'] / f'{stem}.{file_format}')
+    if paths['output_mesh'].exists():
+        logger.warning(f'Final mesh target already exists and will be '
+                       f'overwritten: {paths["output_mesh"]}')
+
+    # Config + metadata, mirroring pgs-recon conventions (sidecar files; the
+    # recon's own metadata.json is never touched).
     datetime_str = dt.now(tz.utc).strftime('%Y%m%d%H%M%S')
-    config_path = output / f'{datetime_str}_{args.name}_retexture_config.txt'
+    config_path = working_dir / f'{datetime_str}_{stem}_retexture_config.txt'
     args.config = str(config_path)
     with config_path.open('w') as f:
         for arg in vars(args):
@@ -741,7 +874,7 @@ def main():
 
     metadata = {'args': ' '.join(sys.argv), 'parsed': vars(args),
                 'commands': {}}
-    paths['metadata'] = output / f'{args.name}_retexture_metadata.json'
+    paths['metadata'] = working_dir / f'{stem}_retexture_metadata.json'
 
     @atexit.register
     def write_metadata():
@@ -762,11 +895,12 @@ def main():
             # Default: project the mesh into the calibrated view so the OBJ's UVs
             # point straight at the image (no OpenMVS atlas resampling; UVs
             # reused across modalities). Projection reads only pose + mesh.
-            if args.file_type != 'obj':
+            out_obj = paths['output_mesh']
+            if out_obj.suffix.lower() != '.obj':
                 logger.warning('Projective UV mapping writes OBJ with an '
-                               'external texture; ignoring --file-type '
-                               f'{args.file_type}.')
-            out_obj = paths['mvs'] / f'{args.name}.obj'
+                               f'external texture; forcing .obj on '
+                               f'{out_obj.name}.')
+                out_obj = out_obj.with_suffix('.obj')
             tex_img = modality_input
             if args.convert_texture:
                 logger.info('Converting modality image to 8-bit sRGB')
@@ -799,6 +933,9 @@ def main():
         filter_sfm_for_camera(paths['sfm_full'], camera_index,
                               paths['modality_8bit'], pos_to_name,
                               paths['sfm_filtered'])
+        if sfm_transform is not None:
+            logger.info('Transforming SfM extrinsics to centered mesh frame')
+            transform_sfm_extrinsics(paths['sfm_filtered'], sfm_transform)
 
     # 3. MVG -> MVS (undistorts modality images with original intrinsics)
     logger.info('Building MVS scene from modality views')
@@ -808,16 +945,30 @@ def main():
 
     # 4. Texture the existing mesh
     logger.info('Preparing mesh for OpenMVS')
-    paths['mesh'] = ensure_ply_mesh(mesh_in, paths['mvs'])
+    paths['mesh'] = ensure_ply_mesh(mesh_in, paths['mvs'], out_stem=stem)
     logger.info('Texturing mesh with modality images')
+    before = set(paths['mvs'].iterdir())
     out_key = mvs_texture(paths, mvs_key='mvs_scene', mesh_key='mesh',
-                          file_format=args.file_type,
+                          file_format=file_format,
                           resolution_lvl=args.texture_resolution_level,
                           max_size=args.max_texture_size,
                           empty_color=args.empty_color,
                           global_seam_leveling=args.global_seam_leveling,
                           local_seam_leveling=args.local_seam_leveling,
-                          output_name=args.name, metadata=metadata)
+                          output_name=stem, metadata=metadata)
+
+    # Relocate the deliverable (mesh + .mtl + texture) if --output-mesh points
+    # outside the working mvs/. The produced files already carry <stem> ==
+    # target stem, so this is a pure directory move with references intact.
+    target = paths['output_mesh']
+    if target.resolve() != paths[out_key].resolve():
+        # Only the mesh and its own sidecars (all <stem>-prefixed); leave
+        # unrelated new files such as TextureMesh's own log behind.
+        produced = sorted(p for p in paths['mvs'].iterdir()
+                          if p.is_file() and p not in before
+                          and p.name.startswith(stem))
+        paths[out_key] = relocate_textured_mesh(produced, paths[out_key],
+                                                 target)
 
     logger.info(f'Done. Re-textured mesh: {paths[out_key]}')
 
