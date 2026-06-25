@@ -2,7 +2,7 @@
 
 #include <filesystem>
 
-#include "global_scaler_types.hpp"
+#include "marker_types.hpp"
 
 namespace pgs {
 

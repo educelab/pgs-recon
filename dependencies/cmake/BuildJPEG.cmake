@@ -7,8 +7,8 @@ if(BUILD_JPEG)
     find_package(NASM REQUIRED)
     ExternalProject_Add(
       jpeg
-      URL https://github.com/libjpeg-turbo/libjpeg-turbo/archive/3.0.3.tar.gz
-      URL_HASH SHA256=46c44be837654e201d11bbf8d9fbb35b775a7d4bf653e9e709279437b10d5c8b0825ece4c8ee33f66689c263234fa2b08240fb5f5ba80e76e03891da8f64eda8
+      URL https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.1.4.1/libjpeg-turbo-3.1.4.1.tar.gz
+      URL_HASH SHA256=ecae8008e2cc9ade2f2c1bb9d5e6d4fb73e7c433866a056bd82980741571a022
       DOWNLOAD_NO_PROGRESS ON
       DOWNLOAD_EXTRACT_TIMESTAMP OFF
       CMAKE_CACHE_ARGS
@@ -20,8 +20,8 @@ if(BUILD_JPEG)
     # libjpeg
     ExternalProject_Add(
       jpeg
-      URL https://github.com/csparker247/jpeg-cmake/archive/v1.3.0.tar.gz
-      URL_HASH SHA512=663faa4edcaa8f40815d8ef480de71ebc14e546e8c57d92f3ddafc10ae1badf73739221e63667c5b6edba374a075e94d7593c11264d1bbaaebeae2e635073762
+      URL https://github.com/csparker247/jpeg-cmake/archive/v10.0.0.tar.gz
+      URL_HASH SHA512=b6947e758d36ff97bd07a818a72e5c8c2d53b9d63978618834391e482a421adf7b57dfb1e0e868b9205b1bab960ad72001898a7d5424ba2ecc18c8f2a89c7a1d
       DOWNLOAD_NO_PROGRESS ON
       DOWNLOAD_EXTRACT_TIMESTAMP OFF
       CMAKE_CACHE_ARGS

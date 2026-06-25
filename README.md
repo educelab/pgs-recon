@@ -65,6 +65,99 @@ usage: pgs-recon [-h] [--config CONFIG] --input INPUT --output OUTPUT
 ...
 ```
 
+## Utilities
+In addition to the main `pgs-recon` pipeline, this project ships several
+standalone tools. All of them can be launched through the Docker image in the
+same way as `pgs-recon` (e.g. `docker run ... pgs-sfm-orient --help`).
+
+### `pgs-sfm-orient`
+Centers, orients, and (optionally) scales a reconstructed mesh using the
+EduceLab sample square / ArUco markers detected directly in the **SfM scene
+images**. It is the SfM-based counterpart to `pgs-center`: where `pgs-center`
+detects the sample square in the mesh's UV texture (which requires a coherent,
+reordered texture map), `pgs-sfm-orient` detects and triangulates the markers
+from the original images, so it works regardless of how the mesh was textured.
+
+The translation comes from the mesh's oriented-bounding-box center (so the
+object lands at the origin), the orientation and scale come from the markers,
+and the result is written as a transformed mesh and/or a 4×4 similarity
+transform. The input mesh must already be in the SfM coordinate frame.
+
+```shell
+docker run -v .:/working ghcr.io/educelab/pgs-recon \
+  pgs-sfm-orient \
+    -i /working/recon/sfm/sfm_data.bin \
+    --input-mesh /working/recon/mvs/my-object.obj \
+    -o /working/recon/mvs/my-object-centered.obj \
+    --save-transform /working/recon/orient.npy \
+    -s 0.47
+```
+
+Key options:
+* `-i, --input-scene` — the SfM scene file (markers are detected in its images).
+* `--input-mesh` — mesh (`.obj`/`.ply`) in the SfM frame; enables OBB-center
+  translation and the bounding-box orientation fallback.
+* `-o, --output-mesh` — write the transformed mesh (requires `--input-mesh`).
+* `--save-transform` — write the 4×4 transform as a NumPy `.npy`, compatible
+  with `pgs-center --load-transform` and `pgs-calibrate`/`pgs-retexture
+  --sfm-transform`.
+* `-s, --marker-size` — marker size in the desired world units (required unless
+  `--no-scale` or `--orient-method bbox`).
+* `--orient-method {auto,aruco,bbox}` — orientation source (default `auto`: use
+  markers if detected, otherwise fall back to the mesh bounding box). `aruco`
+  fails if no markers are found; `bbox` ignores markers and requires a mesh.
+* `--no-scale` — skip scale estimation (output rotation + translation only).
+
+At least one of `--output-mesh` or `--save-transform` is required.
+
+### Camera calibration file format
+`pgs-calibrate` reads and writes camera parameters in a single plain-text
+**camera calibration file**. It is a flat list of `key value` entries, one per
+line; blank lines and lines beginning with `#` are ignored, and unrecognized
+keys are skipped (so the same file can carry both an intrinsic and a pose, and
+each consumer reads only what it needs).
+
+| Key | Meaning |
+| --- | --- |
+| `fx`, `fy` | Focal length in **pixels** (x and y). `fy` defaults to `fx` if omitted. OpenMVG uses a single focal, so the two should match. |
+| `cx`, `cy` | Principal point in **pixels**. |
+| `width`, `height` | Image resolution (pixels) the intrinsic is calibrated at. |
+| `k1`, `k2`, `k3` | Radial distortion coefficients (OpenCV/OpenMVG order). Optional; absent means no distortion. |
+| `pose` | 16 whitespace-separated floats: a **row-major 4×4 world-to-camera** matrix in OpenCV convention (`x_cam = R·X + t`). |
+
+Example (an overhead camera with mild barrel distortion):
+
+```
+# my overhead RGB camera
+fx 18250.0
+fy 18250.0
+cx 3000.0
+cy 2000.0
+width 6000
+height 4000
+k1 -0.082
+k2 0.011
+k3 0.0
+pose 0.9998 0.0011 -0.0203 12.4 -0.0009 0.9999 0.0102 -8.1 0.0203 -0.0102 0.9997 423.7 0 0 0 1
+```
+
+Two flags use this format:
+
+* **`pgs-calibrate --intrinsic <file>`** reads it as a *precalibrated* query
+  intrinsic. It requires the intrinsic keys (`fx`, `cx`, `cy`, `width`,
+  `height`); `fy` and the `k*` distortion are optional, and any `pose` is
+  ignored (the pose is what calibration solves for). The intrinsic is scaled to
+  the query image's resolution automatically, and the distortion is honored —
+  OpenMVG undistorts the query before resectioning. This is the stable,
+  recommended path for long-focal overhead cameras with few feature matches.
+  (For a focal-only calibration you can instead pass `--focal-length` in pixels,
+  or `--focal-length-mm` together with `--pixel-size` (mm/px) or `--sensor-width`
+  (mm); both assume a centered principal point and no distortion.)
+* **`pgs-calibrate --save-camera-file <file>`** writes the solved calibration in
+  this format (intrinsic + `pose`, with `k*` emitted only when non-zero). It is
+  consumed by [registration-toolkit](https://github.com/educelab/registration-toolkit)
+  and can be fed straight back into `--intrinsic`.
+
 ## Install from source
 ### Install dependencies
 The Python scripts use executables provided by the OpenMVG and OpenMVS projects. 
