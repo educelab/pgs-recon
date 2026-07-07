@@ -1,0 +1,43 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Verify the Python package installs and its console scripts are wired up.
+  # This installs only the PyPI dependencies (requirements.txt) -- it does NOT
+  # build the OpenMVG/OpenMVS/pgs C++ toolchain, which is discovered at runtime
+  # via --path. Fast, and runs across every supported interpreter.
+  python-install:
+    name: Python install (py${{ matrix.python-version }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mirror python_requires = >=3.9 from setup.cfg
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package (Python deps only)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Smoke-test entry points
+        run: |
+          python -c "import pgs_recon; print('imported', pgs_recon.__file__)"
+          # Exercise the console_scripts declared in setup.cfg. --help must work
+          # without the compiled binaries present.
+          pgs-recon --help
+          pgs-convert --help
+          pgs-center --help
