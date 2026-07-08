@@ -6,16 +6,19 @@ from pgs_recon.utility import current_timestamp, run_command
 
 def mvs_densify(paths: Dict[str, Path], mvs_key: str,
                 resolution_lvl: int = None, mask_value: int = None,
-                metadata: Dict = None) -> str:
-    """Densify a point cloud"""
+                metadata: Dict = None) -> Tuple[str, str]:
+    """Densify a point cloud. Returns ``(scene_key, cloud_key)``."""
     out_key = mvs_key + '_dense'
+    cloud_key = out_key + '_cloud'
     in_path = paths[mvs_key]
     paths[out_key] = in_path.parent / (in_path.stem + '_dense.mvs')
+    paths[cloud_key] = paths[out_key].with_suffix('.ply')
     command = [
         str(paths['MVS_BIN'] / 'DensifyPointCloud'),
         '-i', str(paths[mvs_key].name),
         '-o', str(paths[out_key].name),
         '-w', str(paths['mvs']),
+        '--archive-type', '-1',
     ]
     if resolution_lvl is not None:
         command.extend(['--resolution-level', str(resolution_lvl)])
@@ -24,11 +27,12 @@ def mvs_densify(paths: Dict[str, Path], mvs_key: str,
     if metadata is not None:
         metadata['commands'][current_timestamp()] = (str(' ').join(command))
     run_command(command)
-    return out_key
+    return out_key, cloud_key
 
 
 def mvs_reconstruct(paths: Dict[str, Path], mvs_key: str, free_space=False,
-                    smooth: int = 2, metadata: Dict = None) -> Tuple[str, str]:
+                    smooth: int = 2, pointcloud_key: str = None,
+                    metadata: Dict = None) -> Tuple[str, str]:
     """Reconstruct an MVS scene"""
     mesh_key = mvs_key + '_mesh'
     scene_key = mvs_key
@@ -39,8 +43,11 @@ def mvs_reconstruct(paths: Dict[str, Path], mvs_key: str, free_space=False,
         '-i', str(paths[mvs_key].name),
         '-o', str(paths[mesh_key].name),
         '-w', str(paths['mvs']),
+        '--archive-type', '-1',
         '--smooth', str(smooth),
     ]
+    if pointcloud_key is not None:
+        command.extend(['-p', str(paths[pointcloud_key].name)])
     if free_space:
         command.extend(['--free-space-support', '1'])
     if metadata is not None:
@@ -63,7 +70,8 @@ def mvs_refine(paths: Dict[str, Path], mvs_key: str, mesh_key: str,
         '-i', str(paths[mvs_key].name),
         '-m', str(paths[mesh_key].name),
         '-o', str(paths[out_key].name),
-        '-w', str(paths['mvs'])
+        '-w', str(paths['mvs']),
+        '--archive-type', '-1',
     ]
     if decimation_factor is not None:
         command.extend(['--decimate', str(decimation_factor)])
@@ -114,6 +122,7 @@ def mvs_texture(paths: Dict[str, Path], mvs_key: str, mesh_key: str,
         '-o', str(paths[out_key].name),
         '--export-type', file_format.lower(),
         '-w', str(paths['mvs']),
+        '--archive-type', '-1',
         '--max-texture-size', str(max_size)
     ]
     if resolution_lvl is not None:

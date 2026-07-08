@@ -442,9 +442,10 @@ def main():
                          threads=args.threads)
 
     # Densify MVS Scene
+    cloud_key = None
     if args.mvs_densify:
         logger.info('Densifying point cloud')
-        mvs_key = mvs_densify(paths, mvs_key=mvs_key,
+        mvs_key, cloud_key = mvs_densify(paths, mvs_key=mvs_key,
                               resolution_lvl=args.densify_resolution_level,
                               mask_value=args.mask_value,
                               metadata=metadata)
@@ -454,6 +455,7 @@ def main():
     mvs_key, mesh_key = mvs_reconstruct(paths, mvs_key=mvs_key,
                               free_space=args.free_space_support,
                               smooth=args.mvs_smooth,
+                              pointcloud_key=cloud_key,
                               metadata=metadata)
 
     # Refine Mesh
