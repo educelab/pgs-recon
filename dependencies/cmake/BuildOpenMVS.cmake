@@ -5,12 +5,13 @@ ExternalProject_Add(
     GIT_REPOSITORY https://github.com/cdcseacave/openMVS.git
     # Pinned to a post-v2.4.0 develop commit (2026-03-20). The v2.4.0 release
     # (pgs-recon MR !58) shipped a bug; this commit picks up the upstream fix
-    # while still self-reporting version 2.4.0. Both patches below still apply.
+    # while still self-reporting version 2.4.0. All patches below still apply.
     GIT_TAG ca991d50964ad2cfabc94c88d61a444999670a5d
     DOWNLOAD_NO_PROGRESS ON
     DOWNLOAD_EXTRACT_TIMESTAMP OFF
     PATCH_COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVS-v2.4-FixFindBoost.diff || true
       COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVS-v2.4-OptionalJXL.diff || true
+      COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVS-v2.4-RemoveMTLTransparency.diff || true
     CMAKE_CACHE_ARGS
         ${GLOBAL_CMAKE_ARGS}
         ${GLOBAL_CUDA_ARGS}
