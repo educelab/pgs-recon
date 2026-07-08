@@ -54,7 +54,7 @@ jobs:
       - name: Assert OpenMVS version
         run: |
           set -euo pipefail
-          bin="dependencies/installed/bin/DensifyPointCloud"
+          bin="dependencies/installed/bin/OpenMVS/DensifyPointCloud"
           if [ ! -x "$bin" ]; then
             echo "::error::$bin was not built/installed"
             exit 1
