@@ -1,0 +1,14 @@
+--- a/libs/MVS/SceneRefineCUDA.cu
++++ b/libs/MVS/SceneRefineCUDA.cu
+@@ -114,9 +114,9 @@
+ 	// Bounding box with ±0.5 padding, clamped to 5-pixel border
+ 	const float border = 5.f;
+ 	const int ixMin = max(__float2int_ru(fminf(fminf(p0.x(), p1.x()), p2.x()) - 0.5f), (int)border);
+-	const int ixMax = min(__float2int_rd(fmaxf(fmaxf(p0.x(), p1.x()), p2.x()) + 0.5f), (int)xMax);
++	const int ixMax = min(__float2int_rd(fmaxf(fmaxf(p0.x(), p1.x()), p2.x()) + 0.5f), camera.size.x() - (int)border);
+ 	const int iyMin = max(__float2int_ru(fminf(fminf(p0.y(), p1.y()), p2.y()) - 0.5f), (int)border);
+-	const int iyMax = min(__float2int_rd(fmaxf(fmaxf(p0.y(), p1.y()), p2.y()) + 0.5f), (int)yMax);
++	const int iyMax = min(__float2int_rd(fmaxf(fmaxf(p0.y(), p1.y()), p2.y()) + 0.5f), camera.size.y() - (int)border);
+ 	if (ixMin > ixMax || iyMin > iyMax) return;
+ 
+ 	const int width = camera.size.x();
