@@ -2,36 +2,88 @@ stages:
   - test
   - deploy
 
+# Run merge-request pipelines, and branch pipelines only when no MR is open for
+# the branch (avoids duplicate branch + MR pipelines once MR-gated jobs exist).
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
 ### Tests ###
-.build:
+
+# Quick check for normal MRs: install the Python package (and its Python deps)
+# into a venv and smoke-test the entry point. The compiled OpenMVG/OpenMVS
+# binaries are discovered at runtime, not at install time, so this needs no C++
+# build. Runs on every pipeline for fast feedback.
+test:python:
+  stage: test
+  image: ubuntu:22.04
   variables:
-    PACKAGE_LIST: ""
+    DEBIAN_FRONTEND: "noninteractive"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+  before_script:
+    - apt update
+    - apt install -y --no-install-recommends build-essential python3-dev python3-pip python3-venv git
+  script:
+    - echo Installing Python package
+    - python3 -m venv venv
+    - source venv/bin/activate
+    - python -m pip install --upgrade pip setuptools wheel
+    - python -m pip install .
+    - pgs-recon --help
+
+# Full C++ dependency build across the same base-image / CUDA matrix as the
+# GitHub Docker images. Expensive, so gated to MRs that actually touch the
+# dependencies, Dockerfile, or CI config. CUDA variants compile the .cu kernels
+# with nvcc (no GPU needed), catching CUDA-only regressions on the MR instead of
+# in the downstream image build.
+.build:
+  stage: test
+  image: $BASE_IMAGE
+  variables:
+    PACKAGE_LIST: ci/apt-ubuntu-jammy
     PYTHON_EXE: "python3"
+    USE_CUDA: "OFF"
+    CUDA_ARCHITECTURES: "60;61;70;90"
     DEBIAN_FRONTEND: "noninteractive"
   before_script:
     - apt update
     - apt install -y --no-install-recommends $(cat $PACKAGE_LIST)
   script:
-    - echo Building dependencies
+    - echo "Building dependencies (BASE_IMAGE=$BASE_IMAGE USE_CUDA=$USE_CUDA)"
+    - if [ "$USE_CUDA" = "ON" ]; then export CUDACXX="/usr/local/cuda/bin/nvcc"; fi
     - mkdir -p dependencies/build/
-    - cmake -GNinja -S dependencies/ -B dependencies/build/ -DCMAKE_BUILD_TYPE=Release -DBUILD_JPEG=OFF
+    - cmake -GNinja -S dependencies/ -B dependencies/build/
+        -DCMAKE_BUILD_TYPE=Release
+        -DBUILD_JPEG=OFF
+        -DBUILD_CERES=ON
+        -DUSE_CUDA=$USE_CUDA
+        -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHITECTURES"
     - cmake --build dependencies/build/
     - ${PYTHON_EXE} -m venv venv
     - source venv/bin/activate
     - python -m pip install .
 
-test:ubuntu:22.04:
+test:dependencies:
   extends: .build
-  stage: test
-  variables:
-    PACKAGE_LIST: ci/apt-ubuntu-jammy
-    PYTHON_EXE: "python3"
-  image: ubuntu:22.04
-
-test:ubuntu:24.04:
-  extends: .build
-  stage: test
-  variables:
-    PACKAGE_LIST: ci/apt-ubuntu-jammy
-    PYTHON_EXE: "python3"
-  image: ubuntu:24.04
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - dependencies/**/*
+        - Dockerfile
+        - ci/**/*
+        - .gitlab-ci.yml
+  parallel:
+    matrix:
+      - BASE_IMAGE: "ubuntu:22.04"
+        USE_CUDA: "OFF"
+      - BASE_IMAGE: "ubuntu:24.04"
+        USE_CUDA: "OFF"
+      - BASE_IMAGE: "nvidia/cuda:12.4.1-devel-ubuntu22.04"
+        USE_CUDA: "ON"
+      - BASE_IMAGE: "nvidia/cuda:12.8.1-devel-ubuntu22.04"
+        USE_CUDA: "ON"
