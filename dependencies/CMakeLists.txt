@@ -82,6 +82,9 @@ include(BuildCGAL)
 ### VCG ###
 include(BuildVCG)
 
+### nanoflann ###
+include(BuildNanoflann)
+
 ### openMVG ###
 include(BuildOpenMVG)
 

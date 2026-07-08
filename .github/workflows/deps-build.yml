@@ -1,0 +1,69 @@
+name: Dependencies build
+on:
+  pull_request:
+    paths:
+      - "dependencies/**"
+      - "Dockerfile"
+      - "ci/apt-*"
+      - ".github/workflows/deps-build.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "dependencies/**"
+      - "Dockerfile"
+      - "ci/apt-*"
+      - ".github/workflows/deps-build.yml"
+
+concurrency:
+  group: deps-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Build the full C++ dependency superbuild once (amd64, Ubuntu 22.04, no CUDA)
+  # and assert the resulting OpenMVS binaries report the expected version. The
+  # version assertion is what actually guards a dependency bump: a build that
+  # silently keeps the old GIT_TAG still "succeeds", so we must check the binary.
+  #
+  # Gated by paths above so it only runs when the dependency build inputs change.
+  deps-build:
+    name: Dependencies build + OpenMVS version check (amd64)
+    runs-on: ubuntu-22.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      EXPECTED_OPENMVS_VERSION: "2.4.0"
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc "$AGENT_TOOLSDIRECTORY"
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt update
+          sudo apt install -y --no-install-recommends $(cat ci/apt-ubuntu-jammy)
+
+      - name: Build dependencies
+        run: |
+          mkdir -p dependencies/build/
+          cmake -GNinja -S dependencies/ -B dependencies/build/ \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_JPEG=OFF
+          cmake --build dependencies/build/
+
+      - name: Assert OpenMVS version
+        run: |
+          set -euo pipefail
+          bin="dependencies/installed/bin/DensifyPointCloud"
+          if [ ! -x "$bin" ]; then
+            echo "::error::$bin was not built/installed"
+            exit 1
+          fi
+          # OpenMVS tools print a version banner to stderr on invocation.
+          out="$("$bin" 2>&1 || true)"
+          echo "$out"
+          if ! echo "$out" | grep -qE "v?${EXPECTED_OPENMVS_VERSION}"; then
+            echo "::error::Expected OpenMVS v${EXPECTED_OPENMVS_VERSION} not found in binary output"
+            exit 1
+          fi
+          echo "OpenMVS v${EXPECTED_OPENMVS_VERSION} confirmed."
