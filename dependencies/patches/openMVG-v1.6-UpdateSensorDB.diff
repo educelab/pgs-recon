@@ -1,8 +1,36 @@
+Add sensor widths for cameras missing from the upstream OpenMVG database.
+
+NOTE ON KEY FORMAT -- read before adding entries here.
+
+openMVG_main_SfMInit_ImageListing looks up EXIF "Make" + " " + "Model" (see
+main_SfMInit_ImageListing.cpp:343) and Datasheet::operator== matches in two steps:
+
+  1. The first space-delimited token of the database key must equal the first
+     token of the query, i.e. the key MUST start with the EXIF Make.
+     A bare "Chameleon3 CM3-U3-50S5M" key has maker token "chameleon3" and can
+     never match a query of "Point Grey Research Chameleon3 CM3-U3-50S5M".
+  2. The FIRST digit-containing token of the key must appear verbatim as a token
+     of the query. So the key must not carry a digit-bearing family name ahead of
+     the model code: "Point Grey Research Chameleon3 CM3-U3-50S5M" reduces to the
+     token "chameleon3", which every Chameleon3 shares, and a CM3-U3-31S4C entry
+     would then silently claim a CM3-U3-50S5M camera. Use
+     "Point Grey Research CM3-U3-50S5M" so the discriminating token is the model code.
+
+Lookup takes the FIRST match in file order, so appending can add a match but can
+never override an earlier entry. "Pixel 3a" is shadowed by upstream's
+"Google Pixel 3a;5.76" (line 2007) and cannot be corrected by appending.
+
+The bare keys below are kept because pgs_recon's Python importers
+(reconstruct.py:79-82, pgs_data.py:173-176) do an exact dict lookup of
+"{make} {model}" and then fall back to "{model}" alone. They are inert for the
+C++ matcher. Do not add '#' comment lines to the database itself -- sfm_utils'
+openmvg_load_camdb() regex rejects them and logs a parse error.
+
 diff --git a/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt b/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt
 index 9a3f5c0f..d5257a2f 100644
 --- a/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt
 +++ b/src/openMVG/exif/sensor_width_database/sensor_width_camera_database.txt
-@@ -6883,3 +6883,12 @@ Zuk Z1;4.69
+@@ -6883,3 +6883,18 @@ Zuk Z1;4.69
  Zuk Z2 Pro;4.61
  Zuk Z2 Rio Edition;4.54
  Zuk Z2;4.61
@@ -15,3 +43,9 @@ index 9a3f5c0f..d5257a2f 100644
 +Chameleon3 CM3-U3-31S4C;7.0656
 +Chameleon3 CM3-U3-50S5M;8.4456
 +NIKON Z 7_2;35.9
++Apple iPhone X;4.8
++LGE Nexus 5X;4.7
++Google Pixel 4a;5.6448
++Google Pixel 6a;5.6448
++Point Grey Research CM3-U3-31S4C;7.0656
++Point Grey Research CM3-U3-50S5M;8.4456
