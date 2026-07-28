@@ -1,5 +1,6 @@
 configargparse
 educelab-imgproc>=0.4
+imagecodecs
 imageio
 matplotlib
 numpy>=2
