@@ -28,6 +28,74 @@ docker run -v .:/working ghcr.io/educelab/pgs-recon:latest \
 Upon successful completion of the pipeline, your reconstructed model can be 
 found in `recon/mvs/my-object.obj`.
 
+### Staged and resumable runs
+The pipeline records what it has finished in `<output>/metadata.json`, so
+**re-running the same command in the same output directory resumes it** rather
+than starting over. After a crash or an out-of-memory kill during mesh
+refinement, this picks up at `refine`:
+
+```shell
+pgs-recon -i images/ -o recon/ --name my-object
+```
+
+`--from`/`--to` (both inclusive) restrict a run to a contiguous window of the
+thirteen pipeline stages:
+
+```
+import  features  matches  filter  sfm  robust  autoscale  colorize
+convert  densify  reconstruct  refine  texture
+```
+
+This lets one reconstruction be split across several cluster jobs, each sized
+for the stages it runs — useful because `RefineMesh` needs far more memory than
+the rest of the pipeline, and sizing a whole-pipeline job for its worst case
+wastes a large allocation on hours of cheap SfM:
+
+```shell
+J1=$(sbatch --mem=32G  --parsable job1.sh)   # pgs-recon -i $IMGS -o $OUT -n obj --to reconstruct
+J2=$(sbatch --mem=256G --parsable --dependency=afterok:$J1 job2.sh)  # pgs-recon -o $OUT --from refine --to refine
+        sbatch --mem=64G           --dependency=afterok:$J2 job3.sh  # pgs-recon -o $OUT --from texture
+```
+
+The later jobs need neither `-i` nor `--name`: every argument of the first run is
+recorded in the manifest and reloaded, so only what changes has to be repeated.
+`apptainer/submit_recon_pipeline.sh` is a worked example of this: it submits the
+OpenMVG stages to a CPU node, densification to a GPU node, and
+mesh/refine/texture to a high-memory node, chained with `afterok`. Notes:
+
+* `--dry-run` resolves and prints the whole plan — loaded arguments, pipeline
+  shape, which stages will run or be skipped, rehydrated input paths, and the
+  prerequisite check — then exits without launching a binary. With no range it
+  doubles as a status query for an output directory.
+* Stages already recorded complete are skipped. A stage re-runs if its own
+  arguments changed, if a stage producing one of its inputs re-runs, if one of
+  its inputs now comes from somewhere else, or if `--rerun` is given. So
+  retrying just the expensive step is
+  `pgs-recon -o recon/ --from refine --refine-resolution-level 2`, which
+  re-refines and re-textures but touches nothing before it.
+* Changing the shape is allowed at any point. Adding `--mvs-densify` to a
+  finished reconstruction re-runs densify and the mesh stages, and dropping it
+  again re-runs them against the non-dense filenames.
+* Stages before `--from` are never run implicitly: if one is incomplete or its
+  inputs have moved, the run fails immediately, naming each, instead of quietly
+  doing work the job was not sized for.
+* If the range stops before stages the run invalidates, those stages are named
+  in a warning and rebuilt by the next run that covers them. The final textured
+  mesh keeps its usual `mvs/<name>.obj` filename in the meantime, so check the
+  warning rather than the filename.
+* What is on disk is never consulted — `<output>/metadata.json` is the record. If
+  you delete an intermediate by hand, use `--rerun` to rebuild it.
+* An argument aimed at a stage outside the range is ignored with a warning,
+  because it would change filenames the rest of the pipeline has already
+  committed to. Per-invocation settings are exempt and can differ freely between
+  jobs: `--path` and `--cam-db` apply silently, and `--threads`, `--log-level`,
+  `--config` and `--output` are not recorded at all, so they never leak into a
+  later job.
+* `--output` must be on a filesystem every job can see. `pgs-recon` does no
+  copying of its own; stage node-local scratch in and out around it.
+* `--no-mvs` is deprecated: use `--to colorize` for an SfM-only run. The old flag
+  still works (it sets `--to colorize` and warns) but will be removed.
+
 ### Docker images
 We provide multi-architecture (x86, arm64) Docker images in the 
 [GitHub Container Registry](https://github.com/educelab/pgs-recon/pkgs/container/pgs-recon).
@@ -57,7 +125,7 @@ docker pull ghcr.io/educelab/pgs-recon:latest-cuda12.8
 All project tools can be launched directly using `docker run`:
 ```shell
 $ docker run ghcr.io/educelab/pgs-recon pgs-recon --help
-usage: pgs-recon [-h] [--config CONFIG] --input INPUT --output OUTPUT
+usage: pgs-recon [-h] [--config CONFIG] [--input INPUT] --output OUTPUT
                  [--name NAME] [--file-type {ply,obj}] [--focal-length n]
                  [--new-importer | --no-new-importer]
                  [--import-pgs-scan | --no-import-pgs-scan | -p]

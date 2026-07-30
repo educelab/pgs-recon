@@ -15,9 +15,11 @@ for i in $(cat "$1"); do
      cnt=0
   fi
 
-  # Submit a new job
+  # Submit a new chain. submit_recon_pipeline.sh runs on the login node and
+  # sbatches the jobs itself, so it is invoked directly; per-job partitions and
+  # resources are set inside it (PGS_PART_* to override).
   echo "Submitting ${i}..."
-  sbatch -p CAL48M192_L --cpus-per-task=32 --mem=0 --export ALL,PGS_EXPOSURE=2,PGS_SHADOWS=40 submit_recon_pipeline.sh "/mnt/gemini1-4/seales_uksr/herculaneum/Dailies/${i}/"
+  PGS_EXPOSURE=2 PGS_SHADOWS=40 ./submit_recon_pipeline.sh "/mnt/gemini1-4/seales_uksr/herculaneum/Dailies/${i}/"
   echo ${i} >> submitted.txt
   echo
 

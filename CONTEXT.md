@@ -55,18 +55,97 @@ camera, intrinsic) in the solved frame. Distinct from the **rig-prior import**:
 the scene is already solved and is not re-solved. This is what `pgs-calibrate`
 does. _Avoid_: registration, alignment, SfM
 
-**Calibration** (camera calibration artifact):
-The reusable single-view `*_calibration.json` emitted by `pgs-calibrate`: one
-localized view carrying a pose + intrinsic in the solved frame. Because a
-physical camera position is shared across its modalities, the calibration is
-solved once and reused to texture with each modality. NOT the ChArUco/board
-calibration of `educelab`, and NOT the autoscale step. _Avoid_: calib, intrinsics
+**Calibration** (a family of senses):
+Three steps here all calibrate something, and naming which one is meant is the
+whole job of the word:
+
+- the **SfM solve** calibrates the rig's cameras against the scene, recovering
+  their poses (and intrinsics) from the images themselves — the `sfm` and
+  `robust` stages;
+- **autoscale** calibrates the scene's *scale*, fixing the solved frame's
+  arbitrary unit against a marker of known physical size — the `autoscale`
+  stage, via `pgs-global-scaler`;
+- **`pgs-calibrate`** calibrates a *new* camera into an already-solved scene, by
+  **localizing** it.
+
+Unqualified, and especially as an artifact, "calibration" means the third:
+`*_calibration.json`, the reusable single-view calibration emitted by
+`pgs-calibrate`, one localized view carrying a pose + intrinsic in the solved
+frame. Because a physical camera position is shared across its modalities, that
+calibration is solved once and reused to texture with each modality.
+
+NOT the ChArUco/board calibration of `educelab`.
+_Avoid_: calib, intrinsics
 
 **Overhead camera**:
 A camera that imaged the object but was NOT part of the rig reconstruction
 (e.g. a top-down registration camera). It has no solved pose, so it must be
 **localized** before its images can texture the mesh. Contrast a **modality**,
 which reuses an existing rig camera's solved poses. _Avoid_: external camera, witness camera
+
+**Stage**:
+One of the thirteen steps of a reconstruction, each exactly one binary
+invocation, named for what it does rather than for the binary (`densify`,
+`refine`, `texture`). A stage is the unit a run can start and stop at, and the
+unit whose completion is recorded.
+_Avoid_: step, phase, pass, task
+
+**Pipeline shape**:
+Which stages a given reconstruction consists of at all — declared by the enable
+flags (`--mvs-densify`, `--mvs-refine`, ...) of the run in progress. A later run
+may legitimately change it, which re-runs whatever the change invalidates
+(warning about any of it left outside the range). Distinct from the **range**:
+the contiguous window of that shape a single run executes (`--from`/`--to`). The
+shape says what the reconstruction *is*; the range says what this job *does*.
+_Avoid_: pipeline, stage list, workflow
+
+**Role**:
+A semantic artifact slot a stage consumes or produces — `sfm`, `features`,
+`matches`, `matches_filtered`, `view_pairs`, `colorized`, `scene`, `cloud`,
+`mesh`. Roles are how a resumed job finds its inputs: the real `paths` keys
+encode which stages ran (`mvs_scene_dense_mesh_refine`), a role does not.
+Declared per stage in `stages.STAGE_IO`. Distinct from the artifact's
+**filename**, which the wrappers derive from their input's stem.
+_Avoid_: artifact type, slot, key
+
+**Binding**:
+Which stage currently owns a role, and where that artifact is. Roles are
+*rebound* as a run proceeds — `sfm` is produced by `import`, then rebound by the
+`sfm`, `robust` and `autoscale` stages — so a binding is only meaningful at a
+point in the pipeline, and the stage graph is derived from the shape rather than
+declared. A binding's path is unknown while its producing stage is **dirty**.
+_Avoid_: chain entry, path, mapping
+
+**Dirty**:
+A stage whose recorded result no longer holds, and so must run: no record or a
+record that is not `complete`, its own arguments changed, a stage producing
+something it consumes is dirty, or a role it consumes is now bound to a
+different path than it recorded. Dirtiness is **computed** each run, never
+stored — which is why a range that leaves later stages dirty is a warning rather
+than an error. Never inferred from what is on disk.
+_Avoid_: stale, invalid, out-of-date, needs-rebuild
+
+**Manifest**:
+The run's `metadata.json`, the single record of what a reconstruction has
+finished: each stage's status, the artifacts it produced, and the effective
+arguments it ran with. It is what makes a run resumable and what a later job
+consults instead of being told again.
+_Avoid_: state file, checkpoint, log, metadata
+
+**Effective arguments**:
+The arguments a stage actually ran with, after the manifest's recorded values
+have been merged with this invocation's and out-of-range overrides discarded.
+Distinct from what was typed on the command line — the manifest records the
+effective values, never the ignored ones.
+_Avoid_: args, options, config, defaults
+
+**Interface scene** (`MVSI`):
+An OpenMVS `.mvs` written in the Boost-independent interface format — cameras,
+poses, and image paths, with its own versioned header. It is portable across
+Boost versions, compilers, and architectures, unlike the Boost project format
+(`MVS\0`) OpenMVS otherwise writes. Every scene handed between stages is an
+interface scene, and all geometry travels beside it as `.ply`.
+_Avoid_: mvs file, scene file, project, archive
 
 ## Retexture output layout
 

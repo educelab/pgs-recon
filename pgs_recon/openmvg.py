@@ -40,14 +40,18 @@ def init_sfm_generic(paths: Dict[str, Path], focal_length=None,
     run_command(command)
 
 
-def compute_features(paths: Dict[str, Path], method: str, preset: str,
-                     upright=False, threads: int = None,
-                     metadata: Dict = None):
-    """MVG: Compute image features"""
+def compute_features(paths: Dict[str, Path], sfm_key: str, method: str,
+                     preset: str, upright=False, threads: int = None,
+                     metadata: Dict = None) -> str:
+    """MVG: Compute image features.
+
+    Features land beside the scene in ``matches_dir`` under names derived from
+    each image, so the returned key is that directory rather than a file.
+    """
     # Compute features
     command = [
         str(paths['BIN'] / 'openMVG_main_ComputeFeatures'),
-        '-i', str(paths['sfm']),
+        '-i', str(paths[sfm_key]),
         '-o', str(paths['matches_dir']),
         '-m', method,
         '-p', preset,
@@ -59,15 +63,16 @@ def compute_features(paths: Dict[str, Path], method: str, preset: str,
     if metadata is not None:
         metadata['commands'][current_timestamp()] = (str(' ').join(command))
     run_command(command)
+    return 'matches_dir'
 
 
-def compute_matches(paths: Dict[str, Path], method: str,
+def compute_matches(paths: Dict[str, Path], sfm_key: str, method: str,
                     ratio: float = None, pairs_file: Path = None,
-                    metadata: Dict = None):
+                    metadata: Dict = None) -> str:
     """Compute image feature matches"""
     command = [
         str(paths['BIN'] / 'openMVG_main_ComputeMatches'),
-        '-i', str(paths['sfm']),
+        '-i', str(paths[sfm_key]),
         '-o', str(paths['matches_file']),
         '-n', method,
     ]
@@ -78,17 +83,25 @@ def compute_matches(paths: Dict[str, Path], method: str,
     if metadata is not None:
         metadata['commands'][current_timestamp()] = (str(' ').join(command))
     run_command(command)
+    return 'matches_file'
 
 
-def geometric_filter(paths: Dict[str, Path], model: str = None,
-                     pairs_file: Path = None, metadata: Dict = None):
-    filtered = paths['matches_file']
+def geometric_filter(paths: Dict[str, Path], sfm_key: str, matches_key: str,
+                     model: str = None, pairs_file: Path = None,
+                     metadata: Dict = None) -> str:
+    """Geometrically filter putative matches.
+
+    Writes ``<matches>_filtered<suffix>`` beside its input, and keeps that path
+    under the canonical ``matches_file_filtered`` key: ``mvg_sfm`` passes it to
+    ``-M`` by basename.
+    """
+    filtered = paths[matches_key]
     filtered = filtered.parent / (filtered.stem + '_filtered' + filtered.suffix)
     paths['matches_file_filtered'] = filtered
     command = [
         str(paths['BIN'] / 'openMVG_main_GeometricFilter'),
-        '-i', str(paths['sfm']),
-        '-m', str(paths['matches_file']),
+        '-i', str(paths[sfm_key]),
+        '-m', str(paths[matches_key]),
         '-o', str(filtered)
     ]
     if model is not None:
@@ -98,20 +111,26 @@ def geometric_filter(paths: Dict[str, Path], model: str = None,
     if metadata is not None:
         metadata['commands'][current_timestamp()] = (str(' ').join(command))
     run_command(command)
+    return 'matches_file_filtered'
 
 
-def mvg_sfm(paths: Dict[str, Path], sfm_key: str, engine: str, use_priors=False,
+def mvg_sfm(paths: Dict[str, Path], sfm_key: str, features_key: str,
+            matches_key: str, engine: str, use_priors=False,
             refine_intrinsics: str = None,
             initializer: str = None,
             metadata: Dict = None) -> str:
-    """Run SfM"""
+    """Run SfM.
+
+    ``features_key`` names the regions directory, ``matches_key`` the filtered
+    matches file inside it -- OpenMVG takes the latter by basename.
+    """
     command = [
         str(paths['BIN'] / 'openMVG_main_SfM'),
         '-i', str(paths[sfm_key]),
         '-s', engine.upper(),
-        '-m', str(paths['matches_dir']),
+        '-m', str(paths[features_key]),
         '-o', str(paths['recon_dir']),
-        '-M', str(paths['matches_file_filtered'].name),
+        '-M', str(paths[matches_key].name),
     ]
     if use_priors:
         command.append('-P')
@@ -157,19 +176,24 @@ def mvg_autoscale(paths: Dict[str, Path], sfm_key: str, marker_size: float,
     return out_key
 
 
-def mvg_compute_known(paths: Dict[str, Path], sfm_key: str,
-                      direct: bool = False, bundle_adjustment: bool = False,
+def mvg_compute_known(paths: Dict[str, Path], sfm_key: str, features_key: str,
+                      matches_key: str, direct: bool = False,
+                      bundle_adjustment: bool = False,
                       metadata: Dict = None) -> str:
-    """Compute structure from known poses (direct/robust)"""
+    """Compute structure from known poses (direct/robust).
+
+    Triangulates against the unfiltered matches (``matches_key``), unlike
+    ``mvg_sfm``.
+    """
     out_key = sfm_key + '_structured'
     in_path = paths[sfm_key]
     paths[out_key] = paths['recon_dir'] / (in_path.stem + '_structured.bin')
     command = [
         str(paths['BIN'] / 'openMVG_main_ComputeStructureFromKnownPoses'),
         '-i', str(paths[sfm_key]),
-        '-m', str(paths['matches_dir']),
+        '-m', str(paths[features_key]),
         '-o', str(paths[out_key]),
-        '-f', str(paths['matches_file']),
+        '-f', str(paths[matches_key]),
     ]
     if direct:
         command.append('-d')
