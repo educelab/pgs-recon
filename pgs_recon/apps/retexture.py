@@ -618,25 +618,53 @@ def ensure_ply_mesh(mesh_path: Path, work_dir: Path,
     return out
 
 
-def resolve_recon_inputs(recon_dir: Path):
-    """Locate the solved SfM and textured mesh inside a pgs-recon output dir.
+def _stage_status(stages: dict, name: str) -> str:
+    """A stage's recorded status, or ``'never run'`` if it has no record."""
+    return (stages.get(name) or {}).get('status') or 'never run'
 
-    Reads ``<recon_dir>/metadata.json`` but rebuilds every path *relative to*
-    ``recon_dir``: the absolute paths recorded there may belong to another
-    runtime (e.g. a Docker mount), so they are not trusted directly.
 
-    The SfM that produced the mesh is the one fed to openMVG2openMVS (after any
-    robust-triangulation / autoscale step, before colorize); we recover its
-    basename from that command and re-root it under ``mvg/recon_dir``. The
-    textured mesh is ``mvs/<name>.<file_type>`` from the run's parsed args.
-    Returns ``(sfm_path, mesh_path)``.
+def _resolve_from_stage_records(meta: dict, meta_path: Path, recon_dir: Path):
+    """Read the SfM and textured mesh straight out of the stage records.
+
+    ``pgs-recon`` records each stage's inputs and outputs as paths relative to
+    the output directory (see ``pgs_recon/stages.py``), so both artifacts are an
+    exact lookup. Returns ``None`` if this manifest predates stage records.
+
+    Only a ``complete`` stage carries inputs/outputs -- ``pgs-recon`` replaces
+    the whole record when a stage starts -- so the absence of one means either
+    "never ran" or "crashed", and the recorded status is what tells them apart.
     """
-    meta_path = recon_dir / 'metadata.json'
-    if not meta_path.is_file():
-        sys.exit(f'No metadata.json in {recon_dir}; '
-                 f'is this a pgs-recon output directory?')
-    meta = json.loads(meta_path.read_text())
+    stages = meta.get('stages') or {}
+    if not stages:
+        return None
+    sfm_rel = ((stages.get('convert') or {}).get('inputs') or {}).get('sfm')
+    mesh_rel = ((stages.get('texture') or {}).get('outputs') or {}).get('mesh')
+    if not sfm_rel:
+        status = _stage_status(stages, 'convert')
+        if status == 'never run':
+            sys.exit(f'{meta_path} records no convert stage; the run stopped '
+                     f'before MVS (--to colorize?) and cannot be re-textured.')
+        sys.exit(f'{meta_path} records convert as {status!r}, not complete, so '
+                 f'the MVS scene it produces is not available. Finish the '
+                 f'reconstruction first: pgs-recon -o {recon_dir}')
+    if not mesh_rel:
+        status = _stage_status(stages, 'texture')
+        if status == 'never run':
+            sys.exit(f'{meta_path} records no texture stage; there is no '
+                     f'textured mesh to re-texture.')
+        sys.exit(f'{meta_path} records texture as {status!r}, not complete, so '
+                 f'its textured mesh is missing or half-written. Finish the '
+                 f'reconstruction first: pgs-recon -o {recon_dir}')
+    return recon_dir / sfm_rel, recon_dir / mesh_rel
 
+
+def _resolve_from_commands(meta: dict, meta_path: Path, recon_dir: Path):
+    """Fallback for output dirs written before stage records existed.
+
+    Recovers the SfM basename by grepping the recorded command strings for
+    ``openMVG2openMVS``, then re-roots it at ``mvg/recon_dir``; the textured mesh
+    is ``mvs/<name>.<file_type>`` from the run's parsed args.
+    """
     sfm_name = None
     for cmd in meta.get('commands', {}).values():
         if 'openMVG2openMVS' in cmd:
@@ -645,7 +673,8 @@ def resolve_recon_inputs(recon_dir: Path):
                 sfm_name = Path(toks[toks.index('-i') + 1]).name
     if sfm_name is None:
         sys.exit(f'{meta_path} records no openMVG2openMVS step; the run had no '
-                 f'MVS stage (--no-mvs?) and cannot be re-textured.')
+                 f'MVS stage (--no-mvs / --to colorize?) and cannot be '
+                 f're-textured.')
     sfm_path = recon_dir / 'mvg' / 'recon_dir' / sfm_name
 
     parsed = meta.get('parsed', {})
@@ -653,12 +682,39 @@ def resolve_recon_inputs(recon_dir: Path):
     if not name or not file_type:
         sys.exit(f'{meta_path} is missing name/file_type; '
                  f'cannot locate the textured mesh.')
-    mesh_path = recon_dir / 'mvs' / f'{name}.{file_type}'
+    return sfm_path, recon_dir / 'mvs' / f'{name}.{file_type}'
+
+
+def resolve_recon_inputs(recon_dir: Path):
+    """Locate the solved SfM and textured mesh inside a pgs-recon output dir.
+
+    Reads ``<recon_dir>/metadata.json`` but rebuilds every path *relative to*
+    ``recon_dir``: the absolute paths recorded there may belong to another
+    runtime (e.g. a Docker mount), so they are not trusted directly.
+
+    The SfM that produced the mesh is the one fed to openMVG2openMVS (after any
+    robust-triangulation / autoscale step, before colorize) -- it is not any one
+    stage's output, which is why the convert stage records its input. Returns
+    ``(sfm_path, mesh_path)``.
+    """
+    meta_path = recon_dir / 'metadata.json'
+    if not meta_path.is_file():
+        sys.exit(f'No metadata.json in {recon_dir}; '
+                 f'is this a pgs-recon output directory?')
+    meta = json.loads(meta_path.read_text())
+
+    resolved = _resolve_from_stage_records(meta, meta_path, recon_dir)
+    if resolved is not None:
+        sfm_path, mesh_path = resolved
+        source = 'stage records'
+    else:
+        sfm_path, mesh_path = _resolve_from_commands(meta, meta_path, recon_dir)
+        source = 'legacy command log'
 
     for p in (sfm_path, mesh_path):
         if not p.is_file():
             sys.exit(f'Expected reconstruction artifact not found: {p}')
-    logger.info(f'Resolved from {recon_dir}: sfm={sfm_path.name}, '
+    logger.info(f'Resolved from {recon_dir} via {source}: sfm={sfm_path.name}, '
                 f'mesh={mesh_path.name}')
     return sfm_path, mesh_path
 

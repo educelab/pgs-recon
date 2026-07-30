@@ -13,6 +13,20 @@ workflow:
 
 ### Tests ###
 
+# The run planner (pgs_recon/stages.py) is pure logic over the manifest and the
+# parsed arguments: stdlib only, no filesystem, no binaries. So this needs
+# nothing but a Python interpreter and is the fastest signal in the pipeline.
+# tests/test_reconstruct.py skips itself here, since configargparse and
+# sfm_utils are not installed; test:python below runs it with them present.
+test:unit:
+  stage: test
+  image: python:3.9-slim
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+  script:
+    - python -m unittest discover -s tests -v
+
 # Quick check for normal MRs: install the Python package (and its Python deps)
 # into a venv and smoke-test the entry point. The compiled OpenMVG/OpenMVS
 # binaries are discovered at runtime, not at install time, so this needs no C++
@@ -35,6 +49,8 @@ test:python:
     - python -m pip install --upgrade pip setuptools wheel
     - python -m pip install .
     - pgs-recon --help
+    - echo Running the test suite against the installed dependencies
+    - python -m unittest discover -s tests -v
 
 # Full C++ dependency build across the same base-image / CUDA matrix as the
 # GitHub Docker images. Expensive, so gated to MRs that actually touch the
