@@ -54,23 +54,47 @@ from any other error. `StageError` already made this move for the planner.
 
 ## MR1 · Foundation *(additive, nothing imports it yet)*
 
-- [ ] `pgs_recon/layout.py` — naming as pure functions, **reproducing today's
+- [x] `pgs_recon/layout.py` — naming as pure functions, **reproducing today's
       chained names exactly**
-  - [ ] Preserve `refined()` deriving from the **scene**, not the mesh
+  - [x] Preserve `refine_mesh()` deriving from the **scene**, not the mesh
         (ADR 0003: `scene_dense_refine.ply`)
-  - [ ] Preserve `dense_cloud()` as the scene stem with `.ply`
-- [ ] `pgs_recon/toolchain.py`
-  - [ ] `resolve_exe()` — `explicit kwarg → configure() → $PGS_RECON_PREFIX →
+  - [x] Preserve `densify_cloud()` as the scene stem with `.ply`
+  - Functions are named for the MR3 endpoint (`<stage>_<role>`), so that rename
+    is a change of bodies. Argument rule: **the output root, unless the name
+    chains off an input artifact, in which case that artifact** — so MR3 also
+    drops the input argument from `robust_sfm`/`autoscale_sfm`/`colorize_sfm` and
+    the four MVS chain functions, and every signature becomes `(output, ...)`
+  - Also covers the layout `main()` spells out today: `manifest()`, `config()`,
+    `directories()` for the mkdir pass
+- [x] `pgs_recon/toolchain.py`
+  - [x] `resolve_exe()` — `explicit kwarg → configure() → $PGS_RECON_PREFIX →
         /usr/local → error naming the tier`. **At call time**, never import time
-  - [ ] `configure()` / `using()` (context manager, restores on exit)
-  - [ ] `run()` — record to `metadata['commands']`, then execute. Must reference
+    - `ToolNotFound` subclasses `ToolFailed`, so every `main()`'s existing
+      handler covers it and it exits 127. Also distinguishes a file that is
+      present but not executable
+    - A caller-supplied prefix is absolutised (and `~` expanded) as it is
+      accepted, preserving today's `Path(args.path).resolve()`. Load-bearing,
+      not tidiness: `subprocess` resolves a relative argv[0] against `cwd`, so
+      a relative prefix would pass `resolve_exe`'s check and *then* fail to
+      exec under `mvg_to_mvs`/`mvs_texture`, which both run with `cwd=mvs/`.
+      `$PGS_RECON_PREFIX` is the tier that makes this reachable — no argument
+      parser stands between it and us
+    - The public accessor is `effective_prefix()`, not `prefix()`, which would
+      be shadowed by the `prefix` keyword argument in four of this module's
+      own functions
+  - [x] `configure()` / `using()` (context manager, restores on exit)
+  - [x] `run()` — record to `metadata['commands']`, then execute. Must reference
         `run_command` as a module global so `mock.patch` works
-  - [ ] `Recorder` — also records non-binary Python steps
+  - [x] `Recorder` — also records non-binary Python steps
         (`init_sfm_generic2`, `init_sfm_pgs`), which today hand-write fake
         command strings
-- [ ] `tests/test_layout.py` — exact names for every shape permutation
-- [ ] `tests/test_toolchain.py` — resolution tiers, error message names the tier,
+    - `cam_db()` moves here too: it is prefix-relative, and ADR 0005 counts it
+      as the toolchain half of the old `paths` dict. Deliberately not checked for
+      existence
+- [x] `tests/test_layout.py` — exact names for every shape permutation
+- [x] `tests/test_toolchain.py` — resolution tiers, error message names the tier,
       no filesystem access at import
+  - `make_fake_prefix()` lives here, for MR2's end-to-end tests to import
 
 ---
 
@@ -97,6 +121,13 @@ Atomic by necessity: the moment a signature changes, every caller changes with i
 - [ ] `docs/adr/0005-wrappers-mirror-the-binary.md` *(written)*
 - [ ] `CONTEXT.md` — `Role` entry no longer defined against `paths` keys
       *(written)*
+- [ ] **`README.md` — document `$PGS_RECON_PREFIX`.** MR1 added it as a
+      resolution tier but deliberately left it undocumented outside the ADR:
+      nothing imports `toolchain` yet, so advertising it would promise a knob
+      that does not turn. It becomes user-facing the moment `main()` calls
+      `configure()`, and the README's binary-discovery section (the `--path`
+      default of `/usr/local/`) is where it belongs. `CLAUDE.md`'s "Binary
+      discovery at runtime" needs the same sentence
 
 ### Tests
 
