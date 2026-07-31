@@ -112,8 +112,13 @@ binary invocation and calls `run_command`:
 - `pgs_recon/utility.py` — `run_command` (subprocess wrapper that `sys.exit`s on
   failure) and timestamp helper.
 - `pgs_recon/utils/` — shared helpers: `apps.py` (logging setup), `geometry.py`,
-  `quality.py`, `charuco.py`, `wavefront.py`, `educelab.py` (ChArUco/board detection).
-- `pgs_recon/apps/` — standalone CLI utilities (one `main()` each).
+  `quality.py`, `charuco.py`, `wavefront.py`, `educelab.py` (ChArUco/board detection),
+  `recon_dir.py` (locate a finished run's SfM/mesh from its `metadata.json`),
+  `sfm_json.py` (OpenMVG SfM_Data JSON surgery: cereal polymorphic registration,
+  extrinsic frame transforms), `images.py` (8-bit sRGB normalization).
+- `pgs_recon/apps/` — standalone CLI utilities (one `main()` each). Apps must NOT
+  import each other; anything two apps need belongs in `utils/` (the three modules
+  above were extracted from `retexture.py` for exactly this reason).
 
 ### Key external Python dependency
 
