@@ -24,7 +24,7 @@ from pgs_recon.stages import (CONTROL_ARGS, NO_PERSIST, STAGES, StageError,
                               pipeline_shape, resolve_range,
                               revert_out_of_range, utc_now, validate_arg_map,
                               write_manifest)
-from pgs_recon.utility import current_timestamp
+from pgs_recon.utility import ToolFailed, current_timestamp
 from pgs_recon.utils.apps import setup_logging
 
 
@@ -330,15 +330,22 @@ def build_parser() -> configargparse.ArgumentParser:
 
 
 def main():
-    """Entry point. Planning failures arrive as ``StageError`` and exit here.
+    """Entry point. Planning and tool failures both surface here.
 
-    The planner raises rather than calling ``sys.exit`` so it can be tested
-    without a subprocess; ``utility.run_command`` still exits directly.
+    Both are raised rather than exiting in place so they can be tested without a
+    subprocess. A ``ToolFailed`` exits with the *binary's* status, not 1, so a
+    stage killed by the OOM reaper is distinguishable from a bad argument in a
+    batch scheduler's log.
     """
     try:
         _main()
     except StageError as e:
         sys.exit(f'ERROR: {e}')
+    except ToolFailed as e:
+        # A binary can only fail after setup_logging, so the reason for the exit
+        # status lands in the run's log next to the stage lines that led to it.
+        logging.getLogger('pgs-recon').error(f'{e}')
+        sys.exit(e.exit_code)
 
 
 def _main():
@@ -502,8 +509,9 @@ def _main():
     try:
         run_pipeline(tracker, paths, args, metadata, logger)
     except BaseException:
-        # run_command sys.exit()s on failure; anything not marked complete is
-        # re-runnable, but recording 'failed' makes the reason legible.
+        # A failed binary raises ToolFailed past here; anything not marked
+        # complete is re-runnable, but recording 'failed' makes the reason
+        # legible. BaseException so a Ctrl-C is recorded too.
         tracker.abort()
         raise
 

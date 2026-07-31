@@ -16,7 +16,7 @@ from educelab.imgproc import pipeline
 from skimage import img_as_float
 from tqdm import tqdm
 
-from pgs_recon.utility import run_command
+from pgs_recon.utility import ToolFailed, run_command
 
 
 def write_config(args, config_path=None):
@@ -42,6 +42,15 @@ def has_group_opt(args, grp):
 
 
 def main():
+    """Entry point. A failed binary exits with *its* status, not 1."""
+    try:
+        _main()
+    except ToolFailed as e:
+        logging.getLogger('pgs-convert').error(f'{e}')
+        sys.exit(e.exit_code)
+
+
+def _main():
     parser = configargparse.ArgumentParser(prog='pgs-convert')
     parser.add_argument('--config', '-c', is_config_file=True,
                         help='Config file path')

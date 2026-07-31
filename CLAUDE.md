@@ -109,8 +109,9 @@ binary invocation and calls `run_command`:
 - `pgs_recon/pgs_data.py` — import logic for EduceLab "PGS Scan" directories,
   including grid-scan neighbor lookup that generates an OpenMVG **view pairs file**
   (limits matching to spatial neighbors via `--matching-pairs-radius`).
-- `pgs_recon/utility.py` — `run_command` (subprocess wrapper that `sys.exit`s on
-  failure) and timestamp helper.
+- `pgs_recon/utility.py` — `run_command` (subprocess wrapper that raises
+  `ToolFailed`, carrying the child's exit status; each app's `main()` catches it
+  and exits `128 + signum` for a signal death) and timestamp helper.
 - `pgs_recon/utils/` — shared helpers: `apps.py` (logging setup), `geometry.py`,
   `quality.py`, `charuco.py`, `wavefront.py`, `educelab.py` (ChArUco/board detection),
   `recon_dir.py` (locate a finished run's SfM/mesh from its `metadata.json`),

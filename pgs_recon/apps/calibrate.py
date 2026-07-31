@@ -56,7 +56,7 @@ import cv2
 import numpy as np
 
 from pgs_recon.openmvg import mvg_localize, CameraModel, ResectionMethod
-from pgs_recon.utility import current_timestamp, run_command
+from pgs_recon.utility import ToolFailed, current_timestamp, run_command
 from pgs_recon.utils.apps import setup_logging
 from pgs_recon.utils.images import prepare_8bit_image
 from pgs_recon.utils.recon_dir import resolve_solved_sfm
@@ -417,6 +417,15 @@ def extract_calibration(expanded_json: Path, query_name: str,
 
 
 def main():
+    """Entry point. A failed binary exits with *its* status, not 1."""
+    try:
+        _main()
+    except ToolFailed as e:
+        logging.getLogger('pgs-calibrate').error(f'{e}')
+        sys.exit(e.exit_code)
+
+
+def _main():
     parser = configargparse.ArgumentParser(
         prog='pgs-calibrate',
         description='Localize a new camera image against an existing pgs-recon '

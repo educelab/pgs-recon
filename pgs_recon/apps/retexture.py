@@ -62,7 +62,7 @@ import numpy as np
 
 from pgs_recon.openmvg import mvg_to_mvs
 from pgs_recon.openmvs import mvs_texture
-from pgs_recon.utility import current_timestamp, run_command
+from pgs_recon.utility import ToolFailed, current_timestamp, run_command
 from pgs_recon.utils.apps import setup_logging
 from pgs_recon.utils.images import prepare_8bit_image
 from pgs_recon.utils.recon_dir import (
@@ -525,6 +525,15 @@ def ensure_ply_mesh(mesh_path: Path, work_dir: Path,
 
 
 def main():
+    """Entry point. A failed binary exits with *its* status, not 1."""
+    try:
+        _main()
+    except ToolFailed as e:
+        logging.getLogger('pgs-retexture').error(f'{e}')
+        sys.exit(e.exit_code)
+
+
+def _main():
     parser = configargparse.ArgumentParser(
         prog='pgs-retexture',
         description='Re-texture an existing mesh with an alternate imaging '

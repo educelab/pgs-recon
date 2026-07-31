@@ -30,14 +30,21 @@ Slurm/Apptainer execution is ever wanted.
 
 Lands first: `toolchain.run()`'s contract depends on it.
 
-- [ ] `utility.py` — add `ToolFailed(command, returncode)`; raise instead of
+- [x] `utility.py` — add `ToolFailed(command, returncode)`; raise instead of
       `sys.exit`; drop the bare `except:` so `KeyboardInterrupt` propagates
-- [ ] `apps/reconstruct.py`, `apps/retexture.py`, `apps/calibrate.py`,
+  - `ToolFailed.exit_code` does the POSIX translation once (`128 + signum` for a
+    signal, 127 for a binary that never started), so each `main()` stays 3 lines
+- [x] `apps/reconstruct.py`, `apps/retexture.py`, `apps/calibrate.py`,
       `apps/convert.py` — one `except ToolFailed` per `main()`, exiting
       `128 + signum` for signal deaths (so an OOM reads as 137 in a Slurm log)
-- [ ] `utils/images.py` — non-`main()` caller; confirm it should propagate
-- [ ] Test: a failing fake command raises rather than exiting, and
-      `StageTracker` still records `failed`
+  - The latter three grew a `main()`/`_main()` split, matching `reconstruct.py`.
+    These four are every caller that can reach `run_command`
+- [x] `utils/images.py` — non-`main()` caller; confirm it should propagate
+      *(it should: both callers catch in `main()`)*
+- [x] Test: a failing fake command raises rather than exiting, and
+      `StageTracker` still records `failed` *(`tests/test_utility.py`)*
+- [x] Prose that documented the old convention: ADR 0004, `CLAUDE.md`,
+      `StageError`'s docstring, `_main`'s `abort()` comment
 
 **Why:** `sys.exit(str)` always exits 1, destroying the child's exit code — an
 OOM-killed `RefineMesh` (the failure ADR 0004 exists for) was indistinguishable

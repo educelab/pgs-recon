@@ -24,6 +24,10 @@ def prepare_8bit_image(src: Path, out_dir: Path) -> Path:
     inputs such as the EduceLab CIELab TIFFs (which OpenCV would misread
     channel-for-channel). Per-image tone mapping is fine here because each image
     is textured (or localized) independently. Returns the output path.
+
+    A failed ``convert`` propagates as ``ToolFailed``: both callers
+    (``pgs-retexture``, ``pgs-calibrate``) catch it in ``main()``, so nothing is
+    gained by handling it here and the child's exit status stays intact.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f'{src.stem}.jpg'

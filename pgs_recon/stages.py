@@ -70,8 +70,8 @@ class StageError(Exception):
     """A planning failure with a user-facing message.
 
     Raised instead of ``sys.exit`` so the planner can be exercised by tests;
-    ``main()`` catches it and exits. ``utility.run_command`` keeps exiting
-    directly -- that is a separate, long-standing convention.
+    ``main()`` catches it and exits. ``utility.ToolFailed`` is the same move for
+    execution failures, and carries the child's exit status with it.
     """
 
 
