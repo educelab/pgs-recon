@@ -102,11 +102,25 @@ _Avoid_: pipeline, stage list, workflow
 **Role**:
 A semantic artifact slot a stage consumes or produces — `sfm`, `features`,
 `matches`, `matches_filtered`, `view_pairs`, `colorized`, `scene`, `cloud`,
-`mesh`. Roles are how a resumed job finds its inputs: the real `paths` keys
-encode which stages ran (`mvs_scene_dense_mesh_refine`), a role does not.
-Declared per stage in `stages.STAGE_IO`. Distinct from the artifact's
-**filename**, which the wrappers derive from their input's stem.
+`mesh`. Roles are how a resumed job finds its inputs, and they are *rebound* as a
+run proceeds, so a role names the slot and never the file in it. Declared per
+stage in `stages.STAGE_IO`. Distinct from the **artifact name**, which also
+records which stage produced it.
 _Avoid_: artifact type, slot, key
+
+**Artifact name**:
+An intermediate's filename, `<stage>_<role>.<ext>` — the stage that produced it
+and the role it fills, so it does not encode which *other* stages ran
+(`refine_mesh.ply` whether or not densify is in the shape). The convention
+replaces name *chaining*, so it applies exactly where chaining occurred: a name
+already independent of the shape keeps it, including every name a binary chooses
+for itself (`mvg/sfm_data.json`, `recon_dir/sfm_data.bin`) and the final
+deliverable `mvs/<name>.<ext>`, which is a user-facing contract. An artifact name
+is only ever *written* — a resumed job finds an existing artifact through the
+**manifest**, never by rebuilding its name. Not yet in effect: until
+[ADR 0006](./docs/adr/0006-stage-named-artifacts.md) lands, names chain off the
+input's stem and so *do* encode the shape (`scene_dense_refine.ply`).
+_Avoid_: path, key, stem, filename
 
 **Binding**:
 Which stage currently owns a role, and where that artifact is. Roles are
