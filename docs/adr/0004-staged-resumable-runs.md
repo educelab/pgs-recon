@@ -202,8 +202,9 @@ import…reconstruct and starts at refine. No range flags needed.
   pipelines through the real `begin()`/`end()` and plans against the manifest
   they leave, which is what keeps `test_stages`' hand-written model of those
   records honest. This is possible because the pure functions raise `StageError`
-  instead of calling `sys.exit`; `main()` catches it. `utility.run_command`
-  keeps exiting directly — that is a separate, long-standing convention.
+  instead of calling `sys.exit`; `main()` catches it. `utility.run_command` now
+  makes the same move with `ToolFailed`, which also preserves the child's exit
+  status — so an OOM-killed stage exits 137 instead of a uniform 1.
 - **Per-stage resource records** come from `resource.getrusage(RUSAGE_CHILDREN)`,
   which makes node sizing empirical. `ru_maxrss` is a monotonic high-water mark
   over *all* reaped children — exact when a job runs one stage (the common case
