@@ -22,8 +22,10 @@ an optional stage *after* a normal ``pgs-recon`` run: point ``--recon-dir`` at
 that run's output directory and both inputs are taken from it via its
 ``metadata.json`` — the solved SfM fed to openMVG2openMVS (after any
 robust/autoscale step, NOT the rig-prior import) and the textured mesh as
-output by TextureMesh (before any centering transform). ``--sfm-data`` can
-override the SfM if needed.
+output by TextureMesh (before any centering transform). Either can be supplied
+directly instead (``--sfm-data``, ``--mesh``), and in ``--calibration`` mode the
+calibration .json *is* the scene, so the reconstruction's SfM is never read;
+each artifact is only demanded of ``--recon-dir`` when the run actually reads it.
 
 REQUIRES THE PGS-SCAN FILENAME CONVENTION on both image sets. The correspondence
 between a modality image and a camera pose in the SfM solution is established
@@ -62,6 +64,18 @@ from pgs_recon.openmvg import mvg_to_mvs
 from pgs_recon.openmvs import mvs_texture
 from pgs_recon.utility import current_timestamp, run_command
 from pgs_recon.utils.apps import setup_logging
+from pgs_recon.utils.images import prepare_8bit_image
+from pgs_recon.utils.recon_dir import (
+    load_manifest,
+    resolve_solved_sfm,
+    resolve_textured_mesh,
+)
+from pgs_recon.utils.sfm_json import (
+    bare_polymorphic_id,
+    camera_from_calibration,
+    fix_polymorphic_registration,
+    transform_sfm_extrinsics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,31 +171,6 @@ def convert_modality_images(pos_map: Dict[int, Path], out_dir: Path,
     return out_names
 
 
-def prepare_8bit_image(src: Path, out_dir: Path) -> Path:
-    """Write an 8-bit sRGB copy of a single image via ImageMagick ``convert``.
-
-    Unlike ``convert_modality_images`` (which keeps a *set* of frames mutually
-    consistent with a uniform bit-shift for atlas texturing), this handles ONE
-    standalone overhead image that becomes its own texture. ImageMagick reads
-    the embedded colorspace and bit depth, so it correctly handles 16-bit and
-    non-RGB inputs such as the EduceLab CIELab TIFFs (which OpenCV would
-    misread channel-for-channel). Per-image tone mapping is fine here because
-    each modality image is textured independently. Returns the output path.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f'{src.stem}.jpg'
-    command = [
-        'convert', str(src.resolve()),
-        '-colorspace', 'sRGB', '-depth', '8', '-type', 'TrueColor',
-        '-quality', '100', str(out.resolve()),
-    ]
-    run_command(command)
-    if not out.is_file():
-        sys.exit(f'Failed to prepare 8-bit image from {src}')
-    logger.info(f'Prepared 8-bit image: {out}')
-    return out
-
-
 def repoint_calibration(calibration_json: Path, image: Path,
                         out_json: Path) -> None:
     """Re-point a single-view ``pgs-calibrate`` calibration at ``image``.
@@ -262,7 +251,7 @@ def repoint_calibration(calibration_json: Path, image: Path,
     # Reference the already-registered polymorphic type by bare id (drop the
     # registration bit + name; intrinsics[0] is the registering instance).
     dummy_intr['value']['polymorphic_id'] = \
-        intrinsics[0]['value'].get('polymorphic_id', 0) & ~_POLY_FLAG
+        bare_polymorphic_id(intrinsics[0]['value'])
     dummy_intr['value'].pop('polymorphic_name', None)
     data['intrinsics'].append(dummy_intr)
 
@@ -296,24 +285,6 @@ def load_obj_mesh(mesh_path: Path):
     return np.asarray(verts, dtype=np.float64), np.asarray(faces, dtype=np.int64)
 
 
-def _camera_from_calibration(calibration_json: Path):
-    """Extract (R, C, f, cx, cy, W, H, disto) from a one-view calibration."""
-    cal = json.loads(calibration_json.read_text())
-    did = cal['intrinsics'][0]['value']['ptr_wrapper']['data']
-    f = did['focal_length']
-    cx, cy = did['principal_point']
-    W, H = did['width'], did['height']
-    disto = None
-    if 'disto_k3' in did:               # [k1, k2, k3]
-        disto = list(did['disto_k3'])
-    elif 'disto_k1' in did:             # [k1]
-        disto = list(did['disto_k1']) + [0.0, 0.0]
-    e = cal['extrinsics'][0]['value']
-    R = np.asarray(e['rotation'], dtype=np.float64)   # X_cam = R (X - C)
-    C = np.asarray(e['center'], dtype=np.float64)
-    return R, C, f, cx, cy, W, H, disto
-
-
 def project_texture_mesh(calibration_json: Path, texture_image: Path,
                          mesh_path: Path, out_obj: Path,
                          backface_cull: bool = True,
@@ -336,7 +307,7 @@ def project_texture_mesh(calibration_json: Path, texture_image: Path,
     surface meshes this targets the effect is negligible; use ``--use-openmvs``
     when true occlusion handling is required.
     """
-    R, C, f, cx, cy, W, H, disto = _camera_from_calibration(calibration_json)
+    R, C, f, cx, cy, W, H, disto = camera_from_calibration(calibration_json)
     V, F = load_obj_mesh(mesh_path)
     if len(V) == 0 or len(F) == 0:
         sys.exit(f'Mesh {mesh_path} has no geometry to texture')
@@ -423,71 +394,6 @@ def sfm_to_json(sfm_path: Path, out_json: Path, bin_dir: Path,
     return out_json
 
 
-_POLY_FLAG = 0x80000000
-
-
-def _fix_polymorphic_registration(all_items, kept_items):
-    """Repair cereal polymorphic-pointer registration after filtering.
-
-    In openMVG's cereal JSON the first instance of each polymorphic type sets
-    the high bit on ``polymorphic_id`` and carries a ``polymorphic_name``;
-    later instances reference the type by its bare numeric id. If filtering
-    drops the registering instance, surviving instances reference an
-    unregistered type id and the scene fails to load. This promotes the first
-    kept instance of each type back to the registration form.
-    """
-    # Map type-number -> registered name from the full (original) list.
-    registry = {}
-    for it in all_items:
-        pid = it['value'].get('polymorphic_id', 0)
-        if pid & _POLY_FLAG:
-            registry[pid & ~_POLY_FLAG] = it['value'].get('polymorphic_name')
-
-    seen = set()
-    for it in kept_items:
-        val = it['value']
-        pid = val.get('polymorphic_id', 0)
-        typenum = (pid & ~_POLY_FLAG) if (pid & _POLY_FLAG) else pid
-        if typenum not in seen:
-            val['polymorphic_id'] = _POLY_FLAG | typenum
-            if registry.get(typenum) is not None:
-                val['polymorphic_name'] = registry[typenum]
-            seen.add(typenum)
-        else:
-            val.pop('polymorphic_name', None)
-            val['polymorphic_id'] = typenum
-    return kept_items
-
-
-def transform_extrinsic(R, C, sfm_transform):
-    """Transform an OpenMVG extrinsic (R, C) from the original SfM frame to
-    the frame defined by sfm_transform (4x4 similarity matrix from pgs-center
-    --save-transform). The scale is stripped from the upper-left 3x3 block so
-    R_new remains a proper rotation matrix. C_new uses the full (scaled) block
-    since centers are points, not directions."""
-    s = np.linalg.norm(sfm_transform[:3, 0])
-    R_T = sfm_transform[:3, :3] / s
-    R_new = R @ R_T.T
-    C_new = sfm_transform[:3, :3] @ C + sfm_transform[:3, 3]
-    return R_new, C_new
-
-
-def transform_sfm_extrinsics(sfm_json: Path, sfm_transform) -> None:
-    """Rewrite all extrinsics in an SfM JSON file to the frame defined by
-    sfm_transform. Edits the file in-place."""
-    data = json.loads(sfm_json.read_text())
-    for e in data.get('extrinsics', []):
-        val = e['value']
-        R = np.asarray(val['rotation'], dtype=np.float64)
-        C = np.asarray(val['center'], dtype=np.float64)
-        R_new, C_new = transform_extrinsic(R, C, sfm_transform)
-        val['rotation'] = R_new.tolist()
-        val['center'] = C_new.tolist()
-    sfm_json.write_text(json.dumps(data, indent=2))
-    logger.info(f'Transformed {len(data.get("extrinsics", []))} '
-                f'extrinsics to centered frame')
-
-
 def filter_sfm_for_camera(sfm_json: Path, camera_index: int,
                           modality_dir: Path,
                           pos_to_name: Dict[int, str],
@@ -526,7 +432,7 @@ def filter_sfm_for_camera(sfm_json: Path, camera_index: int,
     data['views'] = kept
     intrinsics = [i for i in data.get('intrinsics', [])
                   if i['key'] in kept_intrinsics]
-    data['intrinsics'] = _fix_polymorphic_registration(
+    data['intrinsics'] = fix_polymorphic_registration(
         data.get('intrinsics', []), intrinsics)
     data['extrinsics'] = [e for e in data.get('extrinsics', [])
                           if e['key'] in kept_poses]
@@ -618,107 +524,6 @@ def ensure_ply_mesh(mesh_path: Path, work_dir: Path,
     return out
 
 
-def _stage_status(stages: dict, name: str) -> str:
-    """A stage's recorded status, or ``'never run'`` if it has no record."""
-    return (stages.get(name) or {}).get('status') or 'never run'
-
-
-def _resolve_from_stage_records(meta: dict, meta_path: Path, recon_dir: Path):
-    """Read the SfM and textured mesh straight out of the stage records.
-
-    ``pgs-recon`` records each stage's inputs and outputs as paths relative to
-    the output directory (see ``pgs_recon/stages.py``), so both artifacts are an
-    exact lookup. Returns ``None`` if this manifest predates stage records.
-
-    Only a ``complete`` stage carries inputs/outputs -- ``pgs-recon`` replaces
-    the whole record when a stage starts -- so the absence of one means either
-    "never ran" or "crashed", and the recorded status is what tells them apart.
-    """
-    stages = meta.get('stages') or {}
-    if not stages:
-        return None
-    sfm_rel = ((stages.get('convert') or {}).get('inputs') or {}).get('sfm')
-    mesh_rel = ((stages.get('texture') or {}).get('outputs') or {}).get('mesh')
-    if not sfm_rel:
-        status = _stage_status(stages, 'convert')
-        if status == 'never run':
-            sys.exit(f'{meta_path} records no convert stage; the run stopped '
-                     f'before MVS (--to colorize?) and cannot be re-textured.')
-        sys.exit(f'{meta_path} records convert as {status!r}, not complete, so '
-                 f'the MVS scene it produces is not available. Finish the '
-                 f'reconstruction first: pgs-recon -o {recon_dir}')
-    if not mesh_rel:
-        status = _stage_status(stages, 'texture')
-        if status == 'never run':
-            sys.exit(f'{meta_path} records no texture stage; there is no '
-                     f'textured mesh to re-texture.')
-        sys.exit(f'{meta_path} records texture as {status!r}, not complete, so '
-                 f'its textured mesh is missing or half-written. Finish the '
-                 f'reconstruction first: pgs-recon -o {recon_dir}')
-    return recon_dir / sfm_rel, recon_dir / mesh_rel
-
-
-def _resolve_from_commands(meta: dict, meta_path: Path, recon_dir: Path):
-    """Fallback for output dirs written before stage records existed.
-
-    Recovers the SfM basename by grepping the recorded command strings for
-    ``openMVG2openMVS``, then re-roots it at ``mvg/recon_dir``; the textured mesh
-    is ``mvs/<name>.<file_type>`` from the run's parsed args.
-    """
-    sfm_name = None
-    for cmd in meta.get('commands', {}).values():
-        if 'openMVG2openMVS' in cmd:
-            toks = cmd.split()
-            if '-i' in toks:
-                sfm_name = Path(toks[toks.index('-i') + 1]).name
-    if sfm_name is None:
-        sys.exit(f'{meta_path} records no openMVG2openMVS step; the run had no '
-                 f'MVS stage (--no-mvs / --to colorize?) and cannot be '
-                 f're-textured.')
-    sfm_path = recon_dir / 'mvg' / 'recon_dir' / sfm_name
-
-    parsed = meta.get('parsed', {})
-    name, file_type = parsed.get('name'), parsed.get('file_type')
-    if not name or not file_type:
-        sys.exit(f'{meta_path} is missing name/file_type; '
-                 f'cannot locate the textured mesh.')
-    return sfm_path, recon_dir / 'mvs' / f'{name}.{file_type}'
-
-
-def resolve_recon_inputs(recon_dir: Path):
-    """Locate the solved SfM and textured mesh inside a pgs-recon output dir.
-
-    Reads ``<recon_dir>/metadata.json`` but rebuilds every path *relative to*
-    ``recon_dir``: the absolute paths recorded there may belong to another
-    runtime (e.g. a Docker mount), so they are not trusted directly.
-
-    The SfM that produced the mesh is the one fed to openMVG2openMVS (after any
-    robust-triangulation / autoscale step, before colorize) -- it is not any one
-    stage's output, which is why the convert stage records its input. Returns
-    ``(sfm_path, mesh_path)``.
-    """
-    meta_path = recon_dir / 'metadata.json'
-    if not meta_path.is_file():
-        sys.exit(f'No metadata.json in {recon_dir}; '
-                 f'is this a pgs-recon output directory?')
-    meta = json.loads(meta_path.read_text())
-
-    resolved = _resolve_from_stage_records(meta, meta_path, recon_dir)
-    if resolved is not None:
-        sfm_path, mesh_path = resolved
-        source = 'stage records'
-    else:
-        sfm_path, mesh_path = _resolve_from_commands(meta, meta_path, recon_dir)
-        source = 'legacy command log'
-
-    for p in (sfm_path, mesh_path):
-        if not p.is_file():
-            sys.exit(f'Expected reconstruction artifact not found: {p}')
-    logger.info(f'Resolved from {recon_dir} via {source}: sfm={sfm_path.name}, '
-                f'mesh={mesh_path.name}')
-    return sfm_path, mesh_path
-
-
 def main():
     parser = configargparse.ArgumentParser(
         prog='pgs-retexture',
@@ -758,17 +563,20 @@ def main():
                              'standard viewers. Default: copy the original '
                              'file as-is (full fidelity for standard sRGB).')
     parser.add_argument('--recon-dir', '-r', required=True,
-                        help='A completed pgs-recon output directory. The solved '
-                             'SfM and the textured mesh are located from its '
-                             'metadata.json (override with --sfm-data). The recon '
-                             'must have used PGS-named images (its SfM view '
-                             'filenames must match the convention above). With '
-                             '--calibration only the mesh is taken from here.')
+                        help='A pgs-recon output directory. The solved SfM and '
+                             'the textured mesh are located from its '
+                             'metadata.json; each is only required if this run '
+                             'actually reads it, so overriding both (--sfm-data '
+                             'or --calibration, plus --mesh) needs nothing from '
+                             'the reconstruction but its manifest. The recon must '
+                             'have used PGS-named images (its SfM view filenames '
+                             'must match the convention above) unless '
+                             '--calibration is given.')
     parser.add_argument('--sfm-data', '-s', default=None,
                         help='Override the solved OpenMVG SfM_Data (.bin/.json) '
                              'to texture from. Defaults to the SfM that produced '
                              'the mesh in --recon-dir. NOT the rig-prior import '
-                             'scene.')
+                             'scene. Ignored in --calibration mode.')
     parser.add_argument('--sfm-transform', default=None,
                         help='4x4 .npy transform matrix saved by pgs-center '
                              '--save-transform. In non-calibration mode, '
@@ -781,7 +589,8 @@ def main():
     parser.add_argument('--mesh', default=None,
                         help='Override the mesh to texture. Use to supply a '
                              'centered or ground-plane-removed mesh in place of '
-                             'the original reconstruction output.')
+                             'the original reconstruction output; the recon\'s own '
+                             'mesh is then not required to exist.')
     parser.add_argument('--working-dir', '-w', default=None,
                         help='Directory for retexture artifacts (default: '
                              '--recon-dir). Outputs are written into its mvg/ '
@@ -839,10 +648,34 @@ def main():
     recon_dir = Path(args.recon_dir)
     calibration = Path(args.calibration) if args.calibration else None
 
-    # The mesh always comes from the reconstruction. The SfM does too in the
-    # legacy mode; in calibration mode the calibration .json is the scene.
-    sfm_default, mesh_in = resolve_recon_inputs(recon_dir)
-    sfm_data = Path(args.sfm_data) if args.sfm_data else sfm_default
+    # -r must be a pgs-recon output whatever this run takes from it: the manifest
+    # is the run-tracking record, and the mvg/ mvs/ layout below assumes it.
+    load_manifest(recon_dir)
+
+    # Beyond that, only what this run actually reads is demanded. The SfM is the
+    # scene rebuilt for the rig camera, so it is unused in --calibration mode
+    # (the calibration .json is the scene) and replaceable by --sfm-data; the
+    # mesh is what gets textured, so it is unused when --mesh names another one.
+    # Whatever remains is required, and .require() exits with the manifest's own
+    # diagnosis of why it could not be resolved.
+    if calibration is not None:
+        sfm_data = None
+        if args.sfm_data:
+            logger.warning('--sfm-data is ignored in --calibration mode; the '
+                           'calibration .json is the scene')
+    elif args.sfm_data:
+        sfm_data = Path(args.sfm_data)
+        if not sfm_data.is_file():
+            sys.exit(f'--sfm-data: file not found: {sfm_data}')
+    else:
+        sfm_data = resolve_solved_sfm(recon_dir).require()
+
+    if args.mesh is not None:
+        mesh_in = Path(args.mesh)
+        if not mesh_in.is_file():
+            sys.exit(f'--mesh: file not found: {mesh_in}')
+    else:
+        mesh_in = resolve_textured_mesh(recon_dir).require()
 
     sfm_transform = None
     if args.sfm_transform is not None:
@@ -855,11 +688,6 @@ def main():
                            'run pgs-calibrate --sfm-transform to embed the '
                            'transform in the calibration instead')
             sfm_transform = None
-
-    if args.mesh is not None:
-        mesh_in = Path(args.mesh)
-        if not mesh_in.is_file():
-            sys.exit(f'--mesh: file not found: {mesh_in}')
 
     # The transformed poses are expressed in the centered mesh frame, so the
     # mesh being textured must be the centered one too. (calibration mode

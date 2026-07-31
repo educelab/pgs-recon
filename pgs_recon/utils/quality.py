@@ -25,15 +25,36 @@ def measure_exposure(img):
 
 
 def detect_outliers(x, clf=None, **kwargs):
+    """Label each row of ``x`` inlier (1) or outlier (-1) by Local Outlier Factor.
+
+    ``x`` is ``(n_samples, n_features)``; a 1-D series of measurements is
+    therefore ``series.reshape(-1, 1)`` -- one sample per measurement -- so that
+    the labels come back per measurement.
+
+    Always (re)fits on the data being labelled. LOF's labels and its
+    ``negative_outlier_factor_`` scores both describe the set the estimator was
+    fitted on, so scoring one series with a model fitted on another says nothing
+    about it; and ``predict`` does not even exist unless the estimator was
+    constructed with ``novelty=True``, which is why this uses ``fit_predict``.
+    ``clf`` lets a caller reuse the estimator object across series (it is refitted
+    each time); ``kwargs`` configure a new one and are ignored when ``clf`` is
+    given.
+
+    Returns ``(labels, clf)``, where ``clf.negative_outlier_factor_`` holds the
+    per-sample scores aligned with ``labels`` -- but only once something has been
+    fitted, so read it only where a label came back ``-1``. A series too short for
+    LOF (under 3 samples, or no more samples than neighbors) is reported
+    all-inlier rather than raising: a quality plot should say "nothing anomalous
+    found" instead of aborting the run.
+    """
+    n = len(x)
     if clf is None:
-        if not kwargs:
-            kwargs = {'n_neighbors': 8}
+        kwargs.setdefault('n_neighbors', 8)
+        kwargs['n_neighbors'] = min(kwargs['n_neighbors'], max(n - 1, 1))
         clf = neighbors.LocalOutlierFactor(**kwargs)
-        clf = clf.fit(x)
-
-    y = clf.predict(x)
-
-    return y, clf
+    if n < 3 or clf.n_neighbors >= n:
+        return np.ones(n, dtype=int), clf
+    return clf.fit_predict(x), clf
 
 
 def main():

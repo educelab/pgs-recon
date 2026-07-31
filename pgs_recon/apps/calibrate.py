@@ -58,12 +58,11 @@ import numpy as np
 from pgs_recon.openmvg import mvg_localize, CameraModel, ResectionMethod
 from pgs_recon.utility import current_timestamp, run_command
 from pgs_recon.utils.apps import setup_logging
-# Reuse the SfM-JSON surgery and image prep already proven in pgs-retexture.
-from pgs_recon.apps.retexture import (
-    _camera_from_calibration,
-    _fix_polymorphic_registration,
-    prepare_8bit_image,
-    resolve_recon_inputs,
+from pgs_recon.utils.images import prepare_8bit_image
+from pgs_recon.utils.recon_dir import resolve_solved_sfm
+from pgs_recon.utils.sfm_json import (
+    camera_from_calibration,
+    fix_polymorphic_registration,
     transform_extrinsic,
 )
 
@@ -82,7 +81,7 @@ def save_camera_file(calibration_json: Path, output_path: Path) -> None:
     row-major. So a file written here can be fed straight back into
     ``--intrinsic`` (which uses the intrinsic and ignores the pose).
     """
-    R, C, f, cx, cy, W, H, disto = _camera_from_calibration(calibration_json)
+    R, C, f, cx, cy, W, H, disto = camera_from_calibration(calibration_json)
     t = -R @ C
     pose = np.eye(4, dtype=np.float64)
     pose[:3, :3] = R
@@ -392,7 +391,7 @@ def extract_calibration(expanded_json: Path, query_name: str,
     out = dict(data)
     out['root_path'] = str(query_dir.resolve())
     out['views'] = [kept_view]
-    out['intrinsics'] = _fix_polymorphic_registration(
+    out['intrinsics'] = fix_polymorphic_registration(
         data.get('intrinsics', []), intrinsics)
     out['extrinsics'] = extrinsics
     out['structure'] = []
@@ -431,15 +430,21 @@ def main():
                              'once from the feature-richest modality; the '
                              'resulting calibration is reused for the others.')
     parser.add_argument('--recon-dir', '-r', required=True,
-                        help='A completed pgs-recon output directory. The solved '
-                             'SfM (with structure) and database regions are '
-                             'located from its metadata.json '
-                             '(override the SfM with --sfm-data).')
+                        help='A pgs-recon output directory. The solved SfM (with '
+                             'structure) and database regions are located from '
+                             'its metadata.json (override the SfM with '
+                             '--sfm-data). The run must have reached the MVS '
+                             'convert stage for the SfM to be found here; with '
+                             '--sfm-data an SfM-only run (--no-mvs / --to '
+                             'colorize) works too, since only the matches_dir '
+                             'regions are then taken from this directory.')
     parser.add_argument('--sfm-data', '-s', default=None,
                         help='Override the solved OpenMVG SfM_Data (.bin/.json) '
-                             'to localize against. Must carry structure and be '
-                             'the frame the mesh lives in. Defaults to the SfM '
-                             'that produced the mesh in --recon-dir.')
+                             'to localize against. Must carry structure, and the '
+                             'calibration comes out in ITS frame -- so for '
+                             'texturing a mesh, pass the SfM that mesh was built '
+                             'from. Defaults to the SfM that produced the mesh in '
+                             '--recon-dir.')
     parser.add_argument('--output', '-o', default=None,
                         help='Output directory (default: '
                              '<recon-dir>/calibrate/<name>)')
@@ -553,10 +558,27 @@ def main():
     if args.name is None:
         args.name = image.stem
 
-    # The mesh is not needed for calibration, but reusing resolve_recon_inputs
-    # keeps "which SfM produced the mesh" logic in one place; we use only the SfM.
-    sfm_default, _mesh = resolve_recon_inputs(recon_dir)
-    sfm_data = Path(args.sfm_data) if args.sfm_data else sfm_default
+    # Calibration consumes neither MVS artifact the way pgs-retexture does: its
+    # output is a pose + intrinsic in the solved frame, so the mesh is never
+    # asked for at all, and the reconstruction's own SfM is only needed when
+    # --sfm-data has not named one. That is what lets a run which stopped before
+    # convert (--no-mvs / --to colorize) still be calibrated against: what
+    # localization actually needs from -r is the database regions checked below,
+    # and features/matches exist in an SfM-only run. metadata.json is still
+    # required (load_manifest), being the record that makes -r a reconstruction
+    # rather than a bare directory.
+    resolved_sfm = resolve_solved_sfm(recon_dir)
+    if args.sfm_data:
+        sfm_data = Path(args.sfm_data)
+        if resolved_sfm.path is None:
+            logger.info(f'{recon_dir} has no solved SfM of its own; localizing '
+                        f'against --sfm-data {sfm_data}')
+            logger.debug(f'Unresolved: {resolved_sfm.reason}')
+    else:
+        # Exits with the manifest's own diagnosis, which names --sfm-data.
+        sfm_data = resolved_sfm.require()
+    if not sfm_data.is_file():
+        sys.exit(f'SfM_Data not found: {sfm_data}')
 
     # The query intrinsic can be supplied three mutually exclusive ways: a full
     # --intrinsic file, a focal in pixels (--focal-length), or a focal in mm

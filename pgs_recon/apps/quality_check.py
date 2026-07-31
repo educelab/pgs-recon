@@ -86,7 +86,8 @@ def main():
 
     axs[1, 1].axis('off')
 
-    clf = neighbors.LocalOutlierFactor(n_neighbors=6)
+    # Built on first use by detect_outliers, then reused (refitted per series).
+    clf = None
     outlier_kwargs = {'marker': 'X', 'mfc': 'red', 'mec': 'none'}
     for cam in range(num_cam):
         for cap in range(num_cap):
@@ -96,12 +97,14 @@ def main():
             # exposure
             val = metrics[cam, :, cap, 0]
             if not np.isnan(val).all():
-                x = np.nan_to_num(val)
-                x = x.reshape(1, -1)
-                y, clf = quality.detect_outliers(x, clf=clf)
-                markers_on = np.where(y == -1)[0]
-                scores = clf.negative_outlier_factor_[markers_on]
+                # One sample per capture position (LOF takes (n_samples,
+                # n_features)), so an outlier label marks a position whose
+                # exposure is anomalous within this camera/capture series.
+                x = np.nan_to_num(val).reshape(-1, 1)
+                y, clf = quality.detect_outliers(x, clf=clf, n_neighbors=6)
+                markers_on = np.where(y == -1)[0].tolist()
                 if len(markers_on) > 0:
+                    scores = clf.negative_outlier_factor_[markers_on]
                     outliers = ', '.join(
                         f'[{i}]({s:.3g})' for i, s in zip(markers_on, scores))
                     print(f'[WARNING] [{cam}.{cap}] Detected {len(markers_on)} '
