@@ -55,8 +55,10 @@ import configargparse
 import cv2
 import numpy as np
 
+from pgs_recon import layout, toolchain
 from pgs_recon.openmvg import mvg_localize, CameraModel, ResectionMethod
-from pgs_recon.utility import ToolFailed, current_timestamp, run_command
+from pgs_recon.toolchain import Recorder, resolve_exe, run
+from pgs_recon.utility import ToolFailed
 from pgs_recon.utils.apps import setup_logging
 from pgs_recon.utils.images import prepare_8bit_image
 from pgs_recon.utils.recon_dir import resolve_solved_sfm
@@ -259,9 +261,9 @@ def _apply_distortion(idata: Dict, disto, sfm_path: Path) -> None:
 
 
 def build_single_intrinsic_scene(sfm_path: Path, query_w: int, query_h: int,
-                                 focal: float, bin_dir: Path, out_json: Path,
+                                 focal: float, out_json: Path,
                                  cx: float = None, cy: float = None,
-                                 disto=None, metadata: Dict = None) -> Path:
+                                 disto=None) -> Path:
     """Rewrite the solved scene to carry a single known query-camera intrinsic.
 
     OpenMVG's localizer honors a P3P resection method (and a fixed, known focal)
@@ -291,13 +293,11 @@ def build_single_intrinsic_scene(sfm_path: Path, query_w: int, query_h: int,
     """
     full = out_json.with_name(f'{out_json.stem}_full.json')
     command = [
-        str(bin_dir / 'openMVG_main_ConvertSfM_DataFormat'),
-        '-i', str(sfm_path.resolve()), '-o', str(full.resolve()),
+        resolve_exe('openMVG_main_ConvertSfM_DataFormat'),
+        '-i', sfm_path.resolve(), '-o', full.resolve(),
         '-V', '-I', '-E', '-S', '-C',
     ]
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = ' '.join(command)
-    run_command(command)
+    run(command)
 
     data = json.loads(full.read_text())
     intr_list = data.get('intrinsics', [])
@@ -549,7 +549,9 @@ def _main():
                         help='Morphological open iterations for --generate-mask.')
     parser.add_argument('--threads', type=int, default=None,
                         help='Threads for localization')
-    parser.add_argument('--path', type=str, default='/usr/local/',
+    # Unset, the install prefix falls through to $PGS_RECON_PREFIX and then to
+    # toolchain.DEFAULT_PREFIX, which a default here would shadow.
+    parser.add_argument('--path', type=str, default=None,
                         help=configargparse.SUPPRESS)
     parser.add_argument('--log-level', default='INFO', type=str.upper,
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -630,10 +632,8 @@ def _main():
               else recon_dir / 'calibrate' / args.name)
     output.mkdir(parents=True, exist_ok=True)
 
-    paths: Dict[str, Path] = {'PATH': Path(args.path).resolve()}
-    paths['BIN'] = paths['PATH'] / 'bin'
-    paths['matches_dir'] = recon_dir / 'mvg' / 'matches_dir'
-    paths['sfm_db'] = sfm_data
+    paths: Dict[str, Path] = {}
+    paths['matches_dir'] = layout.matches_dir(recon_dir)
     paths['query_dir'] = output / 'query'
     paths['match_out'] = output / 'query_matches'
     paths['loc'] = output / 'localization'
@@ -650,10 +650,19 @@ def _main():
     args.config = str(config_path)
     with config_path.open('w') as f:
         for arg in vars(args):
+            # Unset arguments are omitted: a literal `path = None` read back
+            # through -c would be parsed as the string 'None'.
+            if getattr(args, arg) is None:
+                continue
             f.write(f"{arg.replace('_', '-')} = {getattr(args, arg)}\n")
 
     metadata = {'args': ' '.join(sys.argv), 'parsed': vars(args), 'commands': {}}
     paths['metadata'] = output / f'{args.name}_calibrate_metadata.json'
+
+    # Where the binaries are and what records their invocations: process-wide, so
+    # no wrapper takes either as an argument (ADR 0005).
+    recorder = Recorder(metadata['commands'])
+    toolchain.configure(prefix=args.path, recorder=recorder)
 
     @atexit.register
     def write_metadata():
@@ -674,6 +683,7 @@ def _main():
     # build_single_intrinsic_scene). The query JPG keeps the source resolution,
     # which the intrinsic must match for OpenMVG's -s dimension check.
     single_intrinsics = args.single_intrinsics
+    localize_against = sfm_data
     if provide_intrinsic:
         qimg = cv2.imread(str(query_img), cv2.IMREAD_UNCHANGED)
         if qimg is None:
@@ -684,29 +694,32 @@ def _main():
                     'localization')
         paths['loc_scene'] = output / f'{args.name}_loc_scene.json'
         build_single_intrinsic_scene(sfm_data, qw, qh, spec['focal'],
-                                     paths['BIN'], paths['loc_scene'],
+                                     paths['loc_scene'],
                                      cx=spec['cx'], cy=spec['cy'],
-                                     disto=spec['disto'], metadata=metadata)
-        paths['sfm_db'] = paths['loc_scene']
+                                     disto=spec['disto'])
+        localize_against = paths['loc_scene']
         single_intrinsics = True
+    paths['sfm_db'] = localize_against
 
     # 2. Localize against the solved scene (original scene left untouched).
     # --camera-model only steers the uncalibrated DLT estimate; with a known
     # intrinsic OpenMVG reuses the scene K under -s and ignores -c, so drop it.
-    logger.info(f'Localizing {query_img.name} against {paths["sfm_db"].name} '
+    logger.info(f'Localizing {query_img.name} against {localize_against.name} '
                 f'(resection={ResectionMethod(resection_method).name.lower()})')
-    mvg_localize(paths, sfm_key='sfm_db', query_key='query_dir',
-                 out_key='loc', match_out_key='match_out',
-                 camera_model=None if single_intrinsics else args.camera_model,
-                 resection_method=resection_method,
-                 residual_error=args.residual_error,
-                 single_intrinsics=single_intrinsics,
-                 threads=args.threads, metadata=metadata)
+    expanded = mvg_localize(
+        localize_against, features_dir=paths['matches_dir'],
+        query_dir=paths['query_dir'], output_dir=paths['loc'],
+        match_out_dir=paths['match_out'],
+        camera_model=None if single_intrinsics else args.camera_model,
+        resection_method=resection_method,
+        residual_error=args.residual_error,
+        single_intrinsics=single_intrinsics, threads=args.threads)
+    paths['sfm_expanded'] = expanded
 
     # 3. Extract the single localized view as the reusable calibration.
     logger.info('Extracting calibration (pose + intrinsic)')
-    extract_calibration(paths['sfm_expanded'], query_img.name,
-                        paths['query_dir'], paths['calibration'])
+    extract_calibration(expanded, query_img.name, paths['query_dir'],
+                        paths['calibration'])
 
     # 4. (Optional) Re-express pose in the centered mesh coordinate frame.
     if args.sfm_transform:

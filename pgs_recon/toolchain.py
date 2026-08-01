@@ -1,8 +1,11 @@
 """Finding the toolchain's binaries, and running them.
 
-Two jobs, both of which every wrapper needs and none of which is about
-photogrammetry: turn a tool *name* into a path to an executable, and run an argv
-while recording it.
+Three jobs, all of which the wrappers need and none of which is about
+photogrammetry: turn a tool *name* into a path to an executable, run an argv
+while recording it, and serve the binaries that address their files *relative to
+a directory* rather than by path -- naming the working directory a set of
+artifacts shares (:func:`work_dir`) and spelling a lone file the way such a
+binary will resolve it (:func:`relative_to_dir`).
 
 **Configuration is process-wide, not threaded through call signatures.** An
 app calls :func:`configure` once in ``main()``; :func:`using` scopes an override.
@@ -98,6 +101,22 @@ class ToolNotFound(ToolFailed):
         self.tier = tier
         super().__init__([str(expected)], None,
                          detail=f'{problem}; prefix {prefix} came from {tier}')
+
+
+class ArtifactsNotColocated(ToolFailed):
+    """A basename-addressing binary was handed files it would not have found.
+
+    A ``ToolFailed`` for the same reason :class:`ToolNotFound` is: every
+    ``main()`` already handles those, so the mis-wiring lands in the run's log
+    beside the stage that caused it instead of arriving as a traceback. Exit
+    status 1 rather than a child's, because no child ran -- being caught at the
+    call site, before the binary is spawned, is the entire point of the check.
+    """
+
+    def __init__(self, artifacts: Sequence[PathLike], detail: str):
+        #: The artifacts as given, in argument order.
+        self.artifacts = [Path(a) for a in artifacts]
+        super().__init__([str(a) for a in self.artifacts], 1, detail=detail)
 
 
 def configure(*, prefix: PrefixSetting = _UNSET,
@@ -211,6 +230,57 @@ def cam_db(path: Optional[PathLike] = None,
     if path is not None:
         return _absolute(path)
     return _prefix_and_tier(prefix)[0] / CAM_DB
+
+
+def work_dir(*artifacts: Optional[PathLike]) -> Path:
+    """The one directory ``artifacts`` share, for a binary that names them by
+    basename.
+
+    Every OpenMVS stage addresses its scene and geometry as bare filenames
+    against a working directory (``-w``), and ``openMVG2openMVS`` writes relative
+    to its ``cwd``, so those files must be co-located. Deriving the directory from
+    the artifacts -- rather than taking it as a parameter -- means the two cannot
+    disagree; refusing when the artifacts themselves disagree turns a silent
+    wrong-directory read into an error at the call site. Handing ``RefineMesh`` a
+    mesh from somewhere else would otherwise look for that basename beside the
+    scene and fail deep inside the binary, on the input it did find.
+
+    ``None`` artifacts are ignored, so an optional input (the dense cloud) needs
+    no special case at the call site.
+    """
+    given = [a for a in artifacts if a is not None]
+    parents = {Path(a).parent.resolve() for a in given}
+    if len(parents) != 1:
+        raise ArtifactsNotColocated(
+            given, f'needs its artifacts in one directory, because it addresses '
+                   f'them by basename against a single working directory, but '
+                   f'was given {len(parents)}')
+    return parents.pop()
+
+
+def relative_to_dir(artifact: PathLike, directory: PathLike) -> str:
+    """``artifact`` spelled as a binary resolving names against ``directory``
+    needs it.
+
+    The one-file counterpart of :func:`work_dir`, for a binary that takes a
+    single file *relative to* a directory it was told about separately.
+    ``openMVG_main_SfM`` is the case: it joins ``-M`` onto ``-m`` unconditionally
+    (``create_filespec(directory_match, filename_match)`` in ``main_SfM.cpp``,
+    with no try-as-given fallback), so the value has to be expressed in those
+    terms.
+
+    That join accepts far more than a basename -- ``sub/matches.bin`` and
+    ``../other/matches.bin`` both resolve, so the matches file does **not** have
+    to live in the regions directory. What it cannot accept is an *absolute*
+    path: stlplus concatenates, yielding ``/regions//abs/path``. A relative
+    spelling is therefore the general answer rather than a restriction, and it
+    is why this returns a value instead of merely validating one -- there is no
+    legitimate input to reject.
+
+    Both sides are resolved first, so a caller mixing relative and absolute
+    paths, or naming the same directory two ways, still gets a usable answer.
+    """
+    return os.path.relpath(_absolute(artifact), _absolute(directory))
 
 
 class Recorder:

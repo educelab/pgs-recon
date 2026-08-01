@@ -1,22 +1,24 @@
 """Planner tests for staged, resumable runs.
 
-``pgs_recon.stages`` imports only the standard library and never touches the
-filesystem, so this suite needs no binaries, no fixtures and no third-party
-packages:
+``pgs_recon.stages`` imports only the standard library and ``layout`` (itself pure
+path arithmetic), and never touches the filesystem, so this suite needs no
+binaries, no fixtures and no third-party packages:
 
     python3 -m unittest discover -s tests
 
 Everything here builds an argument ``Namespace`` and a dict of fake stage
 records, then asserts on the resolved plan. ``build_records()`` is a small model
-of ``run_pipeline``'s bookkeeping -- it reproduces the artifact *names* the
-OpenMVG/OpenMVS wrappers derive, which is what the graph's rebinding rule
-compares.
+of ``run_pipeline``'s bookkeeping; it names artifacts through ``layout``, exactly
+as ``run_pipeline`` does, so the rebinding these tests exercise is compared
+against the real names. (``test_layout`` is what pins those names to literals --
+duplicating them here would only mean two places to edit.)
 """
 import logging
 import unittest
 from argparse import Namespace
 from pathlib import Path
 
+from pgs_recon import layout
 from pgs_recon.stages import (STAGE_ARGS, STAGE_IO, STAGES, StageError,
                               StageTracker, drifted_stages, pipeline_shape,
                               resolve_range, revert_out_of_range)
@@ -55,11 +57,16 @@ def make_args(**overrides) -> Namespace:
     return Namespace(**values)
 
 
+def rel(path) -> str:
+    """A path as the manifest records it: relative to the output dir."""
+    return None if path is None else str(Path(path).relative_to(ROOT))
+
+
 def build_records(args, shape=None, status='complete') -> dict:
     """A manifest for a run of ``shape`` that finished successfully.
 
-    The paths mirror what the wrappers actually write, because that is what the
-    planner compares: every output name is derived from its input's stem, so
+    The paths are the ones ``run_pipeline`` would produce, because that is what
+    the planner compares: a name derived from the artifact a stage consumed, so
     enabling densify renames the whole mesh chain.
     """
     shape = shape or pipeline_shape(args)
@@ -68,18 +75,18 @@ def build_records(args, shape=None, status='complete') -> dict:
     def rec(stage, inputs, outputs):
         records[stage] = {
             'status': status,
-            'inputs': {r: p for r, p in inputs.items() if p is not None},
-            'outputs': {r: p for r, p in outputs.items() if p is not None},
+            'inputs': {r: rel(p) for r, p in inputs.items() if p is not None},
+            'outputs': {r: rel(p) for r, p in outputs.items() if p is not None},
             'args': {d: getattr(args, d, None) for d in STAGE_ARGS[stage]},
         }
 
-    sfm = 'mvg/sfm_data.json'
-    features = 'mvg/matches_dir'
-    matches = 'mvg/matches_dir/matches.bin'
-    filtered = 'mvg/matches_dir/matches_filtered.bin'
-    pairs = 'mvg/view_pairs.txt' if args.import_pgs_scan else None
+    sfm = layout.imported_sfm(ROOT)
+    features = layout.matches_dir(ROOT)
+    matches = layout.matches(ROOT)
+    filtered = layout.matches_filtered(matches)
+    pairs = layout.view_pairs(ROOT) if args.import_pgs_scan else None
 
-    rec('import', {'images': 'input'}, {'sfm': sfm, 'view_pairs': pairs})
+    rec('import', {'images': ROOT / 'input'}, {'sfm': sfm, 'view_pairs': pairs})
     rec('features', {'sfm': sfm}, {'features': features})
     rec('matches', {'sfm': sfm, 'features': features, 'view_pairs': pairs},
         {'matches': matches})
@@ -91,41 +98,41 @@ def build_records(args, shape=None, status='complete') -> dict:
         # Triangulating known poses reads the unfiltered matches, and writes
         # beside its input rather than to the engine's fixed name.
         sfm_inputs['matches'] = matches
-        solved = f'mvg/recon_dir/{Path(sfm).stem}_structured.bin'
+        solved = layout.robust_sfm(ROOT, sfm)
     else:
         sfm_inputs['matches_filtered'] = filtered
-        solved = 'mvg/recon_dir/sfm_data.bin'
+        solved = layout.solved_sfm(ROOT)
     rec('sfm', sfm_inputs, {'sfm': solved})
     if 'robust' in shape:
-        nxt = f'mvg/recon_dir/{Path(solved).stem}_structured.bin'
+        nxt = layout.robust_sfm(ROOT, solved)
         rec('robust', {'sfm': solved, 'features': features, 'matches': matches},
             {'sfm': nxt})
         solved = nxt
     if 'autoscale' in shape:
-        nxt = f'mvg/recon_dir/{Path(solved).stem}_scaled.bin'
+        nxt = layout.autoscale_sfm(ROOT, solved)
         rec('autoscale', {'sfm': solved}, {'sfm': nxt})
         solved = nxt
     rec('colorize', {'sfm': solved},
-        {'colorized': f'mvg/recon_dir/{Path(solved).stem}_colorized.ply'})
+        {'colorized': layout.colorize_sfm(solved)})
 
-    scene = 'mvs/scene.mvs'
+    scene = layout.convert_scene(ROOT)
     rec('convert', {'sfm': solved}, {'scene': scene})
     cloud = None
     if 'densify' in shape:
-        cloud = 'mvs/scene_dense.ply'
-        dense = 'mvs/scene_dense.mvs'
+        cloud = layout.densify_cloud(scene)
+        dense = layout.densify_scene(scene)
         rec('densify', {'scene': scene}, {'scene': dense, 'cloud': cloud})
         scene = dense
-    mesh = f'mvs/{Path(scene).stem}_mesh.ply'
+    mesh = layout.reconstruct_mesh(scene)
     # reconstruct and refine hand the scene back untouched, so neither records
     # it as an output -- see STAGE_IO on pass-through roles.
     rec('reconstruct', {'scene': scene, 'cloud': cloud}, {'mesh': mesh})
     if 'refine' in shape:
-        refined = f'mvs/{Path(scene).stem}_refine.ply'
+        refined = layout.refine_mesh(scene)
         rec('refine', {'scene': scene, 'mesh': mesh}, {'mesh': refined})
         mesh = refined
     rec('texture', {'scene': scene, 'mesh': mesh},
-        {'mesh': f'mvs/{args.name}.{args.file_type}'})
+        {'mesh': layout.final_mesh(ROOT, args.name, args.file_type)})
     return {s: records[s] for s in shape}
 
 
@@ -162,11 +169,10 @@ def capturing_logger():
 
 def make_tracker(args, records=None, explicit=(), shape=None, logger=None):
     meta = {'stages': dict(records or {})}
-    paths = {'output': ROOT, 'mvs': ROOT / 'mvs'}
     shape = shape or pipeline_shape(args)
     from_stage, to_stage = resolve_range(args, shape)
     drift = drifted_stages(args, meta['stages'], set(explicit), shape)
-    return StageTracker(meta, ROOT / 'metadata.json', paths, args, shape,
+    return StageTracker(meta, layout.manifest(ROOT), ROOT, args, shape,
                         from_stage, to_stage, rerun=args.rerun, drift=drift,
                         logger=logger or quiet_logger())
 
@@ -378,10 +384,12 @@ class TestPlanning(unittest.TestCase):
         tracker = make_tracker(args, records)
         self.assertIn('sfm', runs(tracker))
 
-    def test_key_refuses_an_artifact_that_does_not_exist_yet(self):
+    def test_require_refuses_an_artifact_that_does_not_exist_yet(self):
+        # Defence in depth behind prereq_errors(): a stage is never handed None
+        # and left to pass it to a binary.
         tracker = make_tracker(make_args())
         with self.assertRaises(StageError):
-            tracker.key('sfm')
+            tracker.require('sfm')
 
     def test_rehydrated_inputs_come_from_the_records(self):
         args = make_args(from_stage='refine')
@@ -393,8 +401,7 @@ class TestPlanning(unittest.TestCase):
     def test_view_pairs_rehydrate_into_a_later_job(self):
         args = make_args(import_pgs_scan=True, from_stage='matches')
         tracker = make_tracker(args, build_records(args))
-        self.assertEqual(ROOT / 'mvg/view_pairs.txt',
-                         tracker.path('view_pairs'))
+        self.assertEqual(layout.view_pairs(ROOT), tracker.path('view_pairs'))
 
     def test_a_generic_import_binds_no_view_pairs(self):
         args = make_args(from_stage='matches')

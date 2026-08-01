@@ -1,6 +1,6 @@
-"""``toolchain``: which binary gets run, and what gets recorded.
+"""``toolchain``: which binary gets run, where it runs, and what gets recorded.
 
-Four invariants worth the test file. Resolution is **late** -- it reads the
+Five invariants worth the test file. Resolution is **late** -- it reads the
 configuration at call time, so a ``configure()`` after import still takes effect
 and no filesystem lookup happens on the import path (CI runs this suite before it
 builds ``dependencies/``, so the module has to import on a machine with no
@@ -9,7 +9,10 @@ default -- and a failure says *which* tier chose the prefix, because "not found
 at /usr/local/bin/X" is only actionable once you know whether /usr/local was
 asked for or merely assumed. Whichever tier wins, the prefix is made
 **absolute** on the way in, because the two stages that run with ``cwd`` set
-would otherwise re-interpret a relative argv[0] against the wrong directory. And
+would otherwise re-interpret a relative argv[0] against the wrong directory.
+Files a binary resolves **against a directory** are handled where the argv is
+built rather than left to fail inside it -- refused when they genuinely must be
+co-located, translated when the binary's own join is more forgiving. And
 :func:`~pgs_recon.toolchain.run` **records before it executes**, so a binary that
 dies still leaves behind the invocation that killed it.
 
@@ -27,10 +30,20 @@ from pathlib import Path
 from unittest import mock
 
 from pgs_recon import toolchain
-from pgs_recon.toolchain import (MVG_BIN, MVS_BIN, Recorder, ToolNotFound,
-                                cam_db, configure, effective_prefix,
-                                resolve_exe, run, using)
+from pgs_recon.toolchain import (MVG_BIN, MVS_BIN, ArtifactsNotColocated,
+                                Recorder, ToolNotFound, cam_db, configure,
+                                effective_prefix, relative_to_dir, resolve_exe,
+                                run, using, work_dir)
 from pgs_recon.utility import ToolFailed
+
+
+#: A tool name no install prefix contains, for the not-found paths.
+#:
+#: Load-bearing: the tiers fall through to ``/usr/local``, so a not-found test
+#: naming a *real* tool passes only where OpenMVG is absent. That is true of CI
+#: (which runs this suite before it builds ``dependencies/``) and false inside
+#: our own Docker image, where these tests failed while CI stayed green.
+ABSENT_TOOL = 'openMVG_main_NoSuchTool'
 
 
 def make_fake_prefix(root: Path, mvg=(), mvs=()) -> Path:
@@ -184,18 +197,18 @@ class TestResolveExe(ToolchainCase):
         # The whole reason configuration is process-wide rather than defaulted
         # into signatures: this import already happened, and configure() still
         # decides where the tool comes from.
-        make_fake_prefix(self.tmp, mvs=['RefineMesh'])
+        make_fake_prefix(self.tmp, mvs=[ABSENT_TOOL])
         with self.assertRaises(ToolNotFound):
-            resolve_exe('RefineMesh', MVS_BIN)
+            resolve_exe(ABSENT_TOOL, MVS_BIN)
         configure(prefix=self.tmp)
-        self.assertEqual(self.tmp / 'bin/OpenMVS/RefineMesh',
-                         resolve_exe('RefineMesh', MVS_BIN))
+        self.assertEqual(self.tmp / 'bin/OpenMVS' / ABSENT_TOOL,
+                         resolve_exe(ABSENT_TOOL, MVS_BIN))
 
     def test_a_missing_tool_names_the_tier_that_chose_the_prefix(self):
         with self.assertRaises(ToolNotFound) as ctx:
-            resolve_exe('openMVG_main_SfM')
+            resolve_exe(ABSENT_TOOL)
         message = str(ctx.exception)
-        self.assertIn('/usr/local/bin/openMVG_main_SfM', message)
+        self.assertIn(f'/usr/local/bin/{ABSENT_TOOL}', message)
         self.assertIn('the built-in default', message)
         self.assertEqual('the built-in default', ctx.exception.tier)
 
@@ -221,7 +234,7 @@ class TestResolveExe(ToolchainCase):
         # and 127 because that is what a shell reports for a command it could
         # not find.
         with self.assertRaises(ToolFailed) as ctx:
-            resolve_exe('openMVG_main_SfM')
+            resolve_exe(ABSENT_TOOL)
         self.assertEqual(127, ctx.exception.exit_code)
         self.assertIsNone(ctx.exception.returncode)
 
@@ -292,6 +305,95 @@ class TestCamDb(ToolchainCase):
         self.assertEqual(
             Path('/nowhere/lib/openMVG/sensor_width_camera_database.txt'),
             cam_db())
+
+
+class TestDirectoryRelativeAddressing(ToolchainCase):
+    """``work_dir``/``relative_to_dir``: binaries that resolve names against a dir.
+
+    Two different constraints, deliberately handled differently. Every OpenMVS
+    stage addresses its scene and geometry as bare filenames against ``-w``, and
+    densify pairs its dense cloud with its scene *by name*, so those artifacts
+    genuinely have to be co-located -- ``work_dir`` refuses when they are not,
+    raising ``ArtifactsNotColocated`` (a ``ToolFailed``, so every ``main()``'s
+    existing handler reports it rather than a traceback).
+
+    ``openMVG_main_SfM``'s ``-M`` is not that: it is joined onto ``-m``, and the
+    join resolves ``..``, so any location is reachable given the right spelling.
+    ``relative_to_dir`` produces that spelling instead of restricting the input.
+    """
+
+    def test_the_shared_directory_is_returned(self):
+        mvs = self.tmp / 'mvs'
+        self.assertEqual(mvs, work_dir(mvs / 'scene.mvs', mvs / 'mesh.ply'))
+
+    def test_a_none_artifact_is_ignored(self):
+        # So an optional input (the dense cloud) needs no special case.
+        mvs = self.tmp / 'mvs'
+        self.assertEqual(mvs, work_dir(mvs / 'scene.mvs', None))
+
+    def test_artifacts_in_two_directories_are_refused(self):
+        with self.assertRaises(ArtifactsNotColocated) as ctx:
+            work_dir(self.tmp / 'mvs' / 'scene.mvs',
+                     self.tmp / 'elsewhere' / 'mesh.ply')
+        # The message has to name both, since which one is misplaced is the
+        # question the reader has.
+        self.assertIn('scene.mvs', str(ctx.exception))
+        self.assertIn('elsewhere', str(ctx.exception))
+
+    def test_a_refusal_is_a_tool_failure_the_apps_already_handle(self):
+        with self.assertRaises(ToolFailed) as ctx:
+            work_dir(self.tmp / 'a' / 'scene.mvs', self.tmp / 'b' / 'mesh.ply')
+        # Not the child's status and not 127: nothing was spawned.
+        self.assertEqual(1, ctx.exception.exit_code)
+
+    def test_no_artifacts_at_all_is_refused_rather_than_guessed(self):
+        with self.assertRaises(ArtifactsNotColocated):
+            work_dir(None)
+
+    def test_relative_and_absolute_spellings_of_one_directory_agree(self):
+        # ``.resolve()`` is what makes this hold; on macOS the temp dir is also
+        # reached through a /var -> /private/var symlink.
+        self.addCleanup(os.chdir, Path.cwd())
+        os.chdir(self.tmp)
+        self.assertEqual(self.tmp, work_dir('scene.mvs', self.tmp / 'mesh.ply'))
+
+    def test_a_file_in_the_directory_is_spelled_as_its_basename(self):
+        regions = self.tmp / 'matches_dir'
+        self.assertEqual('matches_filtered.bin',
+                         relative_to_dir(regions / 'matches_filtered.bin',
+                                         regions))
+
+    def test_a_file_elsewhere_is_spelled_relative_to_the_directory(self):
+        # openMVG_main_SfM joins -M onto -m, and that join resolves `..`, so a
+        # matches file outside the regions directory is reachable. Verified
+        # against stlplus create_filespec, which is what does the joining.
+        regions = self.tmp / 'mvg' / 'matches_dir'
+        self.assertEqual('../other/matches.bin',
+                         relative_to_dir(self.tmp / 'mvg' / 'other' / 'matches.bin',
+                                         regions))
+
+    def test_a_file_in_a_subdirectory_keeps_its_subdirectory(self):
+        regions = self.tmp / 'matches_dir'
+        self.assertEqual('nested/matches.bin',
+                         relative_to_dir(regions / 'nested' / 'matches.bin',
+                                         regions))
+
+    def test_the_result_is_never_absolute(self):
+        # The one spelling the binary cannot use: stlplus concatenates, so an
+        # absolute -M becomes `/regions//abs/path`. Translating rather than
+        # passing through is what makes that unreachable.
+        for artifact in (self.tmp / 'matches_dir' / 'm.bin',
+                         Path('/var/tmp/m.bin'), Path('m.bin')):
+            spelled = relative_to_dir(artifact, self.tmp / 'matches_dir')
+            self.assertFalse(Path(spelled).is_absolute(), spelled)
+
+    def test_mixed_relative_and_absolute_spellings_still_work(self):
+        self.addCleanup(os.chdir, Path.cwd())
+        os.chdir(self.tmp)
+        (self.tmp / 'matches_dir').mkdir()
+        self.assertEqual('m.bin',
+                         relative_to_dir('matches_dir/m.bin',
+                                         self.tmp / 'matches_dir'))
 
 
 class TestUsing(ToolchainCase):

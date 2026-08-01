@@ -1,8 +1,28 @@
+"""One function per OpenMVG binary, plus our own ``pgs-global-scaler``.
+
+Each is a straight translation of a Python call into a single binary invocation
+(`ADR 0005 <../docs/adr/0005-wrappers-mirror-the-binary.md>`_): assemble an argv,
+hand it to :func:`toolchain.run`, return nothing. The exceptions are the two
+binaries that name their own output -- :func:`mvg_sfm` and :func:`mvg_localize`
+are handed an output *directory* and pick the filename inside it, so they return
+the path they wrote. Everywhere else the caller named the output and already
+holds it.
+
+Consequently a wrapper takes no ``prefix`` and no ``metadata``: the install
+prefix and the command log are process-wide configuration
+(:func:`toolchain.configure`), which is what makes these usable from outside
+``pgs-recon`` without fabricating a dict, and what makes it impossible for a
+wrapper to forget to record what it ran. Output *naming* is
+:mod:`pgs_recon.layout`'s job, not theirs.
+
+``None`` means **omit the flag**, leaving the binary's own default in force. That
+is load-bearing rather than tidiness: a default spelled out here would silently
+diverge from OpenMVG's the day OpenMVG changes one.
+"""
 from enum import IntEnum
 from pathlib import Path
-from typing import Dict
 
-from pgs_recon.utility import current_timestamp, run_command
+from pgs_recon.toolchain import relative_to_dir, resolve_exe, run, work_dir
 
 
 class CameraModel(IntEnum):
@@ -24,219 +44,198 @@ class ResectionMethod(IntEnum):
     UP2P = 5
 
 
-def init_sfm_generic(paths: Dict[str, Path], focal_length=None,
-                     metadata: Dict = None):
-    """Init sfm scene from dir of images"""
+def init_sfm_generic(images: Path, output_dir: Path, cam_db: Path,
+                     focal_length: int = None) -> None:
+    """Import a directory of images as an SfM scene.
+
+    OpenMVG writes ``sfm_data.json`` into ``output_dir`` under a name of its own
+    choosing (:func:`layout.imported_sfm`).
+    """
     command = [
-        str(paths['BIN'] / 'openMVG_main_SfMInit_ImageListing'),
-        '-i', str(paths['input'].resolve()),
-        '-o', str(paths['mvg']),
-        '-d', str(paths['CAM_DB']),
+        resolve_exe('openMVG_main_SfMInit_ImageListing'),
+        '-i', Path(images).resolve(),
+        '-o', output_dir,
+        '-d', cam_db,
     ]
     if focal_length is not None:
-        command.extend(['-f', str(focal_length)])
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command)
+        command.extend(['-f', focal_length])
+    run(command)
 
 
-def compute_features(paths: Dict[str, Path], sfm_key: str, method: str,
-                     preset: str, upright=False, threads: int = None,
-                     metadata: Dict = None) -> str:
-    """MVG: Compute image features.
+def compute_features(sfm: Path, output_dir: Path, method: str, preset: str,
+                     upright: bool = False, threads: int = None) -> None:
+    """Detect and describe image features.
 
-    Features land beside the scene in ``matches_dir`` under names derived from
-    each image, so the returned key is that directory rather than a file.
+    Regions land in ``output_dir`` under names OpenMVG derives from each image,
+    so the directory is the artifact.
     """
-    # Compute features
     command = [
-        str(paths['BIN'] / 'openMVG_main_ComputeFeatures'),
-        '-i', str(paths[sfm_key]),
-        '-o', str(paths['matches_dir']),
+        resolve_exe('openMVG_main_ComputeFeatures'),
+        '-i', sfm,
+        '-o', output_dir,
         '-m', method,
         '-p', preset,
     ]
     if upright:
         command.extend(['-u', '1'])
     if threads is not None:
-        command.extend(['-n', str(threads)])
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command)
-    return 'matches_dir'
+        command.extend(['-n', threads])
+    run(command)
 
 
-def compute_matches(paths: Dict[str, Path], sfm_key: str, method: str,
-                    ratio: float = None, pairs_file: Path = None,
-                    metadata: Dict = None) -> str:
-    """Compute image feature matches"""
+def compute_matches(sfm: Path, output: Path, method: str, ratio: float = None,
+                    pairs_file: Path = None) -> None:
+    """Match image features, writing putative matches to ``output``.
+
+    ``pairs_file`` limits matching to the listed view pairs -- a grid scan's
+    spatial neighbours (see :mod:`pgs_recon.pgs_data`).
+    """
     command = [
-        str(paths['BIN'] / 'openMVG_main_ComputeMatches'),
-        '-i', str(paths[sfm_key]),
-        '-o', str(paths['matches_file']),
+        resolve_exe('openMVG_main_ComputeMatches'),
+        '-i', sfm,
+        '-o', output,
         '-n', method,
     ]
     if ratio is not None:
-        command.extend(['-r', str(ratio)])
+        command.extend(['-r', ratio])
     if pairs_file is not None:
-        command.extend(['-p', str(pairs_file)])
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command)
-    return 'matches_file'
+        command.extend(['-p', pairs_file])
+    run(command)
 
 
-def geometric_filter(paths: Dict[str, Path], sfm_key: str, matches_key: str,
-                     model: str = None, pairs_file: Path = None,
-                     metadata: Dict = None) -> str:
-    """Geometrically filter putative matches.
-
-    Writes ``<matches>_filtered<suffix>`` beside its input, and keeps that path
-    under the canonical ``matches_file_filtered`` key: ``mvg_sfm`` passes it to
-    ``-M`` by basename.
-    """
-    filtered = paths[matches_key]
-    filtered = filtered.parent / (filtered.stem + '_filtered' + filtered.suffix)
-    paths['matches_file_filtered'] = filtered
+def geometric_filter(sfm: Path, matches: Path, output: Path, model: str = None,
+                     pairs_file: Path = None) -> None:
+    """Geometrically filter putative matches into ``output``."""
     command = [
-        str(paths['BIN'] / 'openMVG_main_GeometricFilter'),
-        '-i', str(paths[sfm_key]),
-        '-m', str(paths[matches_key]),
-        '-o', str(filtered)
+        resolve_exe('openMVG_main_GeometricFilter'),
+        '-i', sfm,
+        '-m', matches,
+        '-o', output,
     ]
     if model is not None:
         command.extend(['-g', model.lower()])
     if pairs_file is not None:
-        command.extend(['-p', str(pairs_file)])
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command)
-    return 'matches_file_filtered'
+        command.extend(['-p', pairs_file])
+    run(command)
 
 
-def mvg_sfm(paths: Dict[str, Path], sfm_key: str, features_key: str,
-            matches_key: str, engine: str, use_priors=False,
+def mvg_sfm(sfm: Path, features_dir: Path, matches: Path, output_dir: Path,
+            engine: str, use_priors: bool = False,
             refine_intrinsics: str = None,
-            initializer: str = None,
-            metadata: Dict = None) -> str:
-    """Run SfM.
+            initializer: str = None) -> Path:
+    """Solve the scene, returning the ``sfm_data.bin`` OpenMVG names itself.
 
-    ``features_key`` names the regions directory, ``matches_key`` the filtered
-    matches file inside it -- OpenMVG takes the latter by basename.
+    ``matches`` is the filtered matches file. OpenMVG resolves ``-M`` **relative
+    to** ``features_dir`` -- it joins the two unconditionally -- so the argument
+    is translated into that form (:func:`toolchain.relative_to_dir`) rather than
+    passed through. It need not live in ``features_dir``: a matches file
+    elsewhere is spelled ``../…`` and resolves fine. Passing an absolute path is
+    what the binary cannot do, and translating here is what keeps a caller from
+    trying.
     """
     command = [
-        str(paths['BIN'] / 'openMVG_main_SfM'),
-        '-i', str(paths[sfm_key]),
+        resolve_exe('openMVG_main_SfM'),
+        '-i', sfm,
         '-s', engine.upper(),
-        '-m', str(paths[features_key]),
-        '-o', str(paths['recon_dir']),
-        '-M', str(paths[matches_key].name),
+        '-m', features_dir,
+        '-o', output_dir,
+        '-M', relative_to_dir(matches, features_dir),
     ]
     if use_priors:
         command.append('-P')
-        if engine == 'incrementalv2':
-            command.extend(['-S', 'EXISTING_POSE'])
+    # Priors on the INCREMENTALV2 engine need the pose-seeded initializer, but
+    # exactly one ``-S`` may be emitted: OpenMVG keeps the *last* it is given
+    # (verified against the v2.1 binary -- `-S BOGUS -S MAX_PAIR` is accepted,
+    # `-S MAX_PAIR -S BOGUS` is rejected). Emitting both left the argv claiming
+    # an initializer the run did not use, so the recorded command lied about the
+    # reconstruction. Deciding here instead keeps the caller's choice winning --
+    # which it already did, by accident of ordering.
+    if initializer is None and use_priors and engine.lower() == 'incrementalv2':
+        initializer = 'EXISTING_POSE'
     if refine_intrinsics is not None:
         command.extend(['-f', refine_intrinsics])
     if initializer is not None:
         command.extend(['-S', initializer])
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command)
-    paths['sfm_recon'] = paths['recon_dir'] / 'sfm_data.bin'
-    return 'sfm_recon'
+    run(command)
+    return Path(output_dir) / 'sfm_data.bin'
 
 
-def mvg_autoscale(paths: Dict[str, Path], sfm_key: str, marker_size: float,
-                  detection_method: str = 'markers', marker_pix: int = None,
-                  include_from: str = None, exclude_from: str = None,
-                  metadata: Dict = None) -> str:
-    """Run pgs-global-scaler"""
-    out_key = sfm_key + '_scaled'
-    in_path = paths[sfm_key]
-    paths[out_key] = paths['recon_dir'] / (in_path.stem + '_scaled.bin')
-    command = [
-        str(paths['BIN'] / 'pgs-global-scaler'),
-        '-i', str(paths[sfm_key]),
-        '-o', str(paths[out_key]),
-        '-s', str(marker_size),
-        '-m', detection_method,
-        '--save-landmarks', str(paths['recon_dir'] / 'landmarks.ply'),
-        '--save-scaled-landmarks', str(paths['recon_dir'] / 'landmarks_scaled.ply')
-    ]
-    if marker_pix is not None:
-        command.extend(['--min-marker-pix', str(marker_pix)])
-    if include_from is not None:
-        command.extend(['--include-from', str(include_from)])
-    if exclude_from is not None:
-        command.extend(['--exclude-from', str(exclude_from)])
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command)
-    return out_key
+def mvg_autoscale(sfm: Path, output: Path, marker_size: float,
+                  detection_method: str = 'markers', min_marker_pix: int = None,
+                  include_from: Path = None, exclude_from: Path = None,
+                  landmarks: Path = None,
+                  scaled_landmarks: Path = None) -> None:
+    """Rescale a scene to physical units from detected markers.
 
-
-def mvg_compute_known(paths: Dict[str, Path], sfm_key: str, features_key: str,
-                      matches_key: str, direct: bool = False,
-                      bundle_adjustment: bool = False,
-                      metadata: Dict = None) -> str:
-    """Compute structure from known poses (direct/robust).
-
-    Triangulates against the unfiltered matches (``matches_key``), unlike
-    ``mvg_sfm``.
+    ``landmarks``/``scaled_landmarks``, when given, save the markers as found and
+    after rescaling -- the check that autoscale did what was asked.
     """
-    out_key = sfm_key + '_structured'
-    in_path = paths[sfm_key]
-    paths[out_key] = paths['recon_dir'] / (in_path.stem + '_structured.bin')
     command = [
-        str(paths['BIN'] / 'openMVG_main_ComputeStructureFromKnownPoses'),
-        '-i', str(paths[sfm_key]),
-        '-m', str(paths[features_key]),
-        '-o', str(paths[out_key]),
-        '-f', str(paths[matches_key]),
+        resolve_exe('pgs-global-scaler'),
+        '-i', sfm,
+        '-o', output,
+        '-s', marker_size,
+        '-m', detection_method,
+    ]
+    if landmarks is not None:
+        command.extend(['--save-landmarks', landmarks])
+    if scaled_landmarks is not None:
+        command.extend(['--save-scaled-landmarks', scaled_landmarks])
+    if min_marker_pix is not None:
+        command.extend(['--min-marker-pix', min_marker_pix])
+    if include_from is not None:
+        command.extend(['--include-from', include_from])
+    if exclude_from is not None:
+        command.extend(['--exclude-from', exclude_from])
+    run(command)
+
+
+def mvg_compute_known(sfm: Path, features_dir: Path, matches: Path,
+                      output: Path, direct: bool = False,
+                      bundle_adjustment: bool = False) -> None:
+    """Triangulate structure from known poses.
+
+    Reads the **unfiltered** matches (``-f``), unlike :func:`mvg_sfm`, and by
+    full path rather than basename. ``direct`` is the reconstruction method that
+    triangulates the imported scene's rig priors; without it this is the robust
+    re-triangulation of an already solved scene.
+    """
+    command = [
+        resolve_exe('openMVG_main_ComputeStructureFromKnownPoses'),
+        '-i', sfm,
+        '-m', features_dir,
+        '-o', output,
+        '-f', matches,
     ]
     if direct:
         command.append('-d')
     if bundle_adjustment:
         command.append('-b')
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command)
-    return out_key
+    run(command)
 
 
-def mvg_colorize_sfm(paths: Dict[str, Path], sfm_key: str,
-                     metadata: Dict = None) -> str:
-    """Colorize SfM file"""
-    sfm_colorized_key = sfm_key + '_colorized'
-    in_path = paths[sfm_key]
-    paths[sfm_colorized_key] = in_path.parent / (
-                in_path.stem + '_colorized.ply')
+def mvg_colorize_sfm(sfm: Path, output: Path) -> None:
+    """Colour a scene's sparse cloud from the images."""
     command = [
-        str(paths['BIN'] / 'openMVG_main_ComputeSfM_DataColor'),
-        '-i', str(paths[sfm_key]),
-        '-o', str(paths[sfm_colorized_key]),
+        resolve_exe('openMVG_main_ComputeSfM_DataColor'),
+        '-i', sfm,
+        '-o', output,
     ]
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command)
-    return sfm_colorized_key
+    run(command)
 
 
-def mvg_localize(paths: Dict[str, Path], sfm_key: str, query_key: str,
-                 out_key: str, match_out_key: str,
+def mvg_localize(sfm: Path, features_dir: Path, query_dir: Path,
+                 output_dir: Path, match_out_dir: Path,
                  camera_model: int = None, resection_method: int = None,
                  residual_error: float = None, single_intrinsics: bool = False,
-                 export_structure: bool = False, threads: int = None,
-                 metadata: Dict = None) -> str:
-    """Localize new image(s) into an existing SfM reconstruction.
+                 export_structure: bool = False, threads: int = None) -> Path:
+    """Localize new image(s) into an existing reconstruction.
 
-    Resections each image in the ``query_key`` directory against the database
-    scene ``sfm_key`` (which must carry structure) using the database regions in
-    ``paths['matches_dir']``. New query regions are written to ``match_out_key``
-    so the original matches directory is left untouched. Writes
-    ``sfm_data_expanded.json`` (database views plus the localized query views) to
-    the ``out_key`` directory; returns the key of that file.
+    Resections each image in ``query_dir`` against the database scene ``sfm``
+    (which must carry structure) using the database regions in ``features_dir``.
+    New query regions go to ``match_out_dir`` so the original regions are left
+    untouched. Returns the ``sfm_data_expanded.json`` OpenMVG writes into
+    ``output_dir`` -- the database views plus the localized query views.
 
     For an uncalibrated camera leave ``single_intrinsics`` off so a fresh
     intrinsic is estimated. ``resection_method=0`` (DLT) does not require known
@@ -244,44 +243,44 @@ def mvg_localize(paths: Dict[str, Path], sfm_key: str, query_key: str,
     assume a calibrated camera.
     """
     command = [
-        str(paths['BIN'] / 'openMVG_main_SfM_Localization'),
-        '-i', str(paths[sfm_key].resolve()),
-        '-m', str(paths['matches_dir'].resolve()),
-        '-u', str(paths[match_out_key].resolve()),
-        '-o', str(paths[out_key].resolve()),
-        '-q', str(paths[query_key].resolve()),
+        resolve_exe('openMVG_main_SfM_Localization'),
+        '-i', Path(sfm).resolve(),
+        '-m', Path(features_dir).resolve(),
+        '-u', Path(match_out_dir).resolve(),
+        '-o', Path(output_dir).resolve(),
+        '-q', Path(query_dir).resolve(),
     ]
     if camera_model is not None:
-        command.extend(['-c', str(camera_model)])
+        command.extend(['-c', camera_model])
     if resection_method is not None:
-        command.extend(['-R', str(resection_method)])
+        command.extend(['-R', resection_method])
     if residual_error is not None:
-        command.extend(['-r', str(residual_error)])
+        command.extend(['-r', residual_error])
     if single_intrinsics:
         command.append('-s')
     if export_structure:
         command.append('-e')
     if threads is not None:
-        command.extend(['-n', str(threads)])
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command)
-    paths['sfm_expanded'] = paths[out_key] / 'sfm_data_expanded.json'
-    return 'sfm_expanded'
+        command.extend(['-n', threads])
+    run(command)
+    return Path(output_dir) / 'sfm_data_expanded.json'
 
 
-def mvg_to_mvs(paths: Dict[str, Path], sfm_key: str, threads: int = None,
-               metadata: Dict = None) -> str:
-    """Convert OpenMVG SfM to OpenMVS Scene"""
+def mvg_to_mvs(sfm: Path, scene: Path, images_dir: Path,
+               threads: int = None) -> None:
+    """Convert a solved OpenMVG scene to an OpenMVS one, undistorting as it goes.
+
+    Runs in the scene's directory and names both outputs by basename, so the
+    undistorted images land beside the scene where every MVS stage expects them
+    (:func:`toolchain.work_dir`). The input is passed absolute for that reason.
+    """
+    work = work_dir(scene, images_dir)
     command = [
-        str(paths['BIN'] / 'openMVG_main_openMVG2openMVS'),
-        '-i', str(paths[sfm_key].resolve()),
-        '-o', str(paths['mvs_scene'].name),
-        '-d', str(paths['mvs_images'].name)
+        resolve_exe('openMVG_main_openMVG2openMVS'),
+        '-i', Path(sfm).resolve(),
+        '-o', Path(scene).name,
+        '-d', Path(images_dir).name,
     ]
     if threads is not None:
-        command.extend(['-n', str(threads)])
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command, cwd=paths['mvs'])
-    return 'mvs_scene'
+        command.extend(['-n', threads])
+    run(command, cwd=work)

@@ -34,10 +34,14 @@ to use system versions. Note: OpenMVS and OpenCV must link against the same libj
 The only tests are `tests/`: `python3 -m unittest discover -s tests`. They cover
 the staged-run planner (`test_stages.py`, pure logic, no filesystem), the stage
 records `StageTracker` writes (`test_tracker.py`, a temp dir but no binaries),
-and `pgs-recon`'s `--dry-run` (`test_reconstruct.py`, which skips itself when
-`configargparse`/`sfm_utils` are missing). All stdlib-only, so they run anywhere
-in seconds. Nothing else — the reconstruction stages themselves are only exercised by
-running the pipeline. CI (`.gitlab-ci.yml`) runs that suite, then verifies that
+artifact naming (`test_layout.py`), binary resolution and the run/record
+chokepoint (`test_toolchain.py`), `run_command`'s exit statuses
+(`test_utility.py`), and `pgs-recon` end to end against a prefix of fake binaries
+plus its `--dry-run` (`test_pipeline.py`, `test_reconstruct.py`, which skip
+themselves when `configargparse`/`sfm_utils`/`exiftool` are missing). All
+stdlib-only, so they run anywhere in seconds — no reconstruction math is
+exercised, only what the pipeline asks the binaries to do. CI
+(`.gitlab-ci.yml`) runs that suite, then verifies that
 dependencies build and the package pip-installs on Ubuntu 22.04 / 24.04. The
 canonical GitHub Actions workflow (`.github/workflows/build_docker.yml`)
 builds/publishes Docker images.
@@ -59,19 +63,24 @@ generation, scan inspection, quality checks, etc.) mapping to modules in
 
 ### Binary discovery at runtime
 
-`pgs-recon` looks for binaries under a `--path` prefix that **defaults to
-`/usr/local/`** (a hidden arg), i.e. it assumes the container/install layout, not
-the CMake default of `dependencies/installed/`. When running outside Docker, pass
-`--path <prefix>` pointing at the dir containing `bin/`. The OpenMVG camera sensor
-database is expected at `<path>/lib/openMVG/sensor_width_camera_database.txt`
-(override with the hidden `--cam-db`).
+`pgs_recon/toolchain.py` resolves every binary under an install prefix, **at call
+time**, from the first of: the hidden `--path <prefix>` arg → `$PGS_RECON_PREFIX`
+→ `/usr/local/` (`toolchain.DEFAULT_PREFIX`), i.e. it assumes the
+container/install layout, not the CMake default of `dependencies/installed/`.
+When running outside Docker, point one of the first two at the dir containing
+`bin/`; a failure names both the path it looked for and which of those tiers
+chose the prefix. OpenMVG binaries and our `pgs-*` utilities live in `bin/`,
+OpenMVS's in `bin/OpenMVS/`. The OpenMVG camera sensor database is expected at
+`<prefix>/lib/openMVG/sensor_width_camera_database.txt` (override with the hidden
+`--cam-db`).
 
 ## Architecture
 
 ### Pipeline flow (`pgs_recon/apps/reconstruct.py`)
 
-`main()` runs the stages in fixed order; each stage is a function that constructs a
-binary invocation and calls `run_command`:
+`run_pipeline()` runs the stages in fixed order; each stage names its output, calls
+a wrapper that builds one binary invocation, and reports the result to the
+tracker:
 
 1. **Import / SfM init** → one of: `init_sfm_pgs` (PGS scan dirs, `-p`),
    `init_sfm_generic2` (new EXIF-based importer), or `init_sfm_generic` (default,
@@ -88,24 +97,46 @@ binary invocation and calls `run_command`:
 
 `--no-mvs` stops after the SfM/colorize stage.
 
-### Two dicts threaded through every stage
+### How a stage gets its paths (ADR 0005, ADR 0006)
 
-- **`paths`**: a `Dict[str, Path]` built up incrementally in `main()`. Stage
-  functions take a `*_key` string argument naming the input path and **return a new
-  key string** for their output, which they also insert into `paths`. This is how
-  output of one stage feeds the next (e.g. `sfm_key`, `mvs_key`, `mesh_key`). When
-  adding a stage, follow this convention: derive the output path, store it under a
-  new key, return the key.
-- **`metadata`**: a dict whose `metadata['commands'][timestamp]` records the exact
-  command line of every binary invocation. An `atexit` hook writes it to
-  `<output>/metadata.json`, and a full run config is written to
-  `<output>/*_recon_config.txt`. Pass `metadata` into any new stage so the run stays
-  reproducible.
+Stages pass `Path`s, and nothing else. There is no `paths` dict threaded through
+them and no `metadata` argument:
+
+- **Inputs** come from the tracker's role bindings — `tracker.require('scene')`
+  for something a stage cannot run without, `tracker.path('cloud')` for something
+  that may legitimately be absent. Both are recorded paths read back from the
+  manifest, never recomputed names.
+- **Outputs** are named by `pgs_recon/layout.py`, pure functions over the output
+  root (plus, until ADR 0006 lands, the input artifact a chained name derives
+  from). A wrapper never invents a filename; `layout` is the only place a name is
+  written, which is what makes renaming safe.
+- **Where the binaries are and what records them** is process-wide:
+  `toolchain.configure(prefix=..., recorder=...)` once in `main()`.
+  `toolchain.run()` is the single chokepoint that appends to
+  `metadata['commands'][timestamp]` (a compatibility surface: `recon_dir.py` greps
+  it) and then executes, so no wrapper can forget to record what it ran. An
+  `atexit` hook writes the manifest to `<output>/metadata.json`; the effective
+  config goes to `<output>/*_recon_config.txt`.
+
+When adding a stage: add a `layout` function for its output, add the wrapper as a
+pure argv builder ending in `run()`, and wire it in `run_pipeline` between
+`tracker.begin()`/`tracker.end()`, reporting the roles it consumed and produced.
+Invariants that are ours rather than the binary's (e.g. always handing
+`ReconstructMesh` the dense cloud) belong in `run_pipeline`, not in the wrapper —
+the wrappers stay a complete library surface over each binary's flags.
 
 ### Module layout
 
 - `pgs_recon/openmvg.py`, `pgs_recon/openmvs.py` — thin wrappers, one function per
-  binary, all routing through `utility.run_command`.
+  binary, all routing through `toolchain.run`.
+- `pgs_recon/toolchain.py` — binary resolution, the run/record chokepoint, and
+  what the binaries that resolve names against a directory need: `work_dir()`
+  returns the directory a set of artifacts shares, refusing with
+  `ArtifactsNotColocated` (a `ToolFailed`) when they disagree — OpenMVS really
+  does require co-location. `relative_to_dir()` instead *translates*, for
+  `openMVG_main_SfM`'s `-M`, whose join onto `-m` resolves `../`, so the matches
+  file may live anywhere; only an absolute path is unusable there.
+- `pgs_recon/layout.py` — what every artifact of a run is called.
 - `pgs_recon/pgs_data.py` — import logic for EduceLab "PGS Scan" directories,
   including grid-scan neighbor lookup that generates an OpenMVG **view pairs file**
   (limits matching to spatial neighbors via `--matching-pairs-radius`).
@@ -129,8 +160,9 @@ binary invocation and calls `run_command`:
 
 ## Conventions
 
-- Stage functions are pure command builders: assemble a `command` list, append
-  optional flags conditionally, record to `metadata`, then `run_command`. Match this
-  style for new binary wrappers rather than calling `subprocess` directly.
+- Wrappers are pure command builders: assemble a `command` list, append optional
+  flags conditionally (`None` means *omit the flag*, so the binary's own default
+  wins), then `toolchain.run`. Match this style for new binary wrappers rather
+  than calling `subprocess` or `run_command` directly.
 - Args use `configargparse`; hidden/internal flags use `configargparse.SUPPRESS`.
 - The package version lives in `setup.cfg` (`version = ...`).

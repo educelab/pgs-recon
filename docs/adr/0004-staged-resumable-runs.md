@@ -92,19 +92,22 @@ import…reconstruct and starts at refine. No range flags needed.
   reveals it (clause 4). Stages outside the shape bind nothing, which is what
   makes clause 4 fire on a shrunken shape. A stale `complete` record for an
   out-of-shape stage stays in the manifest and is simply never consulted.
-- **Rehydration is by semantic role** (`scene`, `mesh`, `cloud`), not by `paths`
-  key. The real keys are *chained* (`mvs_scene_dense_mesh_refine`), so a key
+- **Rehydration is by semantic role** (`scene`, `mesh`, `cloud`), not by artifact
+  name. The names are *chained* (`scene_dense_mesh_refine.ply`), so a name
   encodes which stages ran and cannot be reconstructed from args without
-  duplicating the naming logic. Roles are re-rooted into `paths` under stable
-  synthetic keys and handed to the untouched stage functions. This is safe only
-  because the wrappers derive output filenames from the input `Path`'s stem, not
-  from the dict key — **byte-identical artifact names between a single-shot and a
-  staged run is the acceptance test**, and anything that breaks it makes resumed
-  outputs diverge. Every wrapper therefore takes its inputs as `*_key`
-  arguments, including the three OpenMVG ones that used to reach for
-  `paths['sfm']` directly: a stage that records a role it did not actually
-  consume through the bindings makes that record decorative, and clause 4 cannot
-  see a rebinding it never looked at.
+  duplicating the naming logic; a role's recorded path is read from the manifest
+  and handed to the stage as-is. This is safe only because an output name is
+  derived from the artifacts a stage consumes and from nothing else —
+  **byte-identical artifact names between a single-shot and a staged run is the
+  acceptance test** (automated in `test_pipeline.py`), and anything that breaks it
+  makes resumed outputs diverge. Every wrapper therefore consumes its inputs
+  **explicitly**, including the three OpenMVG ones that used to reach into the
+  `paths` dict for the current `sfm`: a stage that records a role it did not
+  actually consume through the bindings makes that record decorative, and clause
+  4 cannot see a rebinding it never looked at. *(Originally written when wrappers
+  took `paths` + `*_key` strings; [ADR 0005](./0005-wrappers-mirror-the-binary.md)
+  replaced those with explicit `Path` arguments, which serves this reason
+  strictly better.)*
 - **No existence checks anywhere; the manifest is the record.** Dirtiness is
   computed from two dicts, which is what makes the planner testable and keeps a
   half-created output directory from changing the plan. The motivating failure —
@@ -122,8 +125,15 @@ import…reconstruct and starts at refine. No range flags needed.
   what describes *this invocation* rather than the reconstruction: flow control,
   plus `output` (required anyway, so recording it only parks another runtime's
   absolute path in the manifest), `threads` (would pin a later job to a previous
-  node's core count) and `log_level` (would inherit a debugging run's `DEBUG`).
-  `path` and `cam_db` stay recorded: they say where the binaries live.
+  node's core count), `log_level` (would inherit a debugging run's `DEBUG`) and
+  `path` — an inherited install prefix would be handed to
+  `toolchain.configure()` by every later job, making `$PGS_RECON_PREFIX`
+  unreachable on precisely the nodes it exists for: the big-memory refine node,
+  whose prefix legitimately differs from the node that ran SfM. Which prefix a
+  run used is still recoverable from `parsed`, from `runs[].argv`, and from the
+  absolute `argv[0]` of every recorded command. `cam_db` does stay recorded:
+  unset it re-derives from whatever prefix is in force, and set it names a file
+  the user chose — provenance of the reconstruction, not a property of the node.
 - **Arg drift is resolved by an arg→stage ownership map**, comparing explicit
   arguments only — never a fingerprint over all of them, which would make any
   future version that adds a defaulted flag dirty every stage of every existing

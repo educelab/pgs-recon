@@ -24,11 +24,11 @@ set: dirty inside it runs, dirty before ``--from`` is an error, dirty after
 
 Three invariants hold this together, and all three are load-bearing:
 
-* **Staged runs must produce the artifact names a single-shot run would.** The
-  OpenMVG/OpenMVS wrappers derive output filenames from the input ``Path``'s stem
-  rather than from the ``paths`` key, so handing a rehydrated path in under a
-  synthetic key changes nothing about what gets written. Anything that breaks
-  that makes a resumed run's outputs diverge from a fresh one's.
+* **Staged runs must produce the artifact names a single-shot run would.** Output
+  names come from ``layout`` and depend only on the paths a stage consumes, so a
+  rehydrated input produces exactly the output a freshly built one would.
+  Anything that breaks that makes a resumed run's outputs diverge from a fresh
+  one's.
 * **Nothing runs that the range did not ask for.** A job sized for texturing must
   never quietly start refining, which is the exact blowup this exists to prevent.
   Missing prerequisites are an error, never backfilled.
@@ -53,6 +53,8 @@ import time
 from datetime import datetime as dt, timezone as tz
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+
+from pgs_recon import layout
 
 try:  # not available on every platform
     import resource
@@ -157,10 +159,23 @@ CONTROL_ARGS: Tuple[str, ...] = ('from_stage', 'to_stage', 'rerun', 'dry_run',
 # only parks a stale absolute path from another runtime's mounts in the
 # manifest; an inherited ``threads`` silently pins a later job to a previous
 # node's core count; an inherited ``log_level`` silently keeps a debugging run's
-# DEBUG. ``path`` and ``cam_db`` stay persisted -- they say where the binaries
-# live, which is worth recording and harmless to re-default.
+# DEBUG.
+#
+# ``path`` is here for the same reason, and it is the one that bites: inherited,
+# a prefix recorded by job 1 is handed to ``toolchain.configure()`` by every
+# later job, which makes ``$PGS_RECON_PREFIX`` unreachable on exactly the nodes
+# it exists for -- a staged run's big-memory refine node, whose install prefix
+# legitimately differs from the node that ran SfM. That is the same shadowing
+# that cost ``--path`` its parser default (ADR 0005); persisting it here would
+# have reintroduced it one level up. Nothing is lost by dropping it: which
+# prefix a run used is still in ``parsed``, in ``runs[].argv``, and in the
+# absolute argv[0] of every recorded command.
+#
+# ``cam_db`` stays persisted. Unset it records ``None`` and re-derives from
+# whatever prefix is in force, and set it names a file the user chose --
+# provenance of the reconstruction rather than a property of the node.
 NO_PERSIST = frozenset(CONTROL_ARGS) | {'config', 'output', 'threads',
-                                        'log_level'}
+                                        'log_level', 'path'}
 
 _MISSING = object()
 
@@ -465,21 +480,20 @@ class StageTracker:
 
     ``chain`` is the live binding map during execution, seeded with the state
     just before ``from_stage`` and updated as stages run or are skipped.
-    ``key(role)`` inserts a role's path into ``paths`` under a stable synthetic
-    key for handing to a stage wrapper: output *filenames* derive from the input
-    path's stem, not the dict key, so a staged run produces byte-identical
-    artifact names to a single-shot run.
+    ``require(role)``/``path(role)`` hand a stage its inputs as recorded paths,
+    which is the whole mechanism by which a resumed job's outputs land where a
+    single-shot run's would: it consumes the same paths, and ``layout`` derives
+    the same names from them.
     """
 
-    def __init__(self, metadata: Dict, manifest_path: Path, paths: Dict,
+    def __init__(self, metadata: Dict, manifest_path: Path, root: Path,
                  args, shape: Sequence[str], from_stage: str, to_stage: str,
                  rerun: bool = False, drift: Dict[str, List[str]] = None,
                  logger: logging.Logger = None):
         self.meta = metadata
         self.manifest_path = Path(manifest_path)
-        self.paths = paths
         self.args = args
-        self.root = Path(paths['output'])
+        self.root = Path(root)
         self.shape = tuple(shape)
         self.from_stage = from_stage
         self.to_stage = to_stage
@@ -631,16 +645,20 @@ class StageTracker:
                 and (self.stages.get(s) or {}).get('status') == 'complete']
 
     # -- chain ------------------------------------------------------------
-    def key(self, role: str) -> str:
-        """Insert ``chain[role]``'s path into ``paths`` and return its key."""
+    def require(self, role: str) -> Path:
+        """``chain[role]``'s path, or a :class:`StageError` naming what is missing.
+
+        The accessor for an input a stage cannot run without.
+        ``prereq_errors()`` should already have refused the run, so reaching
+        here means the plan and ``STAGE_IO`` disagree -- but a stage must never
+        be handed ``None`` and left to hand it to a binary.
+        """
         binding = self.chain.get(role)
         if binding is None or binding.path is None:
             raise StageError(f'no {role!r} artifact is recorded for this run; '
                              f'cannot resume at '
                              f'{self._active or self.from_stage}.')
-        name = f'resume_{role}'
-        self.paths[name] = binding.path
-        return name
+        return binding.path
 
     def path(self, role: str) -> Optional[Path]:
         """``chain[role]``'s path, or None if unbound or not yet built."""
@@ -707,8 +725,8 @@ class StageTracker:
                 f"'{stage}' is recorded as running (pid {record.get('pid')} @ "
                 f"{record.get('host')}, started {record.get('started')}). If "
                 f"that job is still alive, both will write to "
-                f"{rel_to(self.paths['mvs'], self.root)}/ and the results will "
-                f"be garbage. Continuing.")
+                f"{rel_to(layout.mvs_dir(self.root), self.root)}/ and the "
+                f"results will be garbage. Continuing.")
         elif record.get('status') == 'complete':
             self.log.info(f'{stage}: re-running ({self.dirty[stage]})')
 

@@ -1,139 +1,154 @@
+"""One function per OpenMVS binary.
+
+Same contract as :mod:`pgs_recon.openmvg`: one Python call, one binary
+invocation, no ``prefix`` or ``metadata`` parameters, no naming (`ADR 0005
+<../docs/adr/0005-wrappers-mirror-the-binary.md>`_). None of these four returns a
+path -- OpenMVS never chooses a name the caller did not give it.
+
+Two invariants of `ADR 0003 <../docs/adr/0003-portable-mvs-intermediates.md>`_ run
+through this module, and both are deliberately *parameters* rather than
+hardcoded:
+
+* ``archive_type`` defaults to ``-1`` and is therefore **always emitted**. 0003's
+  concern is the flag being implicit -- an upstream default change would silently
+  reintroduce Boost archives, which OOM when read by a differently built
+  OpenMVS -- not its being overridable. Do not "tidy" this into the
+  ``None``-means-omit convention the other flags follow.
+* ``point_cloud`` is nullable, because no dense cloud is a legitimate shape
+  rather than a mistake. Passing it whenever densify ran is a *pipeline*
+  obligation: without ``-p``, ``ReconstructMesh`` silently builds from the sparse
+  cloud and the densification is wasted.
+
+Every stage addresses its scene and geometry by basename against a working
+directory, so those files must be co-located; :func:`toolchain.work_dir` derives
+that directory from the artifacts themselves and refuses when they disagree.
+"""
 from pathlib import Path
-from typing import Dict, Tuple
 
-from pgs_recon.utility import current_timestamp, run_command
+from pgs_recon.toolchain import MVS_BIN, resolve_exe, run, work_dir
 
 
-def mvs_densify(paths: Dict[str, Path], mvs_key: str,
-                resolution_lvl: int = None, mask_value: int = None,
-                metadata: Dict = None) -> Tuple[str, str]:
-    """Densify a point cloud. Returns ``(scene_key, cloud_key)``."""
-    out_key = mvs_key + '_dense'
-    cloud_key = out_key + '_cloud'
-    in_path = paths[mvs_key]
-    paths[out_key] = in_path.parent / (in_path.stem + '_dense.mvs')
-    paths[cloud_key] = paths[out_key].with_suffix('.ply')
+def mvs_densify(scene: Path, output: Path, resolution_level: int = None,
+                ignore_mask_label: int = None, archive_type: int = -1) -> None:
+    """Densify a scene's point cloud.
+
+    Writes two files: ``output`` (a scene still holding the *sparse* cloud) and
+    the dense cloud beside it as ``output``'s stem with a ``.ply`` suffix, which
+    OpenMVS pairs by name rather than by any argument
+    (:func:`layout.densify_cloud`). This is the only MVS stage that writes a
+    scene at all.
+
+    ``ignore_mask_label`` is the label value in each image's mask to exclude;
+    ``None`` ignores masks entirely.
+    """
+    work = work_dir(scene, output)
     command = [
-        str(paths['MVS_BIN'] / 'DensifyPointCloud'),
-        '-i', str(paths[mvs_key].name),
-        '-o', str(paths[out_key].name),
-        '-w', str(paths['mvs']),
-        '--archive-type', '-1',
+        resolve_exe('DensifyPointCloud', MVS_BIN),
+        '-i', Path(scene).name,
+        '-o', Path(output).name,
+        '-w', work,
+        '--archive-type', archive_type,
     ]
-    if resolution_lvl is not None:
-        command.extend(['--resolution-level', str(resolution_lvl)])
-    if mask_value is not None:
-        command.extend(['--ignore-mask-label', str(mask_value)])
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command)
-    return out_key, cloud_key
+    if resolution_level is not None:
+        command.extend(['--resolution-level', resolution_level])
+    if ignore_mask_label is not None:
+        command.extend(['--ignore-mask-label', ignore_mask_label])
+    run(command)
 
 
-def mvs_reconstruct(paths: Dict[str, Path], mvs_key: str, free_space=False,
-                    smooth: int = 2, pointcloud_key: str = None,
-                    metadata: Dict = None) -> Tuple[str, str]:
-    """Reconstruct an MVS scene"""
-    mesh_key = mvs_key + '_mesh'
-    scene_key = mvs_key
-    in_path = paths[mvs_key]
-    paths[mesh_key] = in_path.parent / (in_path.stem + '_mesh.ply')
+def mvs_reconstruct(scene: Path, output: Path, point_cloud: Path = None,
+                    free_space_support: bool = False, smooth: int = 2,
+                    archive_type: int = -1) -> None:
+    """Reconstruct a surface from a scene's point cloud.
+
+    ``point_cloud`` must be given whenever densify ran: the scene densify wrote
+    holds the sparse cloud, so without ``-p`` this silently meshes that instead
+    of the dense one.
+    """
+    work = work_dir(scene, output, point_cloud)
     command = [
-        str(paths['MVS_BIN'] / 'ReconstructMesh'),
-        '-i', str(paths[mvs_key].name),
-        '-o', str(paths[mesh_key].name),
-        '-w', str(paths['mvs']),
-        '--archive-type', '-1',
-        '--smooth', str(smooth),
+        resolve_exe('ReconstructMesh', MVS_BIN),
+        '-i', Path(scene).name,
+        '-o', Path(output).name,
+        '-w', work,
+        '--archive-type', archive_type,
     ]
-    if pointcloud_key is not None:
-        command.extend(['-p', str(paths[pointcloud_key].name)])
-    if free_space:
+    if smooth is not None:
+        command.extend(['--smooth', smooth])
+    if point_cloud is not None:
+        command.extend(['-p', Path(point_cloud).name])
+    if free_space_support:
         command.extend(['--free-space-support', '1'])
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command)
-    return scene_key, mesh_key
+    run(command)
 
 
-def mvs_refine(paths: Dict[str, Path], mvs_key: str, mesh_key: str,
-               decimation_factor: float = None, resolution_lvl: int = None,
-               min_resolution: int = None, scales: int = 3,
-               scale_step: float = None,
-               metadata: Dict = None) -> Tuple[str, str]:
-    """Refine a reconstructed mesh"""
-    out_key = mvs_key + '_refine'
-    in_path = paths[mvs_key]
-    paths[out_key] = in_path.parent / (in_path.stem + '_refine.ply')
+def mvs_refine(scene: Path, mesh: Path, output: Path, decimate: float = None,
+               resolution_level: int = None, min_resolution: int = None,
+               scales: int = 3, scale_step: float = None,
+               archive_type: int = -1) -> None:
+    """Refine a reconstructed mesh against the scene's images.
+
+    The memory hog of the pipeline, and the reason a run can be split into jobs
+    (`ADR 0004 <../docs/adr/0004-staged-resumable-runs.md>`_).
+    """
+    work = work_dir(scene, mesh, output)
     command = [
-        str(paths['MVS_BIN'] / 'RefineMesh'),
-        '-i', str(paths[mvs_key].name),
-        '-m', str(paths[mesh_key].name),
-        '-o', str(paths[out_key].name),
-        '-w', str(paths['mvs']),
-        '--archive-type', '-1',
+        resolve_exe('RefineMesh', MVS_BIN),
+        '-i', Path(scene).name,
+        '-m', Path(mesh).name,
+        '-o', Path(output).name,
+        '-w', work,
+        '--archive-type', archive_type,
     ]
-    if decimation_factor is not None:
-        command.extend(['--decimate', str(decimation_factor)])
-    if resolution_lvl is not None:
-        command.extend(['--resolution-level', str(resolution_lvl)])
+    if decimate is not None:
+        command.extend(['--decimate', decimate])
+    if resolution_level is not None:
+        command.extend(['--resolution-level', resolution_level])
     if min_resolution is not None:
-        command.extend(['--min-resolution', str(min_resolution)])
+        command.extend(['--min-resolution', min_resolution])
     if scales is not None:
-        command.extend(['--scales', str(scales)])
+        command.extend(['--scales', scales])
     if scale_step is not None:
-        command.extend(['--scale-step', str(scale_step)])
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command)
-    return mvs_key, out_key
+        command.extend(['--scale-step', scale_step])
+    run(command)
 
 
-def mvs_texture(paths: Dict[str, Path], mvs_key: str, mesh_key: str,
-                file_format: str = 'ply', resolution_lvl: int = None,
-                max_size: int = 0, empty_color: int = None,
-                global_seam_leveling: int = None,
-                local_seam_leveling: int = None, output_name: str = None,
-                metadata: Dict = None) -> str:
-    """Texture a mesh.
+def mvs_texture(scene: Path, mesh: Path, output: Path, export_type: str = None,
+                resolution_level: int = None, max_texture_size: int = 0,
+                empty_color: int = None, global_seam_leveling: int = None,
+                local_seam_leveling: int = None,
+                archive_type: int = -1) -> None:
+    """Texture a mesh from the scene's images.
 
-    ``mesh_key`` names a path in ``paths`` that lives in the ``mvs`` working dir
-    (it is referenced by basename). A caller texturing an externally produced
-    mesh should stage it into the working dir first (see retexture's
-    ``ensure_ply_mesh``).
+    ``export_type`` defaults to ``output``'s extension, which is what OpenMVS
+    requires of the pair; pass it only to override. ``mesh`` must already live in
+    the working directory -- a caller texturing an externally produced mesh
+    stages it there first (see retexture's ``ensure_ply_mesh``).
 
     Seam leveling and ``empty_color`` are left at OpenMVS defaults unless set.
-    Passing ``*_seam_leveling=0`` disables the per-patch brightness
-    normalization that hides seams, preserving the source radiometry — which
-    matters when texturing a scientific modality where pixel intensities are
-    the signal.
+    Passing ``*_seam_leveling=0`` disables the per-patch brightness normalization
+    that hides seams, preserving the source radiometry -- which matters when
+    texturing a scientific modality where pixel intensities are the signal.
     """
-    out_key = mvs_key + '_texture'
-    in_path = paths[mvs_key]
-    if output_name is not None:
-        paths[out_key] = in_path.parent / f'{output_name}.{file_format.lower()}'
-    else:
-        paths[out_key] = in_path.parent / (
-                    in_path.stem + f'_texture.{file_format.lower()}')
+    work = work_dir(scene, mesh, output)
+    if export_type is None:
+        export_type = Path(output).suffix.lstrip('.')
     command = [
-        str(paths['MVS_BIN'] / 'TextureMesh'),
-        '-i', str(paths[mvs_key].name),
-        '-m', str(paths[mesh_key].name),
-        '-o', str(paths[out_key].name),
-        '--export-type', file_format.lower(),
-        '-w', str(paths['mvs']),
-        '--archive-type', '-1',
-        '--max-texture-size', str(max_size)
+        resolve_exe('TextureMesh', MVS_BIN),
+        '-i', Path(scene).name,
+        '-m', Path(mesh).name,
+        '-o', Path(output).name,
+        '--export-type', export_type.lower(),
+        '-w', work,
+        '--archive-type', archive_type,
+        '--max-texture-size', max_texture_size,
     ]
-    if resolution_lvl is not None:
-        command.extend(['--resolution-level', str(resolution_lvl)])
+    if resolution_level is not None:
+        command.extend(['--resolution-level', resolution_level])
     if empty_color is not None:
-        command.extend(['--empty-color', str(empty_color)])
+        command.extend(['--empty-color', empty_color])
     if global_seam_leveling is not None:
-        command.extend(['--global-seam-leveling', str(global_seam_leveling)])
+        command.extend(['--global-seam-leveling', global_seam_leveling])
     if local_seam_leveling is not None:
-        command.extend(['--local-seam-leveling', str(local_seam_leveling)])
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (str(' ').join(command))
-    run_command(command, cwd=paths['mvs'])
-    return out_key
+        command.extend(['--local-seam-leveling', local_seam_leveling])
+    run(command, cwd=work)
