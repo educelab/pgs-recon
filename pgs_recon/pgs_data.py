@@ -5,7 +5,7 @@ import logging
 import math
 import re
 from pathlib import Path
-from typing import Dict
+from typing import Optional
 
 import exiftool
 import numpy as np
@@ -13,7 +13,7 @@ import sfm_utils as sfm
 from scipy.spatial.transform import Rotation as Rot
 from sfm_utils.openmvg import __OPENMVG_CAMDB_DEFAULT_PATH
 
-from pgs_recon.utility import current_timestamp
+from pgs_recon.toolchain import Recorder
 
 
 def get_tag_option(tags, opts):
@@ -256,42 +256,51 @@ def export_view_pairs(path: Path, view_pairs: list):
             f.write(f'{a} {b}\n')
 
 
-def init_sfm_pgs(paths: Dict[str, Path], pairs_file_radius: int = 2,
-                 metadata: Dict = None):
-    """Init an SfM from a PGS Scan"""
+def init_sfm_pgs(scan_dir: Path, sfm_file: Path, cam_db: Path,
+                 view_pairs_file: Path = None, calib_file: Path = None,
+                 pairs_file_radius: int = 2,
+                 recorder: Recorder = None) -> Optional[Path]:
+    """Import a PGS Scan directory as an SfM scene, written to ``sfm_file``.
+
+    Not a binary wrapper -- the import happens in Python -- so it takes its paths
+    explicitly and records itself through ``recorder`` rather than through
+    :func:`toolchain.run`. A run that cannot say how its scene was imported is no
+    more reproducible for the distinction.
+
+    Returns the view pairs file if one was written, else ``None``: only the
+    importer knows whether the scan was a grid scan and so has spatial
+    neighbours to restrict matching to. Passing no ``view_pairs_file`` declines
+    them.
+    """
     logger = logging.getLogger(__name__)
     # Load the camera db
-    cam_db = sfm.openmvg_load_camdb(paths['CAM_DB'])
+    cam_db_data = sfm.openmvg_load_camdb(cam_db)
 
     # Load the calib if provided
     calib = None
-    if 'input_calib' in paths.keys():
+    if calib_file is not None:
         logger.info('Loading camera calibrations')
-        if metadata is not None:
-            metadata['commands'][
-                current_timestamp()] = f'load_cam_calib {str(paths["input_calib"])}'
-        calib = load_cam_calib(paths['input_calib'])
+        if recorder is not None:
+            recorder.note(f'load_cam_calib {calib_file}')
+        calib = load_cam_calib(Path(calib_file))
 
     # Load the pgs file
-    scene, view_pairs = import_pgs_scan(paths['input'].resolve(), cam_db=cam_db,
-                                        cam_calib=calib,
+    scene, view_pairs = import_pgs_scan(Path(scan_dir).resolve(),
+                                        cam_db=cam_db_data, cam_calib=calib,
                                         pairs_file_radius=pairs_file_radius)
-    if metadata is not None:
-        cmd = (f'import_pgs_scan(scan_dir={str(paths["input"])}, '
-               f'cam_db={str(paths["CAM_DB"])}, '
-               f'cam_calib={str(paths.get("input_calib", None))}, '
-               f'pairs_file_radius={pairs_file_radius})')
-        if calib:
-            cmd += f' {str(paths["input_calib"])}'
-        metadata['commands'][current_timestamp()] = cmd
+    if recorder is not None:
+        recorder.step('import_pgs_scan', scan_dir=scan_dir, cam_db=cam_db,
+                      cam_calib=calib_file,
+                      pairs_file_radius=pairs_file_radius)
 
     # Write the SFM
-    sfm.export_scene(path=paths['sfm'], scene=scene)
+    sfm.export_scene(path=sfm_file, scene=scene)
 
     # Write the view pairs
-    if view_pairs is not None:
-        paths['view_pairs'] = paths['matches_dir'] / 'pgs_view_pairs.txt'
-        export_view_pairs(paths['view_pairs'], view_pairs)
+    if view_pairs is None or view_pairs_file is None:
+        return None
+    export_view_pairs(Path(view_pairs_file), view_pairs)
+    return Path(view_pairs_file)
 
 
 def main():

@@ -1,8 +1,9 @@
 # Wrappers mirror the binary; the pipeline owns policy
 
-**Status: proposed — not yet implemented.** Describes MR2 of the issue #17
-series; see [the plan](../wrapper-refactor-plan.md). Until it lands, the wrappers
-still take a `paths` dict plus `*_key` strings as described under Context.
+**Status: accepted, implemented.** Landed as MR2 of the issue #17 series; see
+[the plan](../wrapper-refactor-plan.md). The artifact *names* are still the
+chained ones — that is [ADR 0006](./0006-stage-named-artifacts.md), which changes
+`layout.py`'s return values and nothing else.
 
 ## Context
 
@@ -56,7 +57,12 @@ nothing else.** Free functions, one per binary, no classes to instantiate.
 
 `StageTracker.key()` is deleted. It existed only to bridge the role→`Path` chain
 into the key convention by inventing synthetic `resume_<role>` keys;
-`tracker.path(role)` was always the real accessor.
+`tracker.path(role)` was always the real accessor. Its one load-bearing side
+effect — refusing to hand a stage a role nothing has produced — survives as
+`tracker.require(role)`, which returns the `Path` or raises `StageError`.
+`path()` remains for roles that may legitimately be unbound (`cloud`,
+`view_pairs`), and the tracker no longer takes a `paths` dict at all, only the
+output root.
 
 ## Consequences / non-obvious traps
 
@@ -74,6 +80,28 @@ into the key convention by inventing synthetic `resume_<role>` keys;
   test** asserting `-p` is in the argv whenever the `cloud` role is bound. Both
   0003 invariants are now testable for the first time; previously they held only
   because no caller passed anything else.
+- **The working directory is derived, not passed.** `toolchain.work_dir(*artifacts)`
+  returns the single directory its arguments share and raises if they disagree.
+  Every OpenMVS stage addresses its scene and geometry by basename against `-w`,
+  and `openMVG2openMVS` writes relative to `cwd`, so a wrapper that took the
+  directory as a parameter could be handed one its artifacts do not live in —
+  which fails inside the binary, on the file it *did* find, rather than at the
+  call. It is the third job in `toolchain` for that reason: it is about running,
+  not about naming. It raises `ArtifactsNotColocated`, a `ToolFailed` — the same
+  move `ToolNotFound` makes, so the mis-wiring lands in the run's log beside the
+  stage that caused it instead of as a traceback.
+- **Where the binary's own join is more forgiving, translate instead of
+  restricting.** `openMVG_main_SfM`'s `-M` looks like the same problem and is
+  not: `main_SfM.cpp` joins it onto `-m` with `create_filespec`, and that join
+  resolves `../`, so `sub/matches.bin` and `../other/matches.bin` both work — the
+  matches file need not be in the regions directory at all. Only an *absolute*
+  `-M` is broken, because stlplus concatenates (`/regions//abs/path`). So
+  `toolchain.relative_to_dir(artifact, directory)` returns the spelling the
+  binary will resolve rather than rejecting anything: the wrapper stays a
+  complete library surface over the flag, which is this ADR's whole premise, and
+  the one unusable spelling becomes unreachable by construction. An earlier
+  revision enforced co-location here; that was a restriction the binary does not
+  impose, and the distinction is why the two helpers differ.
 - **`resolve_exe` validates against the local filesystem, so it is incompatible
   with containerized remote execution.** Where a binary lives is a property of
   the execution environment, not of the submitting process. If Slurm/Apptainer
@@ -107,6 +135,18 @@ into the key convention by inventing synthetic `resume_<role>` keys;
 - **`metadata['paths']` shrinks to the output layout.** Nothing reads it
   programmatically: `recon_dir.py` resolves artifacts from the stage records and,
   failing that, the command log.
+- **`--path` lost its `/usr/local/` default**, in `pgs-recon`, `pgs-retexture`
+  and `pgs-calibrate` alike. A parser default is passed to `configure()` like any
+  other value, so it would shadow `$PGS_RECON_PREFIX` and make that tier
+  unreachable from every entry point we ship. The default now lives in exactly
+  one place, `toolchain.DEFAULT_PREFIX`. For the same reason `path` is in
+  `NO_PERSIST` (ADR 0004): a prefix inherited from the manifest would shadow the
+  environment on every job after the first, which is where a staged run most
+  needs it. Consequence: the config file each app
+  writes omits **every** unset argument, because a literal `path = None` read
+  back through `-c` would be parsed as the string `'None'` and send the run
+  looking for its binaries under `./None`. (That trap already existed for
+  `focal-length` and friends; `--path` is what made it worth fixing.)
 - **The Python importers are not binary wrappers.** `init_sfm_generic2` and
   `init_sfm_pgs` stay free functions outside the toolchain, taking explicit
   `Path`s. `init_sfm_pgs` returns `Optional[Path]` for the view-pairs file: only

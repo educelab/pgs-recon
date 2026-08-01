@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from pgs_recon import layout
 from pgs_recon.stages import (StageError, StageTracker, drifted_stages,
                               load_manifest, pipeline_shape, resolve_range)
 
@@ -23,101 +24,93 @@ from test_stages import build_records, make_args, quiet_logger
 def fake_run(tracker, args) -> None:
     """Drive every stage in ``tracker``'s range through ``begin()``/``end()``.
 
-    Mirrors ``run_pipeline``'s role wiring exactly, but derives each output name
-    the way the OpenMVG/OpenMVS wrappers do -- from its input path's stem --
-    instead of launching the binary that would write it.
+    Mirrors ``run_pipeline``'s role wiring and its ``layout`` calls exactly,
+    minus the binary each stage would launch. ``test_pipeline`` is what checks
+    that the real thing wires the same roles; this exercises the records.
     """
-    paths = tracker.paths
+    root = tracker.root
 
     if tracker.begin('import'):
-        outputs = {'sfm': paths['sfm']}
+        outputs = {'sfm': layout.imported_sfm(root)}
         if args.import_pgs_scan:
-            outputs['view_pairs'] = paths['mvg'] / 'view_pairs.txt'
-        tracker.end('import', inputs={'images': paths['input']},
+            outputs['view_pairs'] = layout.view_pairs(root)
+        tracker.end('import', inputs={'images': Path(args.input)},
                     outputs=outputs)
 
     if tracker.begin('features'):
-        sfm_in = tracker.key('sfm')
-        tracker.end('features', inputs={'sfm': paths[sfm_in]},
-                    outputs={'features': paths['matches_dir']})
+        sfm_in = tracker.require('sfm')
+        tracker.end('features', inputs={'sfm': sfm_in},
+                    outputs={'features': layout.matches_dir(root)})
 
     if tracker.begin('matches'):
-        sfm_in, features_in = tracker.key('sfm'), tracker.key('features')
+        sfm_in, features_in = tracker.require('sfm'), tracker.require('features')
         pairs = tracker.path('view_pairs') if args.import_pgs_scan else None
-        tracker.end('matches', inputs={'sfm': paths[sfm_in],
-                                       'features': paths[features_in],
+        tracker.end('matches', inputs={'sfm': sfm_in, 'features': features_in,
                                        'view_pairs': pairs},
-                    outputs={'matches': paths['matches_file']})
+                    outputs={'matches': layout.matches(root)})
 
     if tracker.begin('filter'):
-        sfm_in, matches_in = tracker.key('sfm'), tracker.key('matches')
-        m = paths[matches_in]
-        tracker.end('filter', inputs={'sfm': paths[sfm_in], 'matches': m},
+        sfm_in, matches_in = tracker.require('sfm'), tracker.require('matches')
+        tracker.end('filter', inputs={'sfm': sfm_in, 'matches': matches_in},
                     outputs={'matches_filtered':
-                             m.parent / (m.stem + '_filtered' + m.suffix)})
+                             layout.matches_filtered(matches_in)})
 
     if tracker.begin('sfm'):
-        in_key, features_in = tracker.key('sfm'), tracker.key('features')
-        inputs = {'sfm': paths[in_key], 'features': paths[features_in]}
+        sfm_in, features_in = tracker.require('sfm'), tracker.require('features')
+        inputs = {'sfm': sfm_in, 'features': features_in}
         if args.mvg_recon_method == 'direct':
-            matches_in = tracker.key('matches')
-            inputs['matches'] = paths[matches_in]
-            out = paths['recon_dir'] / (paths[in_key].stem + '_structured.bin')
+            inputs['matches'] = tracker.require('matches')
+            out = layout.robust_sfm(root, sfm_in)
         else:
-            filtered_in = tracker.key('matches_filtered')
-            inputs['matches_filtered'] = paths[filtered_in]
-            out = paths['recon_dir'] / 'sfm_data.bin'
+            inputs['matches_filtered'] = tracker.require('matches_filtered')
+            out = layout.solved_sfm(root)
         tracker.end('sfm', inputs=inputs, outputs={'sfm': out})
 
     if tracker.begin('robust'):
-        in_key = tracker.key('sfm')
-        features_in, matches_in = tracker.key('features'), tracker.key('matches')
+        sfm_in = tracker.require('sfm')
+        features_in, matches_in = (tracker.require('features'),
+                                   tracker.require('matches'))
         tracker.end('robust',
-                    inputs={'sfm': paths[in_key],
-                            'features': paths[features_in],
-                            'matches': paths[matches_in]},
-                    outputs={'sfm': paths['recon_dir']
-                             / (paths[in_key].stem + '_structured.bin')})
+                    inputs={'sfm': sfm_in, 'features': features_in,
+                            'matches': matches_in},
+                    outputs={'sfm': layout.robust_sfm(root, sfm_in)})
 
     if tracker.begin('autoscale'):
-        in_key = tracker.key('sfm')
-        tracker.end('autoscale', inputs={'sfm': paths[in_key]},
-                    outputs={'sfm': paths['recon_dir']
-                             / (paths[in_key].stem + '_scaled.bin')})
+        sfm_in = tracker.require('sfm')
+        tracker.end('autoscale', inputs={'sfm': sfm_in},
+                    outputs={'sfm': layout.autoscale_sfm(root, sfm_in)})
 
     if tracker.begin('colorize'):
-        p = paths[tracker.key('sfm')]
-        tracker.end('colorize', inputs={'sfm': p},
-                    outputs={'colorized':
-                             p.parent / (p.stem + '_colorized.ply')})
+        sfm_in = tracker.require('sfm')
+        tracker.end('colorize', inputs={'sfm': sfm_in},
+                    outputs={'colorized': layout.colorize_sfm(sfm_in)})
 
     if tracker.begin('convert'):
-        in_key = tracker.key('sfm')
-        tracker.end('convert', inputs={'sfm': paths[in_key]},
-                    outputs={'scene': paths['mvs_scene']})
+        sfm_in = tracker.require('sfm')
+        tracker.end('convert', inputs={'sfm': sfm_in},
+                    outputs={'scene': layout.convert_scene(root)})
 
     if tracker.begin('densify'):
-        p = paths[tracker.key('scene')]
-        dense = p.parent / (p.stem + '_dense.mvs')
-        tracker.end('densify', inputs={'scene': p},
-                    outputs={'scene': dense, 'cloud': dense.with_suffix('.ply')})
+        scene_in = tracker.require('scene')
+        tracker.end('densify', inputs={'scene': scene_in},
+                    outputs={'scene': layout.densify_scene(scene_in),
+                             'cloud': layout.densify_cloud(scene_in)})
 
     if tracker.begin('reconstruct'):
-        p = paths[tracker.key('scene')]
-        cloud = tracker.path('cloud') if tracker.has('cloud') else None
-        tracker.end('reconstruct', inputs={'scene': p, 'cloud': cloud},
-                    outputs={'mesh': p.parent / (p.stem + '_mesh.ply')})
+        scene_in, cloud = tracker.require('scene'), tracker.path('cloud')
+        tracker.end('reconstruct', inputs={'scene': scene_in, 'cloud': cloud},
+                    outputs={'mesh': layout.reconstruct_mesh(scene_in)})
 
     if tracker.begin('refine'):
-        p, mesh = paths[tracker.key('scene')], paths[tracker.key('mesh')]
-        tracker.end('refine', inputs={'scene': p, 'mesh': mesh},
-                    outputs={'mesh': p.parent / (p.stem + '_refine.ply')})
+        scene_in, mesh_in = tracker.require('scene'), tracker.require('mesh')
+        tracker.end('refine', inputs={'scene': scene_in, 'mesh': mesh_in},
+                    outputs={'mesh': layout.refine_mesh(scene_in)})
 
     if tracker.begin('texture'):
-        p, mesh = paths[tracker.key('scene')], paths[tracker.key('mesh')]
-        tracker.end('texture', inputs={'scene': p, 'mesh': mesh},
-                    outputs={'mesh': p.parent
-                             / f'{args.name}.{args.file_type}'})
+        scene_in, mesh_in = tracker.require('scene'), tracker.require('mesh')
+        tracker.end('texture', inputs={'scene': scene_in, 'mesh': mesh_in},
+                    outputs={'mesh': layout.final_mesh(root, args.name,
+                                                       args.file_type)})
 
 
 def modelled_part(records: dict) -> dict:
@@ -148,25 +141,15 @@ class TrackerCase(unittest.TestCase):
         self.root = top / 'recon'
         self.root.mkdir()
         self.images = top / 'images'
-        self.manifest = self.root / 'metadata.json'
-        mvg = self.root / 'mvg'
-        self.base_paths = {
-            'output': self.root,
-            'input': self.images,
-            'mvg': mvg,
-            'matches_dir': mvg / 'matches_dir',
-            'matches_file': mvg / 'matches_dir' / 'matches.bin',
-            'recon_dir': mvg / 'recon_dir',
-            'sfm': mvg / 'sfm_data.json',
-            'mvs': self.root / 'mvs',
-            'mvs_scene': self.root / 'mvs' / 'scene.mvs',
-        }
+        self.manifest = layout.manifest(self.root)
+        self.sfm = layout.imported_sfm(self.root)
+        self.scene = layout.convert_scene(self.root)
 
     def tracker(self, args, explicit=(), manifest=None) -> StageTracker:
         """A tracker over what is on disk now, as a fresh process would build it.
 
-        Each call gets its own ``paths`` copy, so one simulated job cannot see
-        another's rehydrated ``resume_*`` keys.
+        Each call builds its own, from the manifest alone, so one simulated job
+        cannot see another's live bindings.
         """
         path = manifest or self.manifest
         meta = load_manifest(path)
@@ -174,7 +157,7 @@ class TrackerCase(unittest.TestCase):
         from_stage, to_stage = resolve_range(args, shape)
         drift = drifted_stages(args, meta.get('stages') or {}, set(explicit),
                               shape)
-        return StageTracker(meta, path, dict(self.base_paths), args, shape,
+        return StageTracker(meta, path, self.root, args, shape,
                             from_stage, to_stage, rerun=args.rerun, drift=drift,
                             logger=quiet_logger())
 
@@ -201,7 +184,7 @@ class TestRecords(TrackerCase):
         tracker = self.tracker(args)
         tracker.begin('import')
         tracker.end('import', inputs={'images': self.images},
-                    outputs={'sfm': self.base_paths['sfm']})
+                    outputs={'sfm': self.sfm})
         record = self.records()['import']
         self.assertEqual('complete', record['status'])
         self.assertIn('finished', record)
@@ -211,8 +194,8 @@ class TestRecords(TrackerCase):
     def test_recorded_paths_are_relative_to_the_output_dir(self):
         tracker = self.tracker(make_args())
         tracker.begin('convert')
-        tracker.end('convert', inputs={'sfm': self.base_paths['sfm']},
-                    outputs={'scene': self.base_paths['mvs_scene']})
+        tracker.end('convert', inputs={'sfm': self.sfm},
+                    outputs={'scene': self.scene})
         record = self.records()['convert']
         self.assertEqual({'sfm': 'mvg/sfm_data.json'}, record['inputs'])
         self.assertEqual({'scene': 'mvs/scene.mvs'}, record['outputs'])
@@ -223,7 +206,7 @@ class TestRecords(TrackerCase):
         tracker = self.tracker(make_args())
         tracker.begin('import')
         tracker.end('import', inputs={'images': Path('images')},
-                    outputs={'sfm': self.base_paths['sfm']})
+                    outputs={'sfm': self.sfm})
         recorded = self.records()['import']['inputs']['images']
         self.assertTrue(Path(recorded).is_absolute(), recorded)
         self.assertEqual(str(Path('images').resolve()), recorded)
@@ -232,7 +215,7 @@ class TestRecords(TrackerCase):
         tracker = self.tracker(make_args())
         tracker.begin('reconstruct')
         tracker.end('reconstruct',
-                    inputs={'scene': self.base_paths['mvs_scene'],
+                    inputs={'scene': self.scene,
                             'cloud': None},
                     outputs={'mesh': self.root / 'mvs' / 'scene_mesh.ply'})
         self.assertEqual(['scene'], list(self.records()['reconstruct']['inputs']))
@@ -242,7 +225,7 @@ class TestRecords(TrackerCase):
         tracker.meta.setdefault('commands', {})['t0'] = 'before any stage'
         tracker.begin('convert')
         tracker.meta['commands']['t1'] = 'openMVG2openMVS -i ...'
-        tracker.end('convert', outputs={'scene': self.base_paths['mvs_scene']})
+        tracker.end('convert', outputs={'scene': self.scene})
         self.assertEqual(['openMVG2openMVS -i ...'],
                          self.records()['convert']['commands'])
 
@@ -263,11 +246,11 @@ class TestChain(TrackerCase):
     def test_outputs_rebind_the_chain_for_later_stages(self):
         tracker = self.tracker(make_args())
         tracker.begin('import')
-        tracker.end('import', outputs={'sfm': self.base_paths['sfm']})
-        self.assertEqual(self.base_paths['sfm'], tracker.path('sfm'))
+        tracker.end('import', outputs={'sfm': self.sfm})
+        self.assertEqual(self.sfm, tracker.path('sfm'))
         tracker.begin('features')
         tracker.end('features', outputs={'features': self.root / 'mvg/md'})
-        solved = self.base_paths['recon_dir'] / 'sfm_data.bin'
+        solved = layout.solved_sfm(self.root)
         tracker.begin('sfm')
         tracker.end('sfm', outputs={'sfm': solved})
         self.assertEqual(solved, tracker.path('sfm'))
@@ -281,23 +264,22 @@ class TestChain(TrackerCase):
         self.assertFalse(tracker.begin('convert'))
         self.assertEqual(self.root / 'mvs/scene.mvs', tracker.path('scene'))
 
-    def test_key_rehydrates_under_a_stable_synthetic_key(self):
+    def test_a_later_job_requires_the_mesh_the_last_one_recorded(self):
         args = make_args()
         fake_run(self.tracker(args), args)
         tracker = self.tracker(make_args(from_stage='texture', rerun=True))
         self.assertTrue(tracker.begin('texture'))
-        self.assertEqual('resume_mesh', tracker.key('mesh'))
         # RefineMesh names its output after the scene it refined against, not
         # after the mesh it consumed.
         self.assertEqual(self.root / 'mvs/scene_refine.ply',
-                         tracker.paths['resume_mesh'])
+                         tracker.require('mesh'))
 
 
 class TestAbort(TrackerCase):
     def test_abort_marks_the_active_stage_failed(self):
         tracker = self.tracker(make_args())
         tracker.begin('import')
-        tracker.end('import', outputs={'sfm': self.base_paths['sfm']})
+        tracker.end('import', outputs={'sfm': self.sfm})
         tracker.begin('features')
         tracker.abort()
         records = self.records()
@@ -334,7 +316,7 @@ class TestManifestFailures(TrackerCase):
         tracker.begin('import')
         tracker.manifest_path = self.broken()  # the directory goes away
         with self.assertRaises(StageError):
-            tracker.end('import', outputs={'sfm': self.base_paths['sfm']})
+            tracker.end('import', outputs={'sfm': self.sfm})
 
     def test_abort_tolerates_a_manifest_it_cannot_write(self):
         # It runs while an exception is propagating; raising here would replace
@@ -425,7 +407,7 @@ class TestStagedJobs(TrackerCase):
                                         to_stage='import')), args)
         job2 = self.tracker(make_args(import_pgs_scan=True,
                                       from_stage='features'))
-        self.assertEqual(self.root / 'mvg/view_pairs.txt',
+        self.assertEqual(layout.view_pairs(self.root),
                          job2.path('view_pairs'))
 
     def test_dropping_densify_rebuilds_the_mesh_chain_against_real_records(self):

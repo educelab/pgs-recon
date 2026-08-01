@@ -11,6 +11,7 @@ import exiftool
 import configargparse
 import sfm_utils as sfm
 
+from pgs_recon import layout, toolchain
 from pgs_recon.openmvg import (compute_features, compute_matches,
                                geometric_filter, init_sfm_generic,
                                mvg_colorize_sfm, mvg_compute_known, mvg_sfm,
@@ -24,13 +25,18 @@ from pgs_recon.stages import (CONTROL_ARGS, NO_PERSIST, STAGES, StageError,
                               pipeline_shape, resolve_range,
                               revert_out_of_range, utc_now, validate_arg_map,
                               write_manifest)
-from pgs_recon.utility import ToolFailed, current_timestamp
+from pgs_recon.toolchain import Recorder
+from pgs_recon.utility import ToolFailed
 from pgs_recon.utils.apps import setup_logging
 
 
-def init_sfm_generic2(scan_dir: Path, sfm_file: Path, camdb_path: Path):
+def init_sfm_generic2(scan_dir: Path, sfm_file: Path, camdb_path: Path,
+                      recorder: Recorder = None):
     """Init an SfM scene from the given directory"""
     logger = logging.getLogger(__name__)
+    if recorder is not None:
+        recorder.step('init_sfm_generic2', scan_dir=scan_dir,
+                      sfm_file=sfm_file, camdb_path=camdb_path)
     # Load the camera db
     cam_db = sfm.openmvg_load_camdb(camdb_path)
 
@@ -139,8 +145,10 @@ def build_parser() -> configargparse.ArgumentParser:
     parser.add_argument('--log-level', default='INFO', type=str.upper,
                         choices=['ERROR', 'WARNING', 'INFO', 'DEBUG'])
 
-    # Hidden opts
-    parser.add_argument('--path', type=str, default='/usr/local/',
+    # Hidden opts. --path has no default of its own: unset, the install prefix
+    # falls through to $PGS_RECON_PREFIX and then to toolchain.DEFAULT_PREFIX,
+    # which giving it a default here would shadow.
+    parser.add_argument('--path', type=str, default=None,
                         help=configargparse.SUPPRESS)
     parser.add_argument('--threads', type=int, help=configargparse.SUPPRESS)
 
@@ -355,7 +363,7 @@ def _main():
     explicit = explicit_dests(build_parser, sys.argv[1:])
 
     out_dir = Path(args.output).resolve()
-    manifest_path = out_dir / 'metadata.json'
+    manifest_path = layout.manifest(out_dir)
 
     # Load the previous run(s) in this directory. Recorded effective arguments
     # become defaults, so --input/--name are not needed to resume.
@@ -392,37 +400,28 @@ def _main():
     if args.mask_value is not None and args.mask_value < 0:
         args.mask_value = None
 
-    # Structure for storing important paths
+    # Where the binaries are and what records their invocations: process-wide, so
+    # no stage takes either as an argument (ADR 0005). The command log has to
+    # exist before the recorder wraps it, and the recorder before any stage runs.
+    recorder = Recorder(metadata.setdefault('commands', {}))
+    toolchain.configure(prefix=args.path, recorder=recorder)
+
+    # The output layout, kept only for the manifest's own record of where a run
+    # put things: nothing reads it back, and artifact names come from ``layout``.
     logger.info('Setting up output directories')
     paths = {
-        'PATH': Path(args.path).resolve(),
         'output': out_dir,
+        'mvg': layout.mvg_dir(out_dir),
+        'matches_dir': layout.matches_dir(out_dir),
+        'recon_dir': layout.recon_dir(out_dir),
+        'mvs': layout.mvs_dir(out_dir),
+        'undistorted_images': layout.undistorted_images(out_dir),
+        'metadata': manifest_path,
     }
     if args.input is not None:
         paths['input'] = Path(args.input)
     if args.import_calib:
         paths['input_calib'] = Path(args.import_calib)
-    paths['BIN'] = paths['PATH'] / 'bin'
-    paths['MVS_BIN'] = paths['BIN'] / 'OpenMVS'
-    if args.cam_db is None:
-        db_path = 'lib/openMVG/sensor_width_camera_database.txt'
-        paths['CAM_DB'] = paths['PATH'] / db_path
-    else:
-        paths['CAM_DB'] = Path(args.cam_db).resolve()
-
-    # Setup output directory names
-    paths['mvg'] = paths['output'] / 'mvg'
-    paths['matches_dir'] = paths['mvg'] / 'matches_dir'
-    paths['matches_file'] = paths['matches_dir'] / 'matches.bin'
-    # The filtered matches are not pre-seeded here: geometric_filter derives the
-    # name from its input and the sfm stage reads it back through the
-    # matches_filtered binding, so there is only one place it is spelled.
-    paths['recon_dir'] = paths['mvg'] / 'recon_dir'
-    paths['sfm'] = paths['mvg'] / 'sfm_data.json'
-    paths['mvs'] = paths['output'] / 'mvs'
-    paths['mvs_scene'] = paths['mvs'] / 'scene.mvs'
-    paths['mvs_images'] = paths['mvs'] / 'undistorted_images'
-    paths['metadata'] = manifest_path
 
     # Setup experiment
     experiment_start = dt.now(tz.utc)
@@ -435,12 +434,13 @@ def _main():
         args.name = datetime_str + '_' + str(Path(args.input).stem)
     # One config per reconstruction, not per job; metadata.json's 'runs' has the
     # per-invocation history.
-    config = paths['output'] / f'{args.name}_recon_config.txt'
+    config = layout.config(out_dir, args.name)
+    paths['config'] = config
 
     # Resolve the plan. The tracker reads the manifest and the merged arguments
     # and touches nothing else, so everything up to here is safe under --dry-run.
     drift = drifted_stages(args, metadata.get('stages') or {}, explicit, shape)
-    tracker = StageTracker(metadata, manifest_path, paths, args, shape,
+    tracker = StageTracker(metadata, manifest_path, out_dir, args, shape,
                            from_stage, to_stage, rerun=args.rerun, drift=drift,
                            logger=logger)
     tracker.log_plan()
@@ -466,17 +466,21 @@ def _main():
         return
 
     # Create output folders
-    for d in 'output', 'mvg', 'matches_dir', 'recon_dir', 'mvs':
-        paths[d].mkdir(exist_ok=True, parents=True)
+    for d in layout.directories(out_dir):
+        d.mkdir(exist_ok=True, parents=True)
 
     # Write config after all arguments have been changed. Flow-control flags are
-    # left out so the file stays usable as a -c config for another run.
+    # left out so the file stays usable as a -c config for another run, and so
+    # are unset ones: a literal `focal-length = None` read back would be parsed
+    # as the string 'None' rather than as the default it stands for.
     args.config = str(config)
     with config.open(mode='w') as file:
         for arg in vars(args):
             if arg in CONTROL_ARGS:
                 continue
             attr = getattr(args, arg)
+            if attr is None:
+                continue
             arg = arg.replace('_', '-')
             file.write(f'{arg} = {attr}\n')
 
@@ -489,7 +493,6 @@ def _main():
     metadata['effective_args'] = {k: v for k, v in vars(args).items()
                                   if k not in NO_PERSIST}
     metadata['shape'] = list(shape)
-    metadata.setdefault('commands', {})
     metadata.setdefault('runs', []).append({
         'argv': " ".join(sys.argv),
         'started': utc_now(),
@@ -507,7 +510,7 @@ def _main():
     flush_manifest()
 
     try:
-        run_pipeline(tracker, paths, args, metadata, logger)
+        run_pipeline(tracker, args, out_dir, recorder, logger)
     except BaseException:
         # A failed binary raises ToolFailed past here; anything not marked
         # complete is re-runnable, but recording 'failed' makes the reason
@@ -515,55 +518,64 @@ def _main():
         tracker.abort()
         raise
 
-    metadata['commands'][current_timestamp()] = "Processing complete"
-    logger.info(f'Processing complete. Results saved to: {paths["output"]}')
+    recorder.note('Processing complete')
+    logger.info(f'Processing complete. Results saved to: {out_dir}')
 
 
-def run_pipeline(tracker: StageTracker, paths, args, metadata, logger):
+def run_pipeline(tracker: StageTracker, args, output: Path,
+                 recorder: Recorder, logger):
     """Run the stages in the tracker's range, in pipeline order.
 
-    Each block asks the tracker whether its stage runs, rehydrates its inputs
-    from the artifact chain, and reports the outputs back under semantic roles.
-    Because the OpenMVG/OpenMVS wrappers derive output filenames from the input
-    ``Path``'s stem and not from the ``paths`` key, a staged run produces exactly
-    the filenames a single-shot run would.
+    Each block asks the tracker whether its stage runs, takes its inputs from the
+    artifact chain (``require`` for what a stage cannot run without, ``path`` for
+    what may legitimately be absent), names its outputs through ``layout``, and
+    reports them back under semantic roles. Because a name is derived from the
+    input paths and nothing else, a staged run produces exactly the filenames a
+    single-shot run would.
+
+    The invariants that are ours rather than the binaries' live here, not in the
+    wrappers (ADR 0005): notably that ``reconstruct`` is handed the dense cloud
+    whenever densify ran.
     """
+    images = Path(args.input) if args.input is not None else None
+    cam_db = toolchain.cam_db(args.cam_db)
+
     if tracker.begin('import'):
         logger.info('Importing dataset')
-        outputs = {'sfm': paths['sfm']}
+        imported = layout.imported_sfm(output)
+        outputs = {'sfm': imported}
         if args.import_pgs_scan:
-            init_sfm_pgs(paths, pairs_file_radius=args.matching_pairs_radius,
-                         metadata=metadata)
-            if paths.get('view_pairs') is not None:
-                outputs['view_pairs'] = paths['view_pairs']
+            pairs = init_sfm_pgs(
+                images, sfm_file=imported, cam_db=cam_db,
+                view_pairs_file=layout.view_pairs(output),
+                calib_file=args.import_calib,
+                pairs_file_radius=args.matching_pairs_radius,
+                recorder=recorder)
+            if pairs is not None:
+                outputs['view_pairs'] = pairs
         elif args.new_importer:
-            metadata['commands'][current_timestamp()] = (
-                f'init_sfm_generic2(scan_dir={paths["input"]}, '
-                f'sfm_file={paths["sfm"]}, camdb_path={paths["CAM_DB"]})')
-            init_sfm_generic2(paths['input'].resolve(),
-                              sfm_file=paths['sfm'],
-                              camdb_path=paths['CAM_DB'])
+            init_sfm_generic2(images.resolve(), sfm_file=imported,
+                              camdb_path=cam_db, recorder=recorder)
         else:
-            init_sfm_generic(paths, focal_length=args.focal_length,
-                             metadata=metadata)
-        tracker.end('import', inputs={'images': paths.get('input')},
-                    outputs=outputs)
+            init_sfm_generic(images, output_dir=layout.mvg_dir(output),
+                             cam_db=cam_db, focal_length=args.focal_length)
+        tracker.end('import', inputs={'images': images}, outputs=outputs)
 
     if tracker.begin('features'):
         logger.info('Computing image features')
-        sfm_in = tracker.key('sfm')
-        out_key = compute_features(paths, sfm_key=sfm_in,
-                                   method=args.describer_method,
-                                   preset=args.describer_preset,
-                                   upright=args.describer_upright,
-                                   metadata=metadata, threads=args.threads)
-        tracker.end('features', inputs={'sfm': paths[sfm_in]},
-                    outputs={'features': paths[out_key]})
+        sfm_in = tracker.require('sfm')
+        features = layout.matches_dir(output)
+        compute_features(sfm_in, output_dir=features,
+                         method=args.describer_method,
+                         preset=args.describer_preset,
+                         upright=args.describer_upright, threads=args.threads)
+        tracker.end('features', inputs={'sfm': sfm_in},
+                    outputs={'features': features})
 
     if tracker.begin('matches'):
         logger.info('Matching image features')
-        sfm_in = tracker.key('sfm')
-        features_in = tracker.key('features')
+        sfm_in = tracker.require('sfm')
+        features_in = tracker.require('features')
         pairs_file = args.matching_pairs_file
         if pairs_file is None or pairs_file.lower() == 'none':
             pairs_file = None
@@ -571,153 +583,151 @@ def run_pipeline(tracker: StageTracker, paths, args, metadata, logger):
             # The importer's view pairs file, from this run or an earlier job
             pairs_file = (tracker.path('view_pairs')
                           if args.import_pgs_scan else None)
-        paths['view_pairs'] = pairs_file
-        out_key = compute_matches(paths, sfm_key=sfm_in,
-                                  method=args.matching_method,
-                                  ratio=args.matching_ratio,
-                                  pairs_file=pairs_file, metadata=metadata)
-        tracker.end('matches', inputs={'sfm': paths[sfm_in],
-                                       'features': paths[features_in],
+        else:
+            pairs_file = Path(pairs_file)
+        matches = layout.matches(output)
+        compute_matches(sfm_in, output=matches, method=args.matching_method,
+                        ratio=args.matching_ratio, pairs_file=pairs_file)
+        tracker.end('matches', inputs={'sfm': sfm_in, 'features': features_in,
                                        'view_pairs': pairs_file},
-                    outputs={'matches': paths[out_key]})
+                    outputs={'matches': matches})
 
     if tracker.begin('filter'):
         logger.info('Filtering image features')
-        sfm_in = tracker.key('sfm')
-        matches_in = tracker.key('matches')
-        out_key = geometric_filter(paths, sfm_key=sfm_in,
-                                   matches_key=matches_in,
-                                   model=args.matching_geometric_model,
-                                   metadata=metadata)
-        tracker.end('filter', inputs={'sfm': paths[sfm_in],
-                                      'matches': paths[matches_in]},
-                    outputs={'matches_filtered': paths[out_key]})
+        sfm_in = tracker.require('sfm')
+        matches_in = tracker.require('matches')
+        filtered = layout.matches_filtered(matches_in)
+        geometric_filter(sfm_in, matches=matches_in, output=filtered,
+                         model=args.matching_geometric_model)
+        tracker.end('filter', inputs={'sfm': sfm_in, 'matches': matches_in},
+                    outputs={'matches_filtered': filtered})
 
     if tracker.begin('sfm'):
-        in_key = tracker.key('sfm')
-        features_in = tracker.key('features')
-        inputs = {'sfm': paths[in_key], 'features': paths[features_in]}
+        sfm_in = tracker.require('sfm')
+        features_in = tracker.require('features')
+        inputs = {'sfm': sfm_in, 'features': features_in}
         if args.mvg_recon_method == 'direct':
             # Triangulating known poses uses the unfiltered matches
             logger.info('Computing structure from known poses')
-            matches_in = tracker.key('matches')
-            inputs['matches'] = paths[matches_in]
-            out_key = mvg_compute_known(paths, sfm_key=in_key,
-                                        features_key=features_in,
-                                        matches_key=matches_in, direct=True,
-                                        bundle_adjustment=args.sfm_ba,
-                                        metadata=metadata)
+            matches_in = tracker.require('matches')
+            inputs['matches'] = matches_in
+            solved = layout.robust_sfm(output, sfm_in)
+            mvg_compute_known(sfm_in, features_dir=features_in,
+                              matches=matches_in, output=solved, direct=True,
+                              bundle_adjustment=args.sfm_ba)
         else:
             logger.info(f'Running SfM (Engine: {args.mvg_recon_method})')
-            filtered_in = tracker.key('matches_filtered')
-            inputs['matches_filtered'] = paths[filtered_in]
-            out_key = mvg_sfm(paths, sfm_key=in_key, features_key=features_in,
-                              matches_key=filtered_in,
-                              engine=args.mvg_recon_method,
-                              use_priors=args.mvg_priors,
-                              refine_intrinsics=args.mvg_refine_intrinsics,
-                              initializer=args.mvg_initializer,
-                              metadata=metadata)
-        tracker.end('sfm', inputs=inputs, outputs={'sfm': paths[out_key]})
+            filtered_in = tracker.require('matches_filtered')
+            inputs['matches_filtered'] = filtered_in
+            # openMVG_main_SfM names its own output, so the wrapper reports it.
+            solved = mvg_sfm(sfm_in, features_dir=features_in,
+                             matches=filtered_in,
+                             output_dir=layout.recon_dir(output),
+                             engine=args.mvg_recon_method,
+                             use_priors=args.mvg_priors,
+                             refine_intrinsics=args.mvg_refine_intrinsics,
+                             initializer=args.mvg_initializer)
+        tracker.end('sfm', inputs=inputs, outputs={'sfm': solved})
 
     if tracker.begin('robust'):
         logger.info('Performing robust triangulation')
-        in_key = tracker.key('sfm')
-        features_in = tracker.key('features')
-        matches_in = tracker.key('matches')
-        out_key = mvg_compute_known(paths, sfm_key=in_key,
-                                    features_key=features_in,
-                                    matches_key=matches_in,
-                                    bundle_adjustment=args.robust_ba,
-                                    metadata=metadata)
-        tracker.end('robust', inputs={'sfm': paths[in_key],
-                                      'features': paths[features_in],
-                                      'matches': paths[matches_in]},
-                    outputs={'sfm': paths[out_key]})
+        sfm_in = tracker.require('sfm')
+        features_in = tracker.require('features')
+        matches_in = tracker.require('matches')
+        robust = layout.robust_sfm(output, sfm_in)
+        mvg_compute_known(sfm_in, features_dir=features_in, matches=matches_in,
+                          output=robust, bundle_adjustment=args.robust_ba)
+        tracker.end('robust', inputs={'sfm': sfm_in, 'features': features_in,
+                                      'matches': matches_in},
+                    outputs={'sfm': robust})
 
     if tracker.begin('autoscale'):
         logger.info('Auto-scaling SfM scene')
-        in_key = tracker.key('sfm')
-        out_key = mvg_autoscale(paths=paths, sfm_key=in_key,
-                                marker_size=args.mvg_autoscale,
-                                detection_method=args.autoscale_method,
-                                marker_pix=args.autoscale_marker_pix,
-                                include_from=args.autoscale_include_from,
-                                exclude_from=args.autoscale_exclude_from,
-                                metadata=metadata)
-        tracker.end('autoscale', inputs={'sfm': paths[in_key]},
-                    outputs={'sfm': paths[out_key]})
+        sfm_in = tracker.require('sfm')
+        scaled = layout.autoscale_sfm(output, sfm_in)
+        mvg_autoscale(sfm_in, output=scaled, marker_size=args.mvg_autoscale,
+                      detection_method=args.autoscale_method,
+                      min_marker_pix=args.autoscale_marker_pix,
+                      include_from=args.autoscale_include_from,
+                      exclude_from=args.autoscale_exclude_from,
+                      landmarks=layout.landmarks(output),
+                      scaled_landmarks=layout.scaled_landmarks(output))
+        tracker.end('autoscale', inputs={'sfm': sfm_in},
+                    outputs={'sfm': scaled})
 
     # colorize is a leaf: it produces a side artifact, so its output is recorded
     # under its own role and the pre-colorize SfM stays the chained one.
     if tracker.begin('colorize'):
         logger.info('Colorizing SfM scene')
-        in_key = tracker.key('sfm')
-        out_key = mvg_colorize_sfm(paths, sfm_key=in_key, metadata=metadata)
-        tracker.end('colorize', inputs={'sfm': paths[in_key]},
-                    outputs={'colorized': paths[out_key]})
+        sfm_in = tracker.require('sfm')
+        colorized = layout.colorize_sfm(sfm_in)
+        mvg_colorize_sfm(sfm_in, output=colorized)
+        tracker.end('colorize', inputs={'sfm': sfm_in},
+                    outputs={'colorized': colorized})
 
     if tracker.begin('convert'):
         logger.info('Converting MVG scene to MVS scene')
-        in_key = tracker.key('sfm')
-        out_key = mvg_to_mvs(paths, sfm_key=in_key, metadata=metadata,
-                             threads=args.threads)
-        tracker.end('convert', inputs={'sfm': paths[in_key]},
-                    outputs={'scene': paths[out_key]})
+        sfm_in = tracker.require('sfm')
+        scene = layout.convert_scene(output)
+        mvg_to_mvs(sfm_in, scene=scene,
+                   images_dir=layout.undistorted_images(output),
+                   threads=args.threads)
+        tracker.end('convert', inputs={'sfm': sfm_in},
+                    outputs={'scene': scene})
 
     if tracker.begin('densify'):
         logger.info('Densifying point cloud')
-        in_key = tracker.key('scene')
-        scene_key, cloud_key = mvs_densify(
-            paths, mvs_key=in_key,
-            resolution_lvl=args.densify_resolution_level,
-            mask_value=args.mask_value, metadata=metadata)
-        tracker.end('densify', inputs={'scene': paths[in_key]},
-                    outputs={'scene': paths[scene_key],
-                             'cloud': paths[cloud_key]})
+        scene_in = tracker.require('scene')
+        scene = layout.densify_scene(scene_in)
+        cloud = layout.densify_cloud(scene_in)
+        mvs_densify(scene_in, output=scene,
+                    resolution_level=args.densify_resolution_level,
+                    ignore_mask_label=args.mask_value)
+        tracker.end('densify', inputs={'scene': scene_in},
+                    outputs={'scene': scene, 'cloud': cloud})
 
     if tracker.begin('reconstruct'):
         logger.info('Reconstructing mesh')
-        in_key = tracker.key('scene')
-        cloud_key = tracker.key('cloud') if tracker.has('cloud') else None
-        # Both builders hand the scene back untouched, so only the mesh is
+        scene_in = tracker.require('scene')
+        # ADR 0003: whenever densify ran, its dense cloud MUST be handed over --
+        # the scene it wrote still holds the sparse one, so omitting -p meshes
+        # that instead, silently.
+        cloud_in = tracker.path('cloud')
+        mesh = layout.reconstruct_mesh(scene_in)
+        mvs_reconstruct(scene_in, output=mesh, point_cloud=cloud_in,
+                        free_space_support=args.free_space_support,
+                        smooth=args.mvs_smooth)
+        # ReconstructMesh hands the scene back untouched, so only the mesh is
         # recorded as produced: see STAGE_IO on pass-through roles.
-        _, mesh_key = mvs_reconstruct(
-            paths, mvs_key=in_key, free_space=args.free_space_support,
-            smooth=args.mvs_smooth, pointcloud_key=cloud_key,
-            metadata=metadata)
         tracker.end('reconstruct',
-                    inputs={'scene': paths[in_key],
-                            'cloud': paths[cloud_key] if cloud_key else None},
-                    outputs={'mesh': paths[mesh_key]})
+                    inputs={'scene': scene_in, 'cloud': cloud_in},
+                    outputs={'mesh': mesh})
 
     if tracker.begin('refine'):
         logger.info('Refining mesh')
-        scene_in = tracker.key('scene')
-        mesh_in = tracker.key('mesh')
-        _, mesh_key = mvs_refine(
-            paths, mvs_key=scene_in, mesh_key=mesh_in,
-            decimation_factor=args.decimation_factor,
-            resolution_lvl=args.refine_resolution_level,
-            min_resolution=args.refine_min_resolution,
-            scales=args.refine_scales, scale_step=args.refine_scale_step,
-            metadata=metadata)
-        tracker.end('refine',
-                    inputs={'scene': paths[scene_in], 'mesh': paths[mesh_in]},
-                    outputs={'mesh': paths[mesh_key]})
+        scene_in = tracker.require('scene')
+        mesh_in = tracker.require('mesh')
+        refined = layout.refine_mesh(scene_in)
+        mvs_refine(scene_in, mesh=mesh_in, output=refined,
+                   decimate=args.decimation_factor,
+                   resolution_level=args.refine_resolution_level,
+                   min_resolution=args.refine_min_resolution,
+                   scales=args.refine_scales,
+                   scale_step=args.refine_scale_step)
+        tracker.end('refine', inputs={'scene': scene_in, 'mesh': mesh_in},
+                    outputs={'mesh': refined})
 
     if tracker.begin('texture'):
         logger.info('Texturing mesh')
-        scene_in = tracker.key('scene')
-        mesh_in = tracker.key('mesh')
-        out_key = mvs_texture(paths, mvs_key=scene_in, mesh_key=mesh_in,
-                              file_format=args.file_type,
-                              resolution_lvl=args.texture_resolution_level,
-                              max_size=args.texture_max_size,
-                              metadata=metadata, output_name=args.name)
-        tracker.end('texture',
-                    inputs={'scene': paths[scene_in], 'mesh': paths[mesh_in]},
-                    outputs={'mesh': paths[out_key]})
+        scene_in = tracker.require('scene')
+        mesh_in = tracker.require('mesh')
+        final = layout.final_mesh(output, args.name, args.file_type)
+        mvs_texture(scene_in, mesh=mesh_in, output=final,
+                    export_type=args.file_type,
+                    resolution_level=args.texture_resolution_level,
+                    max_texture_size=args.texture_max_size)
+        tracker.end('texture', inputs={'scene': scene_in, 'mesh': mesh_in},
+                    outputs={'mesh': final})
 
 
 if __name__ == '__main__':

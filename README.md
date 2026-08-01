@@ -262,6 +262,30 @@ After installation, the reconstruction script can be run from the shell:
 pgs-recon --help
 ```
 
+#### Telling the tools where the binaries are
+The Python pipeline shells out to the compiled OpenMVG/OpenMVS/`pgs-*` binaries,
+which it looks for under an install prefix containing `bin/` (OpenMVG and our own
+tools) and `bin/OpenMVS/`. Inside our Docker/Apptainer images that prefix is
+`/usr/local/`, which is the default, so nothing needs setting. Elsewhere — most
+often a CMake build left in its default `dependencies/installed/` — point
+`$PGS_RECON_PREFIX` at it:
+
+```shell
+export PGS_RECON_PREFIX="$PWD/dependencies/installed"
+pgs-recon -i images/ -o recon/ --name my-object
+```
+
+Every entry point (`pgs-recon`, `pgs-retexture`, `pgs-calibrate`) reads it, and
+each also takes a `--path <prefix>` argument that wins over the environment. A
+missing binary is reported with the path that was searched and which of the three
+tiers chose the prefix — the argument, the environment, or the built-in default —
+so a typo in any of them is unambiguous. The OpenMVG camera sensor database is
+expected at `<prefix>/lib/openMVG/sensor_width_camera_database.txt`.
+
+Unlike most arguments, `--path` is deliberately *not* inherited from a previous
+run's `metadata.json` when a staged run resumes (see `--from`/`--to` above), so
+each job of a split reconstruction picks up the prefix of the node it lands on.
+
 ### Advanced Installation
 #### Installation Location
 By default, executables created by this CMake project will be installed to 

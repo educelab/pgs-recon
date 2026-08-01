@@ -60,9 +60,11 @@ import configargparse
 import cv2
 import numpy as np
 
+from pgs_recon import toolchain
 from pgs_recon.openmvg import mvg_to_mvs
 from pgs_recon.openmvs import mvs_texture
-from pgs_recon.utility import ToolFailed, current_timestamp, run_command
+from pgs_recon.toolchain import Recorder, resolve_exe, run
+from pgs_recon.utility import ToolFailed
 from pgs_recon.utils.apps import setup_logging
 from pgs_recon.utils.images import prepare_8bit_image
 from pgs_recon.utils.recon_dir import (
@@ -288,7 +290,7 @@ def load_obj_mesh(mesh_path: Path):
 def project_texture_mesh(calibration_json: Path, texture_image: Path,
                          mesh_path: Path, out_obj: Path,
                          backface_cull: bool = True,
-                         metadata: Dict = None) -> None:
+                         recorder: Recorder = None) -> None:
     """Texture a mesh by projecting it through the calibrated view, so the OBJ's
     UVs index the *original* modality image directly (no OpenMVS atlas, no
     resampling). Because the UVs depend only on the camera + mesh — identical
@@ -368,29 +370,25 @@ def project_texture_mesh(calibration_json: Path, texture_image: Path,
         if len(Fu) > 0:
             np.savetxt(fh, Fu + 1, fmt='f %d %d %d')
 
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = (
-            f'project_texture_mesh mesh={mesh_path.name} '
-            f'texture={tex_dst.name} -> {out_obj.name}')
+    if recorder is not None:
+        recorder.note(f'project_texture_mesh mesh={mesh_path.name} '
+                      f'texture={tex_dst.name} -> {out_obj.name}')
     logger.info(f'Projected texture: {len(Fk)}/{len(F)} triangles textured '
                 f'({100.0 * len(Fk) / len(F):.1f}% of mesh in view); '
                 f'map_Kd={tex_dst.name} -> {out_obj}')
 
 
-def sfm_to_json(sfm_path: Path, out_json: Path, bin_dir: Path,
-                metadata: Dict = None) -> Path:
+def sfm_to_json(sfm_path: Path, out_json: Path) -> Path:
     """Export an OpenMVG SfM_Data (.bin/.json) to JSON with only views,
     intrinsics, and extrinsics (drops structure/control points). A ``.json``
     input is re-exported anyway to strip structure and normalize."""
     command = [
-        str(bin_dir / 'openMVG_main_ConvertSfM_DataFormat'),
-        '-i', str(sfm_path.resolve()),
-        '-o', str(out_json.resolve()),
+        resolve_exe('openMVG_main_ConvertSfM_DataFormat'),
+        '-i', sfm_path.resolve(),
+        '-o', out_json.resolve(),
         '-V', '-I', '-E',
     ]
-    if metadata is not None:
-        metadata['commands'][current_timestamp()] = ' '.join(command)
-    run_command(command)
+    run(command)
     return out_json
 
 
@@ -642,7 +640,9 @@ def _main():
                              '(off) to preserve source radiometry.')
     parser.add_argument('--threads', type=int, default=None,
                         help='Threads for openMVG2openMVS')
-    parser.add_argument('--path', type=str, default='/usr/local/',
+    # Unset, the install prefix falls through to $PGS_RECON_PREFIX and then to
+    # toolchain.DEFAULT_PREFIX, which a default here would shadow.
+    parser.add_argument('--path', type=str, default=None,
                         help=configargparse.SUPPRESS)
     parser.add_argument('--log-level', default='INFO', type=str.upper,
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -730,15 +730,9 @@ def _main():
     working_dir = Path(args.working_dir) if args.working_dir else recon_dir
     working_dir.mkdir(parents=True, exist_ok=True)
 
-    paths: Dict[str, Path] = {
-        'PATH': Path(args.path).resolve(),
-    }
-    paths['BIN'] = paths['PATH'] / 'bin'
-    paths['MVS_BIN'] = paths['BIN'] / 'OpenMVS'
-
     # Artifacts integrate into the recon's existing mvg/ and mvs/, prefixed by
     # <stem> so they sit beside the recon's files without overwriting them.
-    paths['working'] = working_dir
+    paths: Dict[str, Path] = {'working': working_dir}
     paths['mvg'] = working_dir / 'mvg'
     paths['mvs'] = working_dir / 'mvs'
     paths['mvg'].mkdir(parents=True, exist_ok=True)
@@ -763,11 +757,20 @@ def _main():
     args.config = str(config_path)
     with config_path.open('w') as f:
         for arg in vars(args):
+            # Unset arguments are omitted: a literal `path = None` read back
+            # through -c would be parsed as the string 'None'.
+            if getattr(args, arg) is None:
+                continue
             f.write(f"{arg.replace('_', '-')} = {getattr(args, arg)}\n")
 
     metadata = {'args': ' '.join(sys.argv), 'parsed': vars(args),
                 'commands': {}}
     paths['metadata'] = working_dir / f'{stem}_retexture_metadata.json'
+
+    # Where the binaries are and what records their invocations: process-wide, so
+    # no wrapper takes either as an argument (ADR 0005).
+    recorder = Recorder(metadata['commands'])
+    toolchain.configure(prefix=args.path, recorder=recorder)
 
     @atexit.register
     def write_metadata():
@@ -802,7 +805,7 @@ def _main():
             logger.info('Projecting mesh into calibrated view for UV mapping')
             project_texture_mesh(calibration, tex_img, mesh_in, out_obj,
                                  backface_cull=not args.no_backface_cull,
-                                 metadata=metadata)
+                                 recorder=recorder)
             logger.info(f'Done. Re-textured mesh: {out_obj}')
             return
         # OpenMVS path: undistortion reads pixels, so it needs an 8-bit image.
@@ -820,8 +823,7 @@ def _main():
         pos_to_name = convert_modality_images(pos_map, paths['modality_8bit'],
                                               args.bit_shift)
         logger.info('Exporting SfM solution to JSON')
-        sfm_to_json(sfm_data, paths['sfm_full'], paths['BIN'],
-                    metadata=metadata)
+        sfm_to_json(sfm_data, paths['sfm_full'])
         logger.info('Filtering SfM scene to the modality camera')
         filter_sfm_for_camera(paths['sfm_full'], camera_index,
                               paths['modality_8bit'], pos_to_name,
@@ -832,38 +834,39 @@ def _main():
 
     # 3. MVG -> MVS (undistorts modality images with original intrinsics)
     logger.info('Building MVS scene from modality views')
-    paths['sfm_ir'] = paths['sfm_filtered']
-    mvg_to_mvs(paths, sfm_key='sfm_ir', threads=args.threads,
-               metadata=metadata)
+    mvg_to_mvs(paths['sfm_filtered'], scene=paths['mvs_scene'],
+               images_dir=paths['mvs_images'], threads=args.threads)
 
-    # 4. Texture the existing mesh
+    # 4. Texture the existing mesh. TextureMesh writes it into the working mvs/
+    # beside the scene it textures from; the deliverable may live elsewhere.
     logger.info('Preparing mesh for OpenMVS')
     paths['mesh'] = ensure_ply_mesh(mesh_in, paths['mvs'], out_stem=stem)
+    paths['textured_mesh'] = paths['mvs'] / f'{stem}.{file_format}'
     logger.info('Texturing mesh with modality images')
     before = set(paths['mvs'].iterdir())
-    out_key = mvs_texture(paths, mvs_key='mvs_scene', mesh_key='mesh',
-                          file_format=file_format,
-                          resolution_lvl=args.texture_resolution_level,
-                          max_size=args.max_texture_size,
-                          empty_color=args.empty_color,
-                          global_seam_leveling=args.global_seam_leveling,
-                          local_seam_leveling=args.local_seam_leveling,
-                          output_name=stem, metadata=metadata)
+    mvs_texture(paths['mvs_scene'], mesh=paths['mesh'],
+                output=paths['textured_mesh'], export_type=file_format,
+                resolution_level=args.texture_resolution_level,
+                max_texture_size=args.max_texture_size,
+                empty_color=args.empty_color,
+                global_seam_leveling=args.global_seam_leveling,
+                local_seam_leveling=args.local_seam_leveling)
 
     # Relocate the deliverable (mesh + .mtl + texture) if --output-mesh points
     # outside the working mvs/. The produced files already carry <stem> ==
     # target stem, so this is a pure directory move with references intact.
+    final = paths['textured_mesh']
     target = paths['output_mesh']
-    if target.resolve() != paths[out_key].resolve():
+    if target.resolve() != final.resolve():
         # Only the mesh and its own sidecars (all <stem>-prefixed); leave
         # unrelated new files such as TextureMesh's own log behind.
         produced = sorted(p for p in paths['mvs'].iterdir()
                           if p.is_file() and p not in before
                           and p.name.startswith(stem))
-        paths[out_key] = relocate_textured_mesh(produced, paths[out_key],
-                                                 target)
+        final = relocate_textured_mesh(produced, final, target)
+    paths['textured_mesh'] = final
 
-    logger.info(f'Done. Re-textured mesh: {paths[out_key]}')
+    logger.info(f'Done. Re-textured mesh: {final}')
 
 
 if __name__ == '__main__':

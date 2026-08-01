@@ -102,56 +102,84 @@ from any other error. `StageError` already made this move for the planner.
 
 Atomic by necessity: the moment a signature changes, every caller changes with it.
 
-- [ ] `openmvg.py` — 10 functions to pure CLI translation
-- [ ] `openmvs.py` — 4 functions; `_work_dir()` enforces co-location instead of
-      failing silently
-- [ ] `pgs_data.py` — `init_sfm_pgs` to explicit `Path`s, returning
+- [x] `openmvg.py` — 10 functions to pure CLI translation
+- [x] `openmvs.py` — 4 functions; co-location enforced instead of failing
+      silently
+  - The check landed as `toolchain.work_dir(*artifacts)` rather than a private
+    `openmvs._work_dir()`: `mvg_to_mvs` needs the same derivation for its `cwd`,
+    and duplicating it in both wrapper modules was the worse of the two shapes
+- [x] `pgs_data.py` — `init_sfm_pgs` to explicit `Path`s, returning
       `Optional[Path]` for view-pairs
-- [ ] Flag-name mirroring: `mask_value` → `ignore_mask_label`,
-      `marker_pix` → `min_marker_pix`, etc.
-- [ ] Drop the pass-through `(scene_key, mesh_key)` returns from
+- [x] Flag-name mirroring: `mask_value` → `ignore_mask_label`,
+      `marker_pix` → `min_marker_pix`, `decimation_factor` → `decimate`,
+      `free_space` → `free_space_support`, `resolution_lvl` →
+      `resolution_level`, `max_size` → `max_texture_size`, `file_format` →
+      `export_type`
+- [x] Drop the pass-through `(scene_key, mesh_key)` returns from
       `mvs_reconstruct`/`mvs_refine`
-- [ ] `apps/reconstruct.py` — `run_pipeline` migrated; one `configure()` in
+- [x] `apps/reconstruct.py` — `run_pipeline` migrated; one `configure()` in
       `main()`; every `metadata=metadata` argument gone
-- [ ] `stages.py` — delete `StageTracker.key()`
-- [ ] `apps/retexture.py` — drop the `sfm_ir`/`mesh` aliases and the
+- [x] `stages.py` — delete `StageTracker.key()`
+  - Its guard survives as `require()`, which returns the `Path` and raises
+    `StageError` when a mandatory role is unbound. The tracker now takes the
+    output root, not a `paths` dict
+- [x] `apps/retexture.py` — drop the `sfm_ir`/`mesh` aliases and the
       `paths[out_key]` write-back
-- [ ] `apps/calibrate.py` — drop the `sfm_db` rebind
-- [ ] Shrink `paths` to the output layout for the manifest dump
-- [ ] `docs/adr/0005-wrappers-mirror-the-binary.md` *(written)*
-- [ ] `CONTEXT.md` — `Role` entry no longer defined against `paths` keys
-      *(written)*
-- [ ] **`README.md` — document `$PGS_RECON_PREFIX`.** MR1 added it as a
+- [x] `apps/calibrate.py` — drop the `sfm_db` rebind
+- [x] Shrink `paths` to the output layout for the manifest dump
+- [x] `docs/adr/0005-wrappers-mirror-the-binary.md` *(status flipped; the
+      `work_dir` and `--path` consequences added)*
+- [x] `CONTEXT.md` — `Role` entry no longer defined against `paths` keys
+      *(written in MR1)*
+- [x] ADR 0004 — the `*_key` paragraph, now that the reason it gave is served by
+      explicit `Path`s
+- [x] **`README.md` — document `$PGS_RECON_PREFIX`.** MR1 added it as a
       resolution tier but deliberately left it undocumented outside the ADR:
       nothing imports `toolchain` yet, so advertising it would promise a knob
       that does not turn. It becomes user-facing the moment `main()` calls
       `configure()`, and the README's binary-discovery section (the `--path`
       default of `/usr/local/`) is where it belongs. `CLAUDE.md`'s "Binary
       discovery at runtime" needs the same sentence
+  - Doing this exposed that `--path`'s own `/usr/local/` default made the
+    environment tier unreachable from every entry point we ship. The default
+    moved to `toolchain.DEFAULT_PREFIX` alone, which in turn required the config
+    writers to omit unset arguments (a round-tripped `path = None` would send the
+    next run looking under `./None`). Recorded in ADR 0005
 
 ### Tests
 
-- [ ] Argv assertions via `mock.patch('pgs_recon.toolchain.run_command', ...)`
-  - [ ] `--archive-type -1` present on all four MVS stages
-  - [ ] `-p` present whenever the `cloud` role is bound
+- [x] Argv assertions via `mock.patch('pgs_recon.toolchain.run_command', ...)`
+      *(`tests/test_pipeline.py`)*
+  - [x] `--archive-type -1` present on all four MVS stages
+  - [x] `-p` present whenever the `cloud` role is bound — including a cloud
+        rehydrated from the manifest by a later job, which is the case that
+        actually breaks meshes
 
-  *Neither ADR 0003 invariant has ever been tested; they held only because no
+  *Neither ADR 0003 invariant had ever been tested; they held only because no
   caller passed anything else.*
-- [ ] End-to-end fake-binary tests
-  - [ ] `make_fake_prefix()` — touch + `chmod 0755` the binary names, so
+- [x] End-to-end fake-binary tests
+  - [x] `make_fake_prefix()` — touch + `chmod 0755` the binary names, so
         `resolve_exe` is exercised for real
-  - [ ] `fake_binary()` — parses the output path off **argv**, never from
+  - [x] `fake_binary()` — parses the output path off **argv**, never from
         `layout`. A fixture that consulted `layout` would reimplement the code
-        under test
-  - [ ] Single-shot run vs the same shape staged across three windows
+        under test. It also *checks its inputs*, so a mis-wired stage fails on
+        the missing input rather than producing an empty artifact
+  - [x] Single-shot run vs the same shape staged across three windows
         (`--to convert`, `--from densify --to reconstruct`, `--from refine`) →
         assert identical artifact trees. This automates ADR 0004's stated
         acceptance test for the first time
-- [ ] `tests/test_tracker.py` — rewrite; it currently mirrors the key threading
-- [ ] `tests/test_stages.py:384` — asserts `key()` raises; update
+  - [x] `pgs-retexture` against a recon directory it did not build — the reuse
+        case ADR 0005 exists for, previously unreachable without fabricating a
+        `paths` dict
+- [x] `tests/test_tracker.py` — rewritten; `fake_run` now mirrors
+      `run_pipeline`'s `layout` calls instead of the key threading
+- [x] `tests/test_stages.py` — `build_records()` names artifacts through
+      `layout` (so MR3 does not have to touch it; `test_layout` is what pins the
+      literals), and the `key()` test became a `require()` test
 
 **Acceptance gate:** byte-identical artifact tree before and after. Filenames do
-not change in this MR by construction.
+not change in this MR by construction, and `test_pipeline` now asserts the whole
+tree for the default and densified shapes.
 
 ---
 
@@ -171,7 +199,14 @@ Entire behavioural risk confined to one file's return values.
   | reconstruct | `scene_dense_mesh.ply` | `reconstruct_mesh.ply` |
   | refine | `scene_dense_refine.ply` | `refine_mesh.ply` |
 
-- [ ] Test expectations updated
+- [ ] Test expectations updated. Larger than it looks: the *fixtures* follow the
+      rename on their own (`fake_run`/`build_records` call `layout`), but ~20
+      **assertions** spell the chained names out literally —
+      `tests/test_tracker.py` (`:201, 220, 265, 274, 381, 416, 425`),
+      `tests/test_stages.py` (`:397, 398, 423`) and `tests/test_pipeline.py`
+      (the expected-tree list, the `-p`/`-i` flag checks, the staged-vs-single
+      spot-check). All mechanical. Frozen names (`mvg/sfm_data.json`,
+      `recon_dir/sfm_data.bin`, `matches_filtered.bin`) do not move
 - [ ] **Legacy-resume test**: a manifest carrying the *old* chained names with
       every stage complete goes clean on a verbatim re-run. Pure dict logic, no
       filesystem — belongs in `test_stages.py`
@@ -187,6 +222,48 @@ Entire behavioural risk confined to one file's return values.
 - [ ] **Manual gate before merge:** one real reconstruction on a known dataset.
       The fake-binary tests cannot observe whether `-p` actually prevented a
       sparse-cloud mesh — only real OpenMVS can
+
+---
+
+## Open follow-ups
+
+Raised in review of MR2 and **not yet closed**. The series is not finished until
+these are, so they are tracked here rather than in an MR thread that disappears.
+
+- [ ] **CI never runs the unit suite where the binaries exist.** `test:unit`
+      (`python:3.9-slim`) and `test:python` (`ubuntu:22.04`) both run against a
+      `/usr/local` with no OpenMVG in it, so any test that reaches the built-in
+      default prefix passes for the wrong reason. Three did: they asserted
+      `ToolNotFound` for real tool names and failed inside
+      `ghcr.io/educelab/pgs-recon:edge` while CI stayed green. MR2 fixed those
+      with `tests/test_toolchain.ABSENT_TOOL`, but nothing stops the next one —
+      add a job running `python -m unittest discover -s tests` inside the built
+      image. Cheap, and it is the only environment that resembles production.
+- [ ] **`mvg_to_mvs` co-locates the scene and the undistorted images, but
+      nothing checks the images the scene references.** `toolchain.work_dir`
+      covers the two paths the wrapper is handed; the MVS stages then read image
+      paths out of the scene itself. A scene pointing at images that moved fails
+      inside OpenMVS. Out of scope for the rename, worth deciding on before the
+      series closes.
+- [ ] **Is `work_dir`'s co-location requirement real for OpenMVS, or only
+      assumed?** This is the same question `-M` turned out to answer the other
+      way. `openMVG_main_SfM` looked like it needed the matches file beside the
+      regions and does not: it joins `-M` onto `-m`, and the join resolves
+      `../`, so any location is reachable (`b25cb6e`). Whether OpenMVS's `-w` is
+      equally forgiving is **unestablished** — it is a different codebase, using
+      Boost program_options and its own path handling, and nothing here has been
+      checked against it. If it is forgiving, `work_dir` is over-strict for
+      exactly the reason `basename_in` was, and `mvs_refine`/`mvs_texture` should
+      translate rather than refuse.
+
+      Two things do *not* relax either way, and are the reason this is a question
+      rather than a presumed bug: densify pairs its dense cloud with its scene
+      **by name** (`layout.densify_cloud` is the scene's stem with `.ply`), which
+      needs them in one directory whatever `-w` accepts; and `mvg_to_mvs` writes
+      relative to `cwd` rather than to a `-w`, so its own derivation is
+      unaffected. Settle it by compiling against the installed OpenMVS the way
+      `create_filespec` was checked — reading `-w` handling out of
+      `DensifyPointCloud`/`RefineMesh` — rather than by inspection.
 
 ---
 
