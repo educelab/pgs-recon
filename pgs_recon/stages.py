@@ -3,7 +3,7 @@
 A reconstruction is thirteen stages, one per binary invocation. ``--from``/``--to``
 select a contiguous window of them so a single output directory can be filled in
 by several cluster jobs, each sized for the stages it runs. State lives in the
-run's ``metadata.json`` under a ``stages`` key.
+run's manifest (:func:`layout.manifest`) under a ``stages`` key.
 
 The motivation is ``RefineMesh``: it is a memory hog with no reliable a-priori
 bound, so a whole-pipeline job has to be sized for its worst case -- which either
@@ -32,11 +32,13 @@ Three invariants hold this together, and all three are load-bearing:
 * **Nothing runs that the range did not ask for.** A job sized for texturing must
   never quietly start refining, which is the exact blowup this exists to prevent.
   Missing prerequisites are an error, never backfilled.
-* **The manifest is the record; nothing here touches the filesystem.** Dirtiness
-  is computed from two dicts (the parsed args and the stage records), which is
-  what makes it testable and what keeps a half-created output directory from
-  changing the plan. Deleting an intermediate by hand therefore does not trigger
-  a rebuild -- that is ``--rerun``.
+* **The manifest is the record; nothing in the planner touches the filesystem.**
+  Dirtiness is computed from two dicts (the parsed args and the stage records),
+  which is what makes it testable and what keeps a half-created output directory
+  from changing the plan. Deleting an intermediate by hand therefore does not
+  trigger a rebuild -- that is ``--rerun``. The lone exception is
+  :func:`find_manifest`, which has to look at the disk to answer a question no
+  record can: whether this directory's manifest is under the pre-1.8 name.
 
 This depends on every MVS intermediate being portable (``MVSI`` scene + ``.ply``
 geometry, ``--archive-type -1`` on all four builders, dense cloud handed to
@@ -136,7 +138,8 @@ STAGE_ARGS: Dict[str, Tuple[str, ...]] = {
     'densify': ('mvs_densify', 'densify_resolution_level', 'mask_value'),
     'reconstruct': ('free_space_support', 'mvs_smooth'),
     'refine': ('mvs_refine', 'decimation_factor', 'refine_resolution_level',
-               'refine_min_resolution', 'refine_scales', 'refine_scale_step'),
+               'refine_min_resolution', 'refine_scales', 'refine_scale_step',
+               'refine_ensure_edge_size', 'refine_max_face_area'),
     'texture': ('name', 'file_type', 'texture_resolution_level',
                 'texture_max_size'),
 }
@@ -268,8 +271,29 @@ def describe_shape(shape: Sequence[str]) -> str:
 # manifest i/o
 # --------------------------------------------------------------------------
 
+def find_manifest(output: Path) -> Path:
+    """The manifest to *read* for a run in ``output``.
+
+    :func:`layout.manifest` unless only the pre-1.8 ``metadata.json`` is there,
+    in which case that -- so a directory built by an earlier version resumes
+    with nothing re-run. A caller writes to :func:`layout.manifest` regardless,
+    which is what moves a legacy directory onto the new name the first time it
+    records anything. Compare the two to tell whether a fallback happened.
+
+    The one place a filesystem check decides a path. It is not the existence
+    check ADR 0004 forbids: that one is about *stage* state, which stays a
+    question about the manifest's contents. This is about locating the manifest
+    itself, which no record can answer.
+    """
+    current = layout.manifest(output)
+    if current.is_file():
+        return current
+    legacy = layout.legacy_manifest(output)
+    return legacy if legacy.is_file() else current
+
+
 def load_manifest(path: Path) -> Dict:
-    """Load an existing ``metadata.json``, or return an empty manifest."""
+    """Load an existing manifest, or return an empty one."""
     if not Path(path).is_file():
         return {}
     try:
@@ -383,11 +407,11 @@ def revert_out_of_range(args, stored: Dict, explicit: set, from_stage: str,
                         to_stage: str, logger) -> None:
     """Undo overrides aimed at stages outside the range, warning about each.
 
-    The out-of-range value must still govern because it determines downstream
-    filenames: flipping ``--mvs-densify`` on a ``--from refine`` job would
-    otherwise make refine look for a ``scene_dense_mesh.ply`` that was never
-    built. Reverting forgives the user error rather than rejecting the run, and
-    it happens *before* the graph is built, so the graph never sees the
+    The out-of-range value must still govern because it determines what the
+    stages in range consume: flipping ``--mvs-densify`` on a ``--from refine``
+    job would otherwise have refine read a scene that was never densified.
+    Reverting forgives the user error rather than rejecting the run, and it
+    happens *before* the graph is built, so the graph never sees the
     override -- the principle being not to mutate parts of the graph this run is
     not prepared to recompute. The manifest keeps recording the effective value,
     not the ignored override, so the log stays truthful.
@@ -574,9 +598,9 @@ class StageTracker:
         if rebuilt:
             return f'inputs rebuilt by {", ".join(rebuilt)}'
         # And an input may move without any producer being dirty: drop densify
-        # from the shape and reconstruct's ``scene`` goes from mvs/scene_dense.mvs
-        # back to convert's mvs/scene.mvs. Roles the record does not carry are
-        # not compared -- an optional role that was bound but not consumed (a
+        # from the shape and reconstruct's ``scene`` goes from mvs/densify.mvs
+        # back to convert's mvs/convert_scene.mvs. Roles the record does not
+        # carry are not compared -- an optional role bound but not consumed (a
         # view_pairs file the user overrode with --matching-pairs-file none) has
         # no recorded value to differ from.
         recorded = record.get('inputs') or {}

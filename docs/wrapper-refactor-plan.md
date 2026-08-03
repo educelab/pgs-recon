@@ -1,9 +1,13 @@
 # Implementation plan: wrapper interface refactor (issue #17)
 
 Working document for the four-MR series that removes the `paths`-dict + `*_key`
-convention from the OpenMVG/OpenMVS wrappers. Delete this file when MR3 merges —
-the durable decisions live in [ADR 0005](./adr/0005-wrappers-mirror-the-binary.md)
-and [ADR 0006](./adr/0006-stage-named-artifacts.md).
+convention from the OpenMVG/OpenMVS wrappers. All four have landed, and every
+follow-up raised in review is now closed or tracked as its own issue — see the
+bottom. The durable decisions live in
+[ADR 0005](./adr/0005-wrappers-mirror-the-binary.md),
+[ADR 0006](./adr/0006-stage-named-artifacts.md) and
+[ADR 0007](./adr/0007-name-the-manifest-for-the-tool.md); nothing here is the
+authority on anything.
 
 ## Settled decisions
 
@@ -187,7 +191,8 @@ tree for the default and densified shapes.
 
 Entire behavioural risk confined to one file's return values.
 
-- [ ] `layout.py` — return values change to `<stage>_<role>.<ext>`:
+- [x] `layout.py` — return values change to `<stage>_<role>.<ext>`, and every
+      signature loses its input argument:
 
   | Stage | Was | Now |
   |---|---|---|
@@ -195,77 +200,123 @@ Entire behavioural risk confined to one file's return values.
   | autoscale | `sfm_data_structured_scaled.bin` | `autoscale_sfm.bin` |
   | colorize | `sfm_data_..._colorized.ply` | `colorize_sfm.ply` |
   | convert | `scene.mvs` | `convert_scene.mvs` |
-  | densify | `scene_dense.mvs` / `.ply` | `densify_scene.mvs` / `densify_cloud.ply` |
+  | densify | `scene_dense.mvs` / `.ply` | `densify.mvs` / `densify.ply` |
   | reconstruct | `scene_dense_mesh.ply` | `reconstruct_mesh.ply` |
   | refine | `scene_dense_refine.ply` | `refine_mesh.ply` |
 
-- [ ] Test expectations updated. Larger than it looks: the *fixtures* follow the
+  - Two names came out other than planned, both because a binary chooses them:
+    - **densify is `densify.mvs`/`densify.ply`, not `densify_scene`/
+      `densify_cloud`.** `DensifyPointCloud` takes one `-o` and writes both files
+      from its stem (`DensifyPointCloud.cpp:385-391`, `baseFileName+".ply"`), so
+      the pair cannot carry two role names. Naming it for either role would have
+      produced a cloud called `densify_scene.ply` or a scene called
+      `densify_cloud.mvs` — the mislabel 0006 exists to end — so the stem carries
+      the stage and the suffix carries the role
+    - **the `direct` method now writes `recon_dir/sfm_data.bin`**, the solve's
+      own name, instead of borrowing robust's. It had to move: `direct` and
+      `--mvg-robust` can both be set, and under the new scheme both would have
+      been `robust_sfm.bin`, so the `robust` stage would read and write one file
+- [x] Test expectations updated. Larger than it looks: the *fixtures* follow the
       rename on their own (`fake_run`/`build_records` call `layout`), but ~20
       **assertions** spell the chained names out literally —
-      `tests/test_tracker.py` (`:201, 220, 265, 274, 381, 416, 425`),
-      `tests/test_stages.py` (`:397, 398, 423`) and `tests/test_pipeline.py`
+      `tests/test_tracker.py`, `tests/test_stages.py` and `tests/test_pipeline.py`
       (the expected-tree list, the `-p`/`-i` flag checks, the staged-vs-single
       spot-check). All mechanical. Frozen names (`mvg/sfm_data.json`,
       `recon_dir/sfm_data.bin`, `matches_filtered.bin`) do not move
-- [ ] **Legacy-resume test**: a manifest carrying the *old* chained names with
-      every stage complete goes clean on a verbatim re-run. Pure dict logic, no
-      filesystem — belongs in `test_stages.py`
-- [ ] `docs/adr/0006-stage-named-artifacts.md` *(written)*
-- [ ] `CONTEXT.md` — **Artifact name** term *(written; ahead of the code until
-      this MR lands)*
-- [ ] ADR 0003 — prose naming `scene_dense.mvs` / `scene_dense_refine.ply`
-- [ ] ADR 0004 — prose naming `mvs/scene.mvs`, `scene_dense_mesh.ply`,
-      `scene_refine.ply`, and the `mvs_scene_dense_mesh_refine` key example
-- [ ] `apptainer/submit_recon_pipeline.sh:112` — the comment explaining that
+  - `test_layout`'s shape permutations now assert the *opposite* of what they
+    used to: `TestNamesAreShapeIndependent` fails if any produced artifact's name
+    differs between two shapes
+- [x] **Legacy-resume test**: a manifest carrying the *old* chained names with
+      every stage complete goes clean on a verbatim re-run
+      *(`test_stages.TestLegacyManifests`, over a `legacy_records()` that
+      replays the old chaining rule rather than tabulating its results)*
+- [x] `docs/adr/0006-stage-named-artifacts.md` *(status accepted; densify and
+      `direct` consequences added)*
+- [x] `CONTEXT.md` — **Artifact name** term
+- [x] ADR 0003 — prose naming `scene_dense.mvs` / `scene_dense_refine.ply`
+- [x] ADR 0004 — prose naming `mvs/scene.mvs`, `scene_dense_mesh.ply`,
+      `scene_refine.ply`
+- [x] `apptainer/submit_recon_pipeline.sh:112` — the comment explaining that
       densify renames the mesh chain. The constraint relaxes; the advice (keep
       shape flags on job 1) stands
-- [ ] **Manual gate before merge:** one real reconstruction on a known dataset.
+- [x] **Manual gate before merge:** one real reconstruction on a known dataset.
       The fake-binary tests cannot observe whether `-p` actually prevented a
       sparse-cloud mesh — only real OpenMVS can
+  - Run, and it earned its keep: `-p` and the renamed chain behaved, and the run
+    also surfaced refine's remesh stall and confirmed that densify writes its
+    `.ply` beside its `.mvs` off the single `-o`. Both became follow-ups below
 
 ---
 
-## Open follow-ups
+## Follow-ups, and how each closed
 
-Raised in review of MR2 and **not yet closed**. The series is not finished until
-these are, so they are tracked here rather than in an MR thread that disappears.
+Raised in review of MR2 and MR3, and addressed in MR3 rather than left to an MR
+thread that disappears. Two were questions rather than defects, and the answers
+came from reading the pinned OpenMVS revision (`ca991d5`) instead of guessing —
+which is what the `-M` case had already taught the series to do.
 
-- [ ] **CI never runs the unit suite where the binaries exist.** `test:unit`
-      (`python:3.9-slim`) and `test:python` (`ubuntu:22.04`) both run against a
-      `/usr/local` with no OpenMVG in it, so any test that reaches the built-in
-      default prefix passes for the wrong reason. Three did: they asserted
-      `ToolNotFound` for real tool names and failed inside
-      `ghcr.io/educelab/pgs-recon:edge` while CI stayed green. MR2 fixed those
-      with `tests/test_toolchain.ABSENT_TOOL`, but nothing stops the next one —
-      add a job running `python -m unittest discover -s tests` inside the built
-      image. Cheap, and it is the only environment that resembles production.
-- [ ] **`mvg_to_mvs` co-locates the scene and the undistorted images, but
-      nothing checks the images the scene references.** `toolchain.work_dir`
-      covers the two paths the wrapper is handed; the MVS stages then read image
-      paths out of the scene itself. A scene pointing at images that moved fails
-      inside OpenMVS. Out of scope for the rename, worth deciding on before the
-      series closes.
-- [ ] **Is `work_dir`'s co-location requirement real for OpenMVS, or only
-      assumed?** This is the same question `-M` turned out to answer the other
-      way. `openMVG_main_SfM` looked like it needed the matches file beside the
-      regions and does not: it joins `-M` onto `-m`, and the join resolves
-      `../`, so any location is reachable (`b25cb6e`). Whether OpenMVS's `-w` is
-      equally forgiving is **unestablished** — it is a different codebase, using
-      Boost program_options and its own path handling, and nothing here has been
-      checked against it. If it is forgiving, `work_dir` is over-strict for
-      exactly the reason `basename_in` was, and `mvs_refine`/`mvs_texture` should
-      translate rather than refuse.
+- [x] **`mvs_refine` was not the complete flag surface ADR 0005 promises, and the
+      missing flags were the ones that mattered** — `--ensure-edge-size` and
+      `--max-face-area`, the two that turn off the remesh below. All four MVS
+      wrappers are now their binaries' full documented surface, and
+      `tests/test_openmvs.SURFACES` tabulates each one so "complete" is a failing
+      test rather than a claim. `NOT_MIRRORED` names the five deliberate
+      exclusions; each app's undocumented "Hidden options" group is out on the
+      same footing upstream leaves it out of `--help`.
+- [x] **Refine's mesh preparation dominates, because of the OpenMVS pin.**
+      Verified end to end at the pin rather than inferred: we omit `--decimate`, so
+      `fDecimateMesh` is 0/auto (`RefineMesh.cpp:124`) and `bNoDecimation` is
+      false; `--max-face-area` defaults to 16 (`:127`) so `bNoSimplification` is
+      false and subdivision runs; `--ensure-edge-size` defaults to 1 (`:126`); so
+      the guard at `SceneRefine.cpp:556` is true and `EnsureEdgeSize()` — CGAL
+      `isotropic_remeshing`, single-threaded, timers reporting only on return
+      (`Mesh.cpp:1863,1888`) — runs once per run, at scale 0, on the freshly
+      *subdivided* mesh. Resolved as (a): the knobs are exposed, at the wrapper
+      and as `--refine-ensure-edge-size` / `--refine-max-face-area`, and the
+      recipe is in the README. **Defaults unchanged** — a mesh that comes out
+      different is not a rename. `apptainer/submit_recon_pipeline.sh` now says
+      that a refine *timeout* wants `--time` or these knobs, not `--mem`.
+- [x] **CI never ran the unit suite where the binaries exist.** `test:in-image`
+      runs it inside `ghcr.io/educelab/pgs-recon:edge`, where the checkout shadows
+      the image's editable install, so the MR's code is exercised against the real
+      toolchain at the real default prefix. It asserts the two binary paths first,
+      so a moved prefix fails the job instead of quietly making it meaningless
+      again. Verified passing in the image, not just written.
+- [x] **`mvg_to_mvs` co-locates the scene and the undistorted images, but nothing
+      checked the images the scene references.** Closed as *no check needed*, with
+      the reason recorded: `openMVG2openMVS` writes those names **relative to the
+      scene file's own directory** (`main_openMVG2openMVS.cpp:54-55,112`) and
+      OpenMVS resolves them against `-w` (`Scene.cpp:144`), which the MVS stages
+      derive from the scene — so the frame is guaranteed by both sides rather than
+      by inspection. Relative names are also what make a finished `mvs/` movable
+      as a unit, which is ADR 0003's portability claim. The failure mode a check
+      could catch is a `-w` that is not the scene's directory, and that is
+      unreachable while `-w` is derived.
+- [x] **The per-tool sidecars said `metadata`.** Renamed with the main manifest
+      after all: `<stem>_retexture.json`, `<name>_calibrate.json`, each with its
+      in-file `paths` key following `metadata` -> `manifest`. The earlier decision
+      to defer lost to a simpler argument — they are downstream-visible names, so
+      shipping them in the release that already documents the manifest rename
+      costs one migration note, while deferring costs a second note later for a
+      smaller reason. ADR 0007 and `docs/migrating-to-1.8.md` record both.
+- [x] **Is `work_dir`'s co-location requirement real for OpenMVS, or only
+      assumed?** Assumed, and now **answered**: not real for the artifacts, real
+      for `-w` itself. Every path argument goes through `MAKE_PATH_SAFE`
+      (`Common.h:101`), which keeps an absolute path verbatim (`Util.h:362-375`)
+      and otherwise joins onto `-w` and collapses `folder/../` textually
+      (`Util.h:407-438`) — so a non-co-located mesh is reachable *both*
+      `../`-relative and absolute, the mirror image of `-M`, where absolute is the
+      one broken spelling. What does not relax is `-w`: it is the frame the
+      scene's image paths resolve against, and OpenMVS **re-saves** them relative
+      to it (`Scene.cpp:267`), so a wrong `-w` corrupts silently. Densify's
+      cloud/scene pair is also matched by name, so it stays co-located whatever
+      `-w` accepts. `work_dir` therefore keeps refusing in MR3 — as our invariant
+      now, with a reason, rather than as an assumption — and the relaxation
+      (derive `-w` from the scene, translate the rest through
+      `relative_to_dir`, let `retexture` stop staging a copy) is **issue #19**.
 
-      Two things do *not* relax either way, and are the reason this is a question
-      rather than a presumed bug: densify pairs its dense cloud with its scene
-      **by name** (`layout.densify_cloud` is the scene's stem with `.ply`), which
-      needs them in one directory whatever `-w` accepts; and `mvg_to_mvs` writes
-      relative to `cwd` rather than to a `-w`, so its own derivation is
-      unaffected. Settle it by compiling against the installed OpenMVS the way
-      `create_filespec` was checked — reading `-w` handling out of
-      `DensifyPointCloud`/`RefineMesh` — rather than by inspection.
-
----
+With these closed, this file has met its own exit condition. It stays for now
+because !71's description links to it; delete it once that MR has merged.
 
 ## Known non-issues
 

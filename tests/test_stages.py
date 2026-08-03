@@ -66,8 +66,9 @@ def build_records(args, shape=None, status='complete') -> dict:
     """A manifest for a run of ``shape`` that finished successfully.
 
     The paths are the ones ``run_pipeline`` would produce, because that is what
-    the planner compares: a name derived from the artifact a stage consumed, so
-    enabling densify renames the whole mesh chain.
+    the planner compares. Since ADR 0006 they no longer move with the shape, so
+    what a shape change alters is which artifact a stage *consumes*, not what
+    any of them are called.
     """
     shape = shape or pipeline_shape(args)
     records = {}
@@ -95,45 +96,79 @@ def build_records(args, shape=None, status='complete') -> dict:
 
     sfm_inputs = {'sfm': sfm, 'features': features}
     if args.mvg_recon_method == 'direct':
-        # Triangulating known poses reads the unfiltered matches, and writes
-        # beside its input rather than to the engine's fixed name.
+        # Triangulating known poses reads the unfiltered matches, and writes the
+        # solve where the engines write theirs.
         sfm_inputs['matches'] = matches
-        solved = layout.robust_sfm(ROOT, sfm)
     else:
         sfm_inputs['matches_filtered'] = filtered
-        solved = layout.solved_sfm(ROOT)
+    solved = layout.solved_sfm(ROOT)
     rec('sfm', sfm_inputs, {'sfm': solved})
     if 'robust' in shape:
-        nxt = layout.robust_sfm(ROOT, solved)
+        nxt = layout.robust_sfm(ROOT)
         rec('robust', {'sfm': solved, 'features': features, 'matches': matches},
             {'sfm': nxt})
         solved = nxt
     if 'autoscale' in shape:
-        nxt = layout.autoscale_sfm(ROOT, solved)
+        nxt = layout.autoscale_sfm(ROOT)
         rec('autoscale', {'sfm': solved}, {'sfm': nxt})
         solved = nxt
     rec('colorize', {'sfm': solved},
-        {'colorized': layout.colorize_sfm(solved)})
+        {'colorized': layout.colorize_sfm(ROOT)})
 
     scene = layout.convert_scene(ROOT)
     rec('convert', {'sfm': solved}, {'scene': scene})
     cloud = None
     if 'densify' in shape:
-        cloud = layout.densify_cloud(scene)
-        dense = layout.densify_scene(scene)
+        cloud = layout.densify_cloud(ROOT)
+        dense = layout.densify_scene(ROOT)
         rec('densify', {'scene': scene}, {'scene': dense, 'cloud': cloud})
         scene = dense
-    mesh = layout.reconstruct_mesh(scene)
+    mesh = layout.reconstruct_mesh(ROOT)
     # reconstruct and refine hand the scene back untouched, so neither records
     # it as an output -- see STAGE_IO on pass-through roles.
     rec('reconstruct', {'scene': scene, 'cloud': cloud}, {'mesh': mesh})
     if 'refine' in shape:
-        refined = layout.refine_mesh(scene)
+        refined = layout.refine_mesh(ROOT)
         rec('refine', {'scene': scene, 'mesh': mesh}, {'mesh': refined})
         mesh = refined
     rec('texture', {'scene': scene, 'mesh': mesh},
         {'mesh': layout.final_mesh(ROOT, args.name, args.file_type)})
     return {s: records[s] for s in shape}
+
+
+def legacy_records(args, shape=None, status='complete') -> dict:
+    """``build_records()`` as an output directory built *before* ADR 0006 has it.
+
+    The chained names are spelled by replaying the old rule -- each stage
+    appending a tag to its input's stem -- rather than by a lookup table, so the
+    shape dependence that motivated the rename stays visible. Only the names
+    differ: a legacy manifest is otherwise the manifest we write today, which is
+    the whole reason it can still be resumed.
+    """
+    records = build_records(args, shape, status)
+    sfm, rename = 'mvg/recon_dir/sfm_data', {}
+    if 'robust' in records:
+        sfm += '_structured'
+        rename[rel(layout.robust_sfm(ROOT))] = sfm + '.bin'
+    if 'autoscale' in records:
+        sfm += '_scaled'
+        rename[rel(layout.autoscale_sfm(ROOT))] = sfm + '.bin'
+    rename[rel(layout.colorize_sfm(ROOT))] = sfm + '_colorized.ply'
+
+    scene = 'mvs/scene'
+    rename[rel(layout.convert_scene(ROOT))] = scene + '.mvs'
+    if 'densify' in records:
+        scene += '_dense'
+        rename[rel(layout.densify_scene(ROOT))] = scene + '.mvs'
+        rename[rel(layout.densify_cloud(ROOT))] = scene + '.ply'
+    rename[rel(layout.reconstruct_mesh(ROOT))] = scene + '_mesh.ply'
+    rename[rel(layout.refine_mesh(ROOT))] = scene + '_refine.ply'
+
+    for record in records.values():
+        for side in ('inputs', 'outputs'):
+            record[side] = {role: rename.get(path, path)
+                            for role, path in record[side].items()}
+    return records
 
 
 def quiet_logger():
@@ -394,8 +429,8 @@ class TestPlanning(unittest.TestCase):
     def test_rehydrated_inputs_come_from_the_records(self):
         args = make_args(from_stage='refine')
         tracker = make_tracker(args, build_records(args))
-        self.assertEqual(ROOT / 'mvs/scene.mvs', tracker.path('scene'))
-        self.assertEqual(ROOT / 'mvs/scene_mesh.ply', tracker.path('mesh'))
+        self.assertEqual(ROOT / 'mvs/convert_scene.mvs', tracker.path('scene'))
+        self.assertEqual(ROOT / 'mvs/reconstruct_mesh.ply', tracker.path('mesh'))
         self.assertFalse(tracker.has('cloud'))
 
     def test_view_pairs_rehydrate_into_a_later_job(self):
@@ -414,13 +449,13 @@ class TestShapeChanges(unittest.TestCase):
     """The two headline regressions: a shrunk shape and an isolated leaf."""
 
     def test_removing_densify_rebuilds_the_mesh_chain(self):
-        # Finding #1. The dense run's reconstruct recorded scene_dense.mvs;
-        # without densify the live binding is convert's scene.mvs, so the mesh
-        # stages must re-run against the non-dense names even though nothing is
+        # Finding #1. The dense run's reconstruct recorded densify.mvs; without
+        # densify the live binding is convert's own scene, so the mesh stages
+        # must re-run against the sparse cloud even though nothing is
         # incomplete. (Pre-fix: all thirteen stages skipped.)
         dense = make_args(mvs_densify=True)
         records = build_records(dense)
-        self.assertEqual('mvs/scene_dense.mvs',
+        self.assertEqual('mvs/densify.mvs',
                          records['reconstruct']['inputs']['scene'])
         args = make_args(mvs_densify=False)
         tracker = make_tracker(args, records, explicit={'mvs_densify'})
@@ -471,6 +506,50 @@ class TestShapeChanges(unittest.TestCase):
         self.assertEqual(['texture'], runs(tracker))
         self.assertEqual('inputs changed: mesh', tracker.dirty['texture'])
         self.assertEqual('off', tracker.status_of('refine'))
+
+
+class TestLegacyManifests(unittest.TestCase):
+    """Directories built before ADR 0006, carrying the chained names.
+
+    The rename is only safe because ``layout`` *writes* names and the manifest
+    *locates* artifacts. If anything rebuilt a name to find an existing file,
+    every one of these directories would silently go dirty -- or worse, resume
+    against a file that was never written.
+    """
+
+    def test_a_verbatim_rerun_over_legacy_names_runs_nothing(self):
+        for label, args in (('default', make_args()),
+                            ('densified', make_args(mvs_densify=True)),
+                            ('scaled', make_args(mvg_robust=True,
+                                                 mvg_autoscale=0.47))):
+            with self.subTest(label):
+                tracker = make_tracker(args, legacy_records(args))
+                self.assertEqual([], runs(tracker))
+                self.assertEqual({}, tracker.dirty)
+
+    def test_a_later_job_binds_the_names_the_records_carry(self):
+        # Not what layout would name them today: the paths handed to the stages
+        # are the recorded ones, verbatim.
+        args = make_args(from_stage='texture')
+        tracker = make_tracker(args, legacy_records(args))
+        self.assertEqual(ROOT / 'mvs/scene.mvs', tracker.require('scene'))
+        self.assertEqual(ROOT / 'mvs/scene_refine.ply', tracker.require('mesh'))
+
+    def test_a_dirty_stage_cascades_and_the_rest_of_the_run_moves_over(self):
+        # What a legacy directory costs: the first stage that re-runs writes the
+        # new name, the cascade carries it downstream, and the old files are
+        # left orphaned -- the same thing --rerun has always produced.
+        args = make_args()
+        records = legacy_records(args)
+        records['reconstruct']['status'] = 'failed'
+        tracker = make_tracker(args, records)
+        self.assertEqual(['reconstruct', 'refine', 'texture'], runs(tracker))
+        self.assertEqual('inputs rebuilt by reconstruct', tracker.dirty['refine'])
+        # Everything upstream is untouched, and reconstruct re-runs against the
+        # legacy scene rather than looking for one under the new name.
+        self.assertEqual('skip', tracker.status_of('convert'))
+        self.assertEqual('mvs/scene.mvs',
+                         records['convert']['outputs']['scene'])
 
 
 if __name__ == '__main__':

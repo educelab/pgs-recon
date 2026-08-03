@@ -11,16 +11,13 @@ Every argument is a ``Path``, not a ``PathLike`` -- deliberately narrower than
 environment. Nothing reaches this module from outside the process: a caller
 holds paths already, and accepting strings would only hide a missing conversion.
 
-The argument convention: **a function takes the output root, unless its name
-chains off an input artifact, in which case it takes that artifact.** The
-chaining is the *current* scheme, not the intended one: today an intermediate's
-name accumulates the pipeline's history (``scene.mvs`` -> ``scene_dense.mvs`` ->
-``scene_dense_mesh.ply``), and `ADR 0006
-<../docs/adr/0006-stage-named-artifacts.md>`_ replaces it with
-``<stage>_<role>.<ext>``. This module reproduces the chained names *exactly* so
-that the interface change can be verified against a byte-identical artifact
-tree; when 0006 lands, the bodies here change and every function ends up taking
-just the output root.
+The argument convention: **a function takes the output root, and nothing else**
+-- plus, for the two names that are not the pipeline's to choose, the run name
+and file type. An intermediate is called ``<stage>_<role>.<ext>``: the stage
+that wrote it and the role it fills (`ADR 0006
+<../docs/adr/0006-stage-named-artifacts.md>`_). Names no longer chain off their
+input's stem, so no name encodes which other stages ran, and nothing here needs
+to be handed an input path to work out an output's name.
 
 Whatever the scheme, one rule holds: **these names are only ever written.** A
 resumed job locates an existing artifact through the manifest's stage records,
@@ -30,7 +27,8 @@ directories that already exist.
 Not every name is ours to choose. Frozen here, and marked as such below: the
 names OpenMVG picks for its own outputs, the already-role-named ``matches*``,
 ``pgs-global-scaler``'s ``landmarks*``, and the deliverable ``mvs/<name>.<ext>``,
-which is a user-facing contract.
+which is a user-facing contract. ``densify`` is the one stage whose pair of
+outputs shares a stem for the same reason -- see :func:`densify_cloud`.
 
 ``pgs-retexture`` writes into an existing recon's ``mvg/``/``mvs/`` under its own
 stem-prefixed convention (see CONTEXT.md); that layout is the app's own and is
@@ -81,7 +79,23 @@ def directories(output: Path) -> Tuple[Path, ...]:
 
 
 def manifest(output: Path) -> Path:
-    """The run's ``metadata.json``."""
+    """The run's manifest: what it has finished, and with what arguments.
+
+    Named for the tool that owns the directory. ``metadata.json``, which this
+    replaced in 1.8, is also what an EduceLab **scan** directory calls its
+    descriptor (see :mod:`pgs_recon.pgs_data`) -- an input format we do not own,
+    so the one filename meant two unrelated things.
+    """
+    return output / 'pgs-recon.json'
+
+
+def legacy_manifest(output: Path) -> Path:
+    """Where runs before 1.8 wrote the manifest.
+
+    Read, never written: :func:`stages.find_manifest` falls back to this so an
+    output directory built by an earlier version still resumes, and the next
+    write lands on :func:`manifest`.
+    """
     return output / 'metadata.json'
 
 
@@ -124,25 +138,25 @@ def view_pairs(output: Path) -> Path:
 
 
 def solved_sfm(output: Path) -> Path:
-    """The solved scene. **Frozen:** ``openMVG_main_SfM`` takes an output
-    *directory* and names this itself; ``mvg_sfm`` returns the path because the
-    binary, not the caller, chose it."""
+    """The solved scene, whichever engine solved it.
+
+    **Frozen:** ``openMVG_main_SfM`` takes an output *directory* and names this
+    itself; ``mvg_sfm`` returns the path because the binary, not the caller,
+    chose it. The ``direct`` method, which triangulates known poses instead of
+    solving, writes here too: it is the same stage producing the same role, and
+    only one of the two branches ever runs.
+    """
     return recon_dir(output) / 'sfm_data.bin'
 
 
-def robust_sfm(output: Path, sfm: Path) -> Path:
-    """Robustly re-triangulated scene.
-
-    Note the directory: this lands in ``recon_dir`` even when the input does
-    not. The ``direct`` reconstruction method triangulates the *imported* scene
-    from ``mvg/``, and its output still belongs with the solve.
-    """
-    return recon_dir(output) / (sfm.stem + '_structured.bin')
+def robust_sfm(output: Path) -> Path:
+    """Robustly re-triangulated scene."""
+    return recon_dir(output) / 'robust_sfm.bin'
 
 
-def autoscale_sfm(output: Path, sfm: Path) -> Path:
+def autoscale_sfm(output: Path) -> Path:
     """Scene rescaled to physical units by ``pgs-global-scaler``."""
-    return recon_dir(output) / (sfm.stem + '_scaled.bin')
+    return recon_dir(output) / 'autoscale_sfm.bin'
 
 
 def landmarks(output: Path) -> Path:
@@ -157,10 +171,14 @@ def scaled_landmarks(output: Path) -> Path:
     return recon_dir(output) / 'landmarks_scaled.ply'
 
 
-def colorize_sfm(sfm: Path) -> Path:
-    """Sparse cloud coloured from the images, beside its input scene. A leaf:
-    nothing downstream consumes it."""
-    return sfm.parent / (sfm.stem + '_colorized.ply')
+def colorize_sfm(output: Path) -> Path:
+    """Sparse cloud coloured from the images. A leaf: nothing downstream
+    consumes it.
+
+    Lands in ``recon_dir`` beside the scene it is coloured from, which every
+    shape puts there.
+    """
+    return recon_dir(output) / 'colorize_sfm.ply'
 
 
 # --- MVS artifacts ---------------------------------------------------------
@@ -168,35 +186,48 @@ def colorize_sfm(sfm: Path) -> Path:
 
 def convert_scene(output: Path) -> Path:
     """The interface scene the MVG->MVS conversion writes."""
-    return mvs_dir(output) / 'scene.mvs'
+    return mvs_dir(output) / 'convert_scene.mvs'
 
 
-def densify_scene(scene: Path) -> Path:
-    """The scene densify writes beside its input.
+def densify_scene(output: Path) -> Path:
+    """The scene densify writes.
 
     Densify is the only MVS stage that writes a scene at all -- and the scene
     it writes still holds the *sparse* cloud, the dense one going to
     :func:`densify_cloud`. Reconstruct, refine and texture emit only geometry.
+
+    The stem is the stage alone, with no role: see :func:`densify_cloud`.
     """
-    return scene.parent / (scene.stem + '_dense.mvs')
+    return mvs_dir(output) / 'densify.mvs'
 
 
-def densify_cloud(scene: Path) -> Path:
-    """The dense cloud. Named from the *scene* densify wrote, so the pair
-    differs only by extension, which is how OpenMVS expects to find it."""
-    return densify_scene(scene).with_suffix('.ply')
+def densify_cloud(output: Path) -> Path:
+    """The dense cloud, the pair to :func:`densify_scene`.
+
+    **Half frozen.** ``DensifyPointCloud`` takes one ``-o`` and writes both
+    files from its stem -- the scene as ``.mvs``, the cloud as ``.ply`` -- so
+    the two names cannot differ, and the stage cannot spell out two roles.
+    Hence ``densify.mvs``/``densify.ply``: the stem names the stage and the
+    suffix carries the role, rather than a cloud being named
+    ``densify_scene.ply``, which is the class of mislabel ADR 0006 exists to
+    end.
+    """
+    return densify_scene(output).with_suffix('.ply')
 
 
-def reconstruct_mesh(scene: Path) -> Path:
+def reconstruct_mesh(output: Path) -> Path:
     """The surface reconstructed from a scene's cloud."""
-    return scene.parent / (scene.stem + '_mesh.ply')
+    return mvs_dir(output) / 'reconstruct_mesh.ply'
 
 
-def refine_mesh(scene: Path) -> Path:
-    """The refined mesh -- named from the *scene* it was refined against, not
-    from the mesh it refines. That is what makes ``scene_dense_refine.ply`` a
-    mesh with a scene's name, the confusion ADR 0006 exists to end."""
-    return scene.parent / (scene.stem + '_refine.ply')
+def refine_mesh(output: Path) -> Path:
+    """The refined mesh.
+
+    Named for what it *is*, not for the scene it was refined against -- which
+    is what made the old ``scene_dense_refine.ply`` a mesh carrying a scene's
+    name.
+    """
+    return mvs_dir(output) / 'refine_mesh.ply'
 
 
 def final_mesh(output: Path, name: str, file_type: str) -> Path:

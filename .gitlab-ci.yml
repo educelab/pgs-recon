@@ -52,6 +52,30 @@ test:python:
     - echo Running the test suite against the installed dependencies
     - python -m unittest discover -s tests -v
 
+# The only job that runs the suite where the binaries are. Both jobs above run
+# against a /usr/local with no OpenMVG in it, so anything reaching the built-in
+# default prefix passes for the wrong reason -- three tests did, asserting
+# ToolNotFound for real tool names and failing inside the image while CI stayed
+# green. The repo checkout shadows the image's editable install, so this tests the
+# MR's code against the real toolchain.
+#
+# It is also the only place test_openmvs.TestSurfaceMatchesTheInstalledBinaries
+# runs: OpenMVS is fetched as a tarball with no source tree to transcribe from, so
+# the binaries' own --help is the authority that ADR 0005's "every flag reachable"
+# is checked against, and that check skips itself wherever they are missing.
+test:in-image:
+  stage: test
+  image: ghcr.io/educelab/pgs-recon:edge
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+  script:
+    # Assert the layout this job exists for, so a moved prefix fails here rather
+    # than quietly making the job meaningless again.
+    - test -x /usr/local/bin/openMVG_main_SfM
+    - test -x /usr/local/bin/OpenMVS/ReconstructMesh
+    - python -m unittest discover -s tests -v
+
 # Full C++ dependency build across the same base-image / CUDA matrix as the
 # GitHub Docker images. Expensive, so gated to MRs that actually touch the
 # dependencies, Dockerfile, or CI config. CUDA variants compile the .cu kernels

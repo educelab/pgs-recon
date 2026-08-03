@@ -14,7 +14,7 @@
 # after that work is already done. Here only job 3 asks for the big node.
 #
 # Each job runs `pgs-recon` against the same --output directory and picks up
-# where the last stopped; state lives in that directory's metadata.json. Only
+# where the last stopped; state lives in that directory's pgs-recon.json. Only
 # job 1 needs -i/--name/-c: every argument it ran with is recorded and reloaded
 # by the later jobs.
 #
@@ -106,14 +106,15 @@ sbatch_common=(
 
 # --- Job 1: stage in, convert to JPG, run every OpenMVG stage ----------------
 # --to convert stops after openMVG2openMVS, so this job produces the interface
-# scene.mvs that densify consumes and nothing more.
+# convert_scene.mvs that densify consumes and nothing more.
 #
-# --mvs-densify belongs HERE, on the run that establishes the pipeline shape:
-# densify renames the whole mesh chain (scene_mesh.ply -> scene_dense_mesh.ply),
-# so adding it on a later job would invalidate stages that job is not sized to
-# rebuild. pgs-recon would notice and warn rather than silently skip them, but
-# the chain would still need a re-run to catch up. (--mvs-refine is on by
-# default, so refine is already in the shape.)
+# --mvs-densify belongs HERE, on the run that establishes the pipeline shape.
+# Artifact names no longer move when it is added (ADR 0006), but reconstruct's
+# input still does -- from convert_scene.mvs to densify.mvs -- so adding it on a
+# later job would invalidate stages that job is not sized to rebuild. pgs-recon
+# would notice and warn rather than silently skip them, but the mesh stages
+# would still need a re-run to catch up. (--mvs-refine is on by default, so
+# refine is already in the shape.)
 job1=$(sbatch --parsable "${sbatch_common[@]}" \
   --job-name="pgs-mvg-${job_name}" \
   --output="pgs-recon_mvg_%j_out.txt" \
@@ -177,6 +178,12 @@ printf '  job 2  %-22s %s  %s\n' "densify" "${part_gpu}" "${job2}"
 # recorded complete and skipped. To retry refine less aggressively instead, add
 # an argument it owns and the stages downstream of it re-run too:
 #   pgs-recon -o <dir> --from refine --refine-resolution-level 2
+#
+# Memory is not the only way this job runs out. At the pinned OpenMVS, refine's
+# mesh *preparation* remeshes with single-threaded CGAL before any optimization
+# starts, and on a large mesh that can burn hours on one core with flat RSS -- so
+# a timeout here means --time or the knobs below, not --mem:
+#   pgs-recon -o <dir> --from refine --refine-ensure-edge-size 0
 job3=$(sbatch --parsable "${sbatch_common[@]}" \
   --job-name="pgs-mesh-${job_name}" \
   --output="pgs-recon_mesh_%j_out.txt" \
@@ -233,7 +240,7 @@ time tar -cvzf "${processed_job_dir}/intermediate.tar.gz" \\
   "${processed_job_dir}/jpg" \\
   "${processed_job_dir}/mvg" \\
   "${processed_job_dir}/mvs" \\
-  "${processed_job_dir}/metadata.json" \\
+  "${processed_job_dir}/pgs-recon.json" \\
   ${processed_job_dir}/*.txt \\
   --remove-files
 

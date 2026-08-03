@@ -35,11 +35,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from pgs_recon import toolchain
+from pgs_recon import layout, toolchain
 from pgs_recon.toolchain import MVG_BIN, MVS_BIN
 from pgs_recon.utility import ToolFailed
 
-from test_toolchain import make_fake_prefix
+from test_toolchain import flag, make_fake_prefix
 
 DEPS = ('configargparse', 'sfm_utils', 'exiftool')
 MISSING = [d for d in DEPS if importlib.util.find_spec(d) is None]
@@ -56,14 +56,6 @@ MVG_TOOLS = ('openMVG_main_SfMInit_ImageListing', 'openMVG_main_ComputeFeatures'
              'openMVG_main_SfM_Localization', 'pgs-global-scaler')
 MVS_TOOLS = ('DensifyPointCloud', 'ReconstructMesh', 'RefineMesh',
              'TextureMesh')
-
-
-def flag(argv, name: str):
-    """The value following ``name`` in ``argv``, or None if it is absent."""
-    for i, token in enumerate(argv[:-1]):
-        if token == name:
-            return argv[i + 1]
-    return None
 
 
 def _write(path: Path) -> None:
@@ -193,7 +185,7 @@ class PipelineCase(unittest.TestCase):
             reconstruct._main()
         for hook in hooks:
             hook()
-        return json.loads((out / 'metadata.json').read_text())
+        return json.loads(layout.manifest(out).read_text())
 
     def argv_for(self, tool: str) -> list:
         """The argv of the single invocation of ``tool``."""
@@ -210,19 +202,22 @@ class TestFullRun(PipelineCase):
         out = self.tmp / 'recon'
         self.run_recon(out)
         self.assertEqual([
-            'metadata.json',
             'mvg/matches_dir/matches.bin',
             'mvg/matches_dir/matches_filtered.bin',
+            'mvg/recon_dir/colorize_sfm.ply',
             'mvg/recon_dir/sfm_data.bin',
-            'mvg/recon_dir/sfm_data_colorized.ply',
             'mvg/sfm_data.json',
+            'mvs/convert_scene.mvs',
             'mvs/obj.obj',
-            'mvs/scene.mvs',
-            'mvs/scene_mesh.ply',
-            # Refine names its output after the *scene* it refined against, not
-            # after the mesh it consumed (ADR 0003; ADR 0006 ends this).
-            'mvs/scene_refine.ply',
+            'mvs/reconstruct_mesh.ply',
+            # Every intermediate is <stage>_<role> (ADR 0006): refine's output
+            # is a mesh named for the stage that made it, not for the scene it
+            # was refined against.
+            'mvs/refine_mesh.ply',
             'obj_recon_config.txt',
+            # The manifest is named for the tool, not 'metadata.json', which is
+            # what a PGS *scan* directory calls its own descriptor.
+            'pgs-recon.json',
         ], tree(out))
 
     def test_the_binaries_run_in_pipeline_order(self):
@@ -248,7 +243,7 @@ class TestFullRun(PipelineCase):
         out = self.tmp / 'recon'
         self.run_recon(out, '--to', 'colorize')
         self.assertEqual([], [t for t in self.ran() if t in MVS_TOOLS])
-        self.assertFalse((out / 'mvs' / 'scene.mvs').exists())
+        self.assertFalse((out / 'mvs' / 'convert_scene.mvs').exists())
 
     def test_a_missing_binary_names_the_prefix_that_was_searched(self):
         # resolve_exe is exercised for real, so a prefix without the tool fails
@@ -325,6 +320,39 @@ class TestSfMEngineFlags(PipelineCase):
         self.assertTrue((self.tmp / 'out' / 'sfm_data.bin').is_file())
 
 
+class TestDirectAndRobustAreDistinctStages(PipelineCase):
+    """Both run ``ComputeStructureFromKnownPoses``, and both can be enabled.
+
+    The names used to tell them apart by chaining (``sfm_data_structured.bin``
+    then ``sfm_data_structured_structured.bin``). Under ADR 0006 the ``sfm``
+    stage writes the solve's own name whichever engine implements it, so robust
+    still has a distinct output rather than reading and writing one file.
+    """
+
+    def triangulations(self) -> list:
+        return [c for c, _ in self.commands
+                if Path(c[0]).name == 'openMVG_main_ComputeStructureFromKnownPoses']
+
+    def test_direct_writes_the_solve_and_robust_writes_its_own(self):
+        out = self.tmp / 'recon'
+        self.run_recon(out, '--mvg-recon-method', 'direct', '--mvg-robust')
+        direct, robust = self.triangulations()
+        solved = str(out / 'mvg' / 'recon_dir' / 'sfm_data.bin')
+        self.assertIn('-d', direct)
+        self.assertEqual(str(out / 'mvg' / 'sfm_data.json'), flag(direct, '-i'))
+        self.assertEqual(solved, flag(direct, '-o'))
+        self.assertNotIn('-d', robust)
+        self.assertEqual(solved, flag(robust, '-i'))
+        self.assertEqual(str(out / 'mvg' / 'recon_dir' / 'robust_sfm.bin'),
+                         flag(robust, '-o'))
+
+    def test_no_openmvg_solve_runs_for_the_direct_method(self):
+        out = self.tmp / 'recon'
+        self.run_recon(out, '--mvg-recon-method', 'direct')
+        self.assertNotIn('openMVG_main_SfM', self.ran())
+        self.assertTrue((out / 'mvg' / 'recon_dir' / 'sfm_data.bin').is_file())
+
+
 class TestArchiveType(PipelineCase):
     """ADR 0003: portable intermediates, so a `.mvs` survives another container."""
 
@@ -346,8 +374,8 @@ class TestDenseCloudIsHandedOver(PipelineCase):
     def test_reconstruct_is_given_the_dense_cloud(self):
         self.run_recon(self.tmp / 'recon', '--mvs-densify')
         argv = self.argv_for('ReconstructMesh')
-        self.assertEqual('scene_dense.ply', flag(argv, '-p'))
-        self.assertEqual('scene_dense.mvs', flag(argv, '-i'))
+        self.assertEqual('densify.ply', flag(argv, '-p'))
+        self.assertEqual('densify.mvs', flag(argv, '-i'))
 
     def test_reconstruct_is_given_the_dense_cloud_a_job_later(self):
         # The binding comes from the manifest here, not from a densify that ran
@@ -356,7 +384,7 @@ class TestDenseCloudIsHandedOver(PipelineCase):
         self.run_recon(out, '--mvs-densify')
         self.commands.clear()
         self.run_recon(out, '--from', 'reconstruct', '--rerun')
-        self.assertEqual('scene_dense.ply',
+        self.assertEqual('densify.ply',
                          flag(self.argv_for('ReconstructMesh'), '-p'))
 
     def test_no_densify_means_no_point_cloud_flag(self):
@@ -367,10 +395,10 @@ class TestDenseCloudIsHandedOver(PipelineCase):
 class TestStagedRunsMatchSingleShot(PipelineCase):
     """ADR 0004's acceptance test: a split run must leave the same tree.
 
-    The names are derived from the artifacts a stage consumes, so a job that
-    rehydrates its inputs from the manifest has to reproduce them exactly. This
-    is the regression that a rename (ADR 0006) could plausibly break, and the
-    reason it is automated rather than checked by eye.
+    A later job rehydrates its inputs from the manifest rather than recomputing
+    them, which is what has to hold for the tree to match. That is the invariant
+    the rename (ADR 0006) rides on, and the reason this is automated rather than
+    checked by eye.
     """
 
     def one_shot(self, *shape) -> Path:
@@ -391,7 +419,7 @@ class TestStagedRunsMatchSingleShot(PipelineCase):
         single, staged = self.one_shot(*shape), self.staged(*shape)
         self.assertEqual(tree(single), tree(staged))
         # And every stage really did run exactly once in the staged case.
-        stages = json.loads((staged / 'metadata.json').read_text())['stages']
+        stages = json.loads(layout.manifest(staged).read_text())['stages']
         self.assertTrue(all(r['status'] == 'complete' for r in stages.values()),
                         stages)
         return tree(single)
@@ -399,9 +427,9 @@ class TestStagedRunsMatchSingleShot(PipelineCase):
     def test_three_windows_leave_the_same_artifacts_as_one_run(self):
         files = self.assert_same_tree('--mvs-densify')
         # Spot-check that the tree compared is the real one, not two empties.
-        for expected in ('mvs/scene_dense.mvs', 'mvs/scene_dense.ply',
-                         'mvs/scene_dense_mesh.ply',
-                         'mvs/scene_dense_refine.ply', 'mvs/obj.obj'):
+        for expected in ('mvs/densify.mvs', 'mvs/densify.ply',
+                         'mvs/reconstruct_mesh.ply', 'mvs/refine_mesh.ply',
+                         'mvs/obj.obj'):
             self.assertIn(expected, files)
 
     def test_the_same_holds_for_a_scaled_and_re_triangulated_shape(self):
@@ -450,8 +478,55 @@ class TestResumeIsIdempotent(PipelineCase):
                          self.ran())
         # The mesh chain is back on the non-dense names, and the dense
         # intermediates are left where they were: nothing deletes.
-        self.assertEqual('scene.mvs', flag(self.argv_for('ReconstructMesh'), '-i'))
-        self.assertTrue((out / 'mvs' / 'scene_mesh.ply').is_file())
+        self.assertEqual('convert_scene.mvs',
+                         flag(self.argv_for('ReconstructMesh'), '-i'))
+        self.assertTrue((out / 'mvs' / 'reconstruct_mesh.ply').is_file())
+
+
+class TestPre18ManifestName(PipelineCase):
+    """A directory whose manifest is still called ``metadata.json``.
+
+    The artifact rename was safe because names are only ever written; the
+    manifest is the one thing located *by* name, so this is the case that would
+    silently re-run an entire finished reconstruction.
+    """
+
+    def make_legacy(self, out: Path, *shape) -> None:
+        """A finished run as pgs-recon before 1.8 left it."""
+        self.run_recon(out, *shape)
+        layout.manifest(out).rename(layout.legacy_manifest(out))
+        self.commands.clear()
+
+    def test_a_pre_1_8_directory_resumes_without_running_anything(self):
+        out = self.tmp / 'recon'
+        self.make_legacy(out, '--mvs-densify')
+        meta = self.run_recon(out, '--mvs-densify')
+        self.assertEqual([], self.ran())
+        self.assertTrue(all(r['status'] == 'complete'
+                            for r in meta['stages'].values()), meta['stages'])
+
+    def test_the_arguments_of_a_pre_1_8_run_are_still_recovered(self):
+        # --name and --input come back out of the old file, so a later job needs
+        # neither -- the property the whole staged workflow rests on.
+        out = self.tmp / 'recon'
+        self.make_legacy(out)
+        meta = self.run_recon(out, '--from', 'texture', '--rerun')
+        self.assertEqual(['TextureMesh'], self.ran())
+        self.assertEqual('obj', meta['effective_args']['name'])
+
+    def test_the_next_run_records_to_the_new_name_and_leaves_the_old_alone(self):
+        out = self.tmp / 'recon'
+        self.make_legacy(out)
+        legacy = layout.legacy_manifest(out)
+        before = legacy.read_text()
+        self.run_recon(out, '--from', 'texture', '--rerun')
+        self.assertTrue(layout.manifest(out).is_file())
+        self.assertEqual(before, legacy.read_text())
+        # And from then on the new file is the record: the stale one is ignored,
+        # not merged, so a second resume still runs only what was asked.
+        self.commands.clear()
+        self.run_recon(out)
+        self.assertEqual([], self.ran())
 
 
 class TestPrefixResolution(PipelineCase):
@@ -489,7 +564,7 @@ class TestPrefixResolution(PipelineCase):
         out = self.tmp / 'recon'
         self.run_recon(out, '--to', 'import')          # records --path
         self.assertNotIn('path', json.loads(
-            (out / 'metadata.json').read_text())['effective_args'])
+            layout.manifest(out).read_text())['effective_args'])
         self.commands.clear()
 
         elsewhere = make_fake_prefix(self.tmp / 'other-prefix', mvg=MVG_TOOLS,

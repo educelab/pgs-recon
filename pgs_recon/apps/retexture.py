@@ -20,7 +20,7 @@ re-pointed at the modality images. The pipeline is:
 The mesh and the regenerated scene must share a coordinate frame. This runs as
 an optional stage *after* a normal ``pgs-recon`` run: point ``--recon-dir`` at
 that run's output directory and both inputs are taken from it via its
-``metadata.json`` — the solved SfM fed to openMVG2openMVS (after any
+manifest — the solved SfM fed to openMVG2openMVS (after any
 robust/autoscale step, NOT the rig-prior import) and the textured mesh as
 output by TextureMesh (before any centering transform). Either can be supplied
 directly instead (``--sfm-data``, ``--mesh``), and in ``--calibration`` mode the
@@ -63,6 +63,7 @@ import numpy as np
 from pgs_recon import toolchain
 from pgs_recon.openmvg import mvg_to_mvs
 from pgs_recon.openmvs import mvs_texture
+from pgs_recon.stages import write_manifest
 from pgs_recon.toolchain import Recorder, resolve_exe, run
 from pgs_recon.utility import ToolFailed
 from pgs_recon.utils.apps import setup_logging
@@ -572,7 +573,7 @@ def _main():
     parser.add_argument('--recon-dir', '-r', required=True,
                         help='A pgs-recon output directory. The solved SfM and '
                              'the textured mesh are located from its '
-                             'metadata.json; each is only required if this run '
+                             'manifest; each is only required if this run '
                              'actually reads it, so overriding both (--sfm-data '
                              'or --calibration, plus --mesh) needs nothing from '
                              'the reconstruction but its manifest. The recon must '
@@ -751,7 +752,7 @@ def _main():
                        f'overwritten: {paths["output_mesh"]}')
 
     # Config + metadata, mirroring pgs-recon conventions (sidecar files; the
-    # recon's own metadata.json is never touched).
+    # recon's own manifest is never touched).
     datetime_str = dt.now(tz.utc).strftime('%Y%m%d%H%M%S')
     config_path = working_dir / f'{datetime_str}_{stem}_retexture_config.txt'
     args.config = str(config_path)
@@ -765,7 +766,7 @@ def _main():
 
     metadata = {'args': ' '.join(sys.argv), 'parsed': vars(args),
                 'commands': {}}
-    paths['metadata'] = working_dir / f'{stem}_retexture_metadata.json'
+    paths['manifest'] = working_dir / f'{stem}_retexture.json'
 
     # Where the binaries are and what records their invocations: process-wide, so
     # no wrapper takes either as an argument (ADR 0005).
@@ -775,8 +776,7 @@ def _main():
     @atexit.register
     def write_metadata():
         metadata['paths'] = {k: str(v) for k, v in paths.items()}
-        with paths['metadata'].open('w') as mf:
-            mf.write(json.dumps(metadata, indent=4, sort_keys=False))
+        write_manifest(paths['manifest'], metadata)
 
     write_metadata()
 
