@@ -28,8 +28,50 @@ docker run -v .:/working ghcr.io/educelab/pgs-recon:latest \
 Upon successful completion of the pipeline, your reconstructed model can be 
 found in `recon/mvs/my-object.obj`.
 
+### What lands in the output directory
+Every intermediate is named `<stage>_<role>`, after the stage that produced it,
+so a half-finished directory can be read for what has happened so far. Optional
+stages are marked; the rest are always present:
+
+```
+recon/
+  pgs-recon.json                  # the manifest: what ran, and with what arguments
+  my-object_recon_config.txt      # the effective arguments, loadable with -c
+  mvg/
+    sfm_data.json                 # the imported scene
+    matches_dir/                  # per-image features, matches[_filtered].bin
+    recon_dir/
+      sfm_data.bin                # the solve
+      robust_sfm.bin              # --mvg-robust
+      autoscale_sfm.bin           # --mvg-autoscale
+      landmarks[_scaled].ply      # --mvg-autoscale: the markers it scaled from
+      colorize_sfm.ply            # sparse cloud coloured from the images
+  mvs/
+    convert_scene.mvs             # the interface scene every MVS stage reads
+    undistorted_images/
+    densify.mvs  densify.ply      # --mvs-densify: scene + the dense cloud
+    reconstruct_mesh.ply
+    refine_mesh.ply               # --mvs-refine (on by default)
+    my-object.obj                 # the deliverable, + .mtl and texture image
+```
+
+**Locate an artifact through the manifest, not by rebuilding its name.** Every
+stage records the paths it consumed and produced, relative to the output
+directory, and those records are what a resumed job reads — which is what lets
+these names change without invalidating a directory that already exists:
+
+```shell
+jq -r '.stages.texture.outputs.mesh' recon/pgs-recon.json   # the textured mesh
+jq -r '.stages.convert.inputs.sfm'   recon/pgs-recon.json   # the solved SfM it came from
+```
+
+Upgrading from 1.7, where the manifest was `metadata.json` and intermediates were
+named by chaining (`scene_dense_refine.ply`)? Those directories are still read,
+but a 1.7 manifest carries no per-stage record, so a run against one rebuilds it
+from the start. See [docs/migrating-to-1.8.md](docs/migrating-to-1.8.md).
+
 ### Staged and resumable runs
-The pipeline records what it has finished in `<output>/metadata.json`, so
+The pipeline records what it has finished in `<output>/pgs-recon.json`, so
 **re-running the same command in the same output directory resumes it** rather
 than starting over. After a crash or an out-of-memory kill during mesh
 refinement, this picks up at `refine`:
@@ -75,7 +117,9 @@ mesh/refine/texture to a high-memory node, chained with `afterok`. Notes:
   re-refines and re-textures but touches nothing before it.
 * Changing the shape is allowed at any point. Adding `--mvs-densify` to a
   finished reconstruction re-runs densify and the mesh stages, and dropping it
-  again re-runs them against the non-dense filenames.
+  again re-runs them against the sparse cloud. Filenames stay put either way:
+  an artifact is named for the stage that wrote it, not for the stages upstream
+  of it.
 * Stages before `--from` are never run implicitly: if one is incomplete or its
   inputs have moved, the run fails immediately, naming each, instead of quietly
   doing work the job was not sized for.
@@ -83,11 +127,11 @@ mesh/refine/texture to a high-memory node, chained with `afterok`. Notes:
   in a warning and rebuilt by the next run that covers them. The final textured
   mesh keeps its usual `mvs/<name>.obj` filename in the meantime, so check the
   warning rather than the filename.
-* What is on disk is never consulted — `<output>/metadata.json` is the record. If
-  you delete an intermediate by hand, use `--rerun` to rebuild it.
+* What is on disk is never consulted — `<output>/pgs-recon.json` is the record.
+  If you delete an intermediate by hand, use `--rerun` to rebuild it.
 * An argument aimed at a stage outside the range is ignored with a warning,
-  because it would change filenames the rest of the pipeline has already
-  committed to. Per-invocation settings are exempt and can differ freely between
+  because it would change what the stages in range consume, and this run is not
+  sized to rebuild them. Per-invocation settings are exempt and can differ freely between
   jobs: `--path` and `--cam-db` apply silently, and `--threads`, `--log-level`,
   `--config` and `--output` are not recorded at all, so they never leak into a
   later job.
@@ -95,6 +139,30 @@ mesh/refine/texture to a high-memory node, chained with `afterok`. Notes:
   copying of its own; stage node-local scratch in and out around it.
 * `--no-mvs` is deprecated: use `--to colorize` for an SfM-only run. The old flag
   still works (it sets `--to colorize` and warns) but will be removed.
+
+### When mesh refinement takes too long
+`refine` is the pipeline's slowest and hungriest stage, and it can run out of two
+different resources. Out of **memory** is the familiar one, and resuming the same
+command picks up where the kill happened.
+
+Out of **wall clock** looks different: no progress in the log, one core pinned at
+100%, and memory flat. That is mesh *preparation* rather than the optimization —
+before refining anything, `RefineMesh` subdivides the input mesh and remeshes the
+result with single-threaded CGAL, which is silent at the default verbosity and on
+a mesh of a few hundred thousand vertices can run for tens of minutes or more.
+Adding cores or memory does not help. Turning it off does:
+
+```shell
+# Skip the remesh; refine everything else as before
+pgs-recon -o recon/ --from refine --refine-ensure-edge-size 0
+
+# Or subdivide less aggressively, so preparation has less to remesh
+pgs-recon -o recon/ --from refine --refine-max-face-area 64
+```
+
+Both change the refined mesh, so they are options rather than defaults. If refine
+is not worth its cost on a given dataset, `--no-mvs-refine` drops it from the
+pipeline shape and textures the reconstructed mesh directly.
 
 ### Docker images
 We provide multi-architecture (x86, arm64) Docker images in the 
@@ -154,7 +222,7 @@ transform. The input mesh must already be in the SfM coordinate frame.
 ```shell
 docker run -v .:/working ghcr.io/educelab/pgs-recon \
   pgs-sfm-orient \
-    -i /working/recon/sfm/sfm_data.bin \
+    -i /working/recon/mvg/recon_dir/sfm_data.bin \
     --input-mesh /working/recon/mvs/my-object.obj \
     -o /working/recon/mvs/my-object-centered.obj \
     --save-transform /working/recon/orient.npy \
@@ -283,8 +351,8 @@ so a typo in any of them is unambiguous. The OpenMVG camera sensor database is
 expected at `<prefix>/lib/openMVG/sensor_width_camera_database.txt`.
 
 Unlike most arguments, `--path` is deliberately *not* inherited from a previous
-run's `metadata.json` when a staged run resumes (see `--from`/`--to` above), so
-each job of a split reconstruction picks up the prefix of the node it lands on.
+run's manifest when a staged run resumes (see `--from`/`--to` above), so each job
+of a split reconstruction picks up the prefix of the node it lands on.
 
 ### Advanced Installation
 #### Installation Location

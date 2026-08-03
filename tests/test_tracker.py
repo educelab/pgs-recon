@@ -10,13 +10,15 @@ through the real begin/end machinery, reloads the manifest that produced, and
 plans against it -- which is what pins ``test_stages.build_records()``, a
 hand-written model of these records, to what the code actually writes.
 """
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from pgs_recon import layout
 from pgs_recon.stages import (StageError, StageTracker, drifted_stages,
-                              load_manifest, pipeline_shape, resolve_range)
+                              find_manifest, load_manifest, pipeline_shape,
+                              resolve_range)
 
 from test_stages import build_records, make_args, quiet_logger
 
@@ -60,11 +62,11 @@ def fake_run(tracker, args) -> None:
         inputs = {'sfm': sfm_in, 'features': features_in}
         if args.mvg_recon_method == 'direct':
             inputs['matches'] = tracker.require('matches')
-            out = layout.robust_sfm(root, sfm_in)
         else:
             inputs['matches_filtered'] = tracker.require('matches_filtered')
-            out = layout.solved_sfm(root)
-        tracker.end('sfm', inputs=inputs, outputs={'sfm': out})
+        # Either engine writes the solve to the same place.
+        tracker.end('sfm', inputs=inputs,
+                    outputs={'sfm': layout.solved_sfm(root)})
 
     if tracker.begin('robust'):
         sfm_in = tracker.require('sfm')
@@ -73,17 +75,17 @@ def fake_run(tracker, args) -> None:
         tracker.end('robust',
                     inputs={'sfm': sfm_in, 'features': features_in,
                             'matches': matches_in},
-                    outputs={'sfm': layout.robust_sfm(root, sfm_in)})
+                    outputs={'sfm': layout.robust_sfm(root)})
 
     if tracker.begin('autoscale'):
         sfm_in = tracker.require('sfm')
         tracker.end('autoscale', inputs={'sfm': sfm_in},
-                    outputs={'sfm': layout.autoscale_sfm(root, sfm_in)})
+                    outputs={'sfm': layout.autoscale_sfm(root)})
 
     if tracker.begin('colorize'):
         sfm_in = tracker.require('sfm')
         tracker.end('colorize', inputs={'sfm': sfm_in},
-                    outputs={'colorized': layout.colorize_sfm(sfm_in)})
+                    outputs={'colorized': layout.colorize_sfm(root)})
 
     if tracker.begin('convert'):
         sfm_in = tracker.require('sfm')
@@ -93,18 +95,18 @@ def fake_run(tracker, args) -> None:
     if tracker.begin('densify'):
         scene_in = tracker.require('scene')
         tracker.end('densify', inputs={'scene': scene_in},
-                    outputs={'scene': layout.densify_scene(scene_in),
-                             'cloud': layout.densify_cloud(scene_in)})
+                    outputs={'scene': layout.densify_scene(root),
+                             'cloud': layout.densify_cloud(root)})
 
     if tracker.begin('reconstruct'):
         scene_in, cloud = tracker.require('scene'), tracker.path('cloud')
         tracker.end('reconstruct', inputs={'scene': scene_in, 'cloud': cloud},
-                    outputs={'mesh': layout.reconstruct_mesh(scene_in)})
+                    outputs={'mesh': layout.reconstruct_mesh(root)})
 
     if tracker.begin('refine'):
         scene_in, mesh_in = tracker.require('scene'), tracker.require('mesh')
         tracker.end('refine', inputs={'scene': scene_in, 'mesh': mesh_in},
-                    outputs={'mesh': layout.refine_mesh(scene_in)})
+                    outputs={'mesh': layout.refine_mesh(root)})
 
     if tracker.begin('texture'):
         scene_in, mesh_in = tracker.require('scene'), tracker.require('mesh')
@@ -145,14 +147,21 @@ class TrackerCase(unittest.TestCase):
         self.sfm = layout.imported_sfm(self.root)
         self.scene = layout.convert_scene(self.root)
 
-    def tracker(self, args, explicit=(), manifest=None) -> StageTracker:
+    def tracker(self, args, explicit=(), manifest=None,
+                read_from=None) -> StageTracker:
         """A tracker over what is on disk now, as a fresh process would build it.
 
         Each call builds its own, from the manifest alone, so one simulated job
         cannot see another's live bindings.
+
+        ``manifest`` is the file written, ``read_from`` the file read. They are
+        the same unless a caller is modelling ``_main()``'s pre-1.8 fallback,
+        where the records come from ``metadata.json`` and the writes land on
+        ``pgs-recon.json`` -- which is what moves such a directory onto the new
+        name.
         """
         path = manifest or self.manifest
-        meta = load_manifest(path)
+        meta = load_manifest(read_from or path)
         shape = pipeline_shape(args)
         from_stage, to_stage = resolve_range(args, shape)
         drift = drifted_stages(args, meta.get('stages') or {}, set(explicit),
@@ -198,7 +207,7 @@ class TestRecords(TrackerCase):
                     outputs={'scene': self.scene})
         record = self.records()['convert']
         self.assertEqual({'sfm': 'mvg/sfm_data.json'}, record['inputs'])
-        self.assertEqual({'scene': 'mvs/scene.mvs'}, record['outputs'])
+        self.assertEqual({'scene': 'mvs/convert_scene.mvs'}, record['outputs'])
 
     def test_an_artifact_outside_the_output_dir_is_recorded_absolute(self):
         # A relative -i would otherwise be recorded bare and re-rooted under the
@@ -217,7 +226,7 @@ class TestRecords(TrackerCase):
         tracker.end('reconstruct',
                     inputs={'scene': self.scene,
                             'cloud': None},
-                    outputs={'mesh': self.root / 'mvs' / 'scene_mesh.ply'})
+                    outputs={'mesh': self.root / 'mvs' / 'reconstruct_mesh.ply'})
         self.assertEqual(['scene'], list(self.records()['reconstruct']['inputs']))
 
     def test_commands_are_attributed_to_the_stage_that_ran_them(self):
@@ -262,16 +271,16 @@ class TestChain(TrackerCase):
         # stages after it.
         tracker = self.tracker(args)
         self.assertFalse(tracker.begin('convert'))
-        self.assertEqual(self.root / 'mvs/scene.mvs', tracker.path('scene'))
+        self.assertEqual(self.root / 'mvs/convert_scene.mvs', tracker.path('scene'))
 
     def test_a_later_job_requires_the_mesh_the_last_one_recorded(self):
         args = make_args()
         fake_run(self.tracker(args), args)
         tracker = self.tracker(make_args(from_stage='texture', rerun=True))
         self.assertTrue(tracker.begin('texture'))
-        # RefineMesh names its output after the scene it refined against, not
-        # after the mesh it consumed.
-        self.assertEqual(self.root / 'mvs/scene_refine.ply',
+        # The mesh role is bound to what refine wrote, not to what
+        # reconstruct did.
+        self.assertEqual(self.root / 'mvs/refine_mesh.ply',
                          tracker.require('mesh'))
 
 
@@ -303,7 +312,7 @@ class TestManifestFailures(TrackerCase):
     """A stage transition that cannot be recorded has to stop the run."""
 
     def broken(self) -> Path:
-        return self.root / 'gone' / 'metadata.json'
+        return self.root / 'gone' / layout.manifest(self.root).name
 
     def test_begin_refuses_to_start_a_stage_it_cannot_record(self):
         tracker = self.tracker(make_args(), manifest=self.broken())
@@ -330,7 +339,7 @@ class TestManifestFailures(TrackerCase):
     def test_a_partial_write_is_never_left_behind(self):
         tracker = self.tracker(make_args())
         tracker.begin('import')
-        self.assertEqual([], list(self.root.glob('metadata.json.tmp*')))
+        self.assertEqual([], list(self.root.glob('pgs-recon.json.tmp*')))
 
 
 class TestRoundTrip(TrackerCase):
@@ -362,6 +371,83 @@ class TestRoundTrip(TrackerCase):
         self.assert_round_trips(make_args(mvg_recon_method='direct'))
 
 
+class TestPre18ManifestName(TrackerCase):
+    """1.8 renamed the manifest ``metadata.json`` -> ``pgs-recon.json``.
+
+    Unlike an artifact name, this one is *located* by name, so a directory
+    written by an earlier version would look empty and re-run the whole
+    pipeline. ``find_manifest`` is the fallback that stops that.
+    """
+
+    def legacy(self) -> Path:
+        return layout.legacy_manifest(self.root)
+
+    def test_a_fresh_directory_resolves_to_the_current_name(self):
+        self.assertEqual(self.manifest, find_manifest(self.root))
+
+    def test_an_old_directory_resolves_to_the_name_it_has(self):
+        args = make_args()
+        fake_run(self.tracker(args, manifest=self.legacy()), args)
+        self.assertTrue(self.legacy().is_file())
+        self.assertFalse(self.manifest.exists())
+        self.assertEqual(self.legacy(), find_manifest(self.root))
+
+    def test_the_current_name_wins_when_both_are_present(self):
+        # What a directory looks like after one run under 1.8: the old file is
+        # left in place and must never be read again.
+        args = make_args()
+        fake_run(self.tracker(args, manifest=self.legacy()), args)
+        self.manifest.write_text('{}')
+        self.assertEqual(self.manifest, find_manifest(self.root))
+
+    def test_an_old_directory_resumes_with_nothing_re_run(self):
+        args = make_args()
+        fake_run(self.tracker(args, manifest=self.legacy()), args)
+        # The next job reads through find_manifest, as _main() does...
+        resumed = self.tracker(args, manifest=find_manifest(self.root))
+        self.assertEqual([], self.runs(resumed))
+        self.assertEqual([], resumed.prereq_errors())
+
+    def test_a_1_7_manifest_records_nothing_to_resume_from(self):
+        """The older case, and the one that is *not* free.
+
+        1.7 predates ADR 0004's stage records: four keys, no ``stages`` and no
+        ``effective_args``. Finding the file is all the fallback can do -- there
+        is nothing in it to resume from, so every stage runs and the arguments
+        have to be given again. Only a 1.8-alpha directory (records, old
+        filename) resumes untouched.
+        """
+        self.legacy().write_text(json.dumps({
+            'args': 'pgs-recon -i /images -o recon --name obj',
+            'parsed': {'name': 'obj', 'file_type': 'obj'},
+            'paths': {'output': str(self.root)},
+            'commands': {'08/01/2026, 00:00:00.000000 UTC':
+                         'openMVG_main_SfM -i sfm_data.json'},
+        }))
+        found = find_manifest(self.root)
+        self.assertEqual(self.legacy(), found)
+
+        meta = load_manifest(found)
+        self.assertEqual({}, meta.get('effective_args', {}))
+        args = make_args()
+        tracker = self.tracker(args, manifest=found)
+        self.assertEqual(list(pipeline_shape(args)), self.runs(tracker))
+        self.assertEqual('never run', tracker.dirty['import'])
+
+    def test_the_records_a_resumed_old_directory_writes_land_on_the_new_name(self):
+        args = make_args()
+        fake_run(self.tracker(args, manifest=self.legacy()), args)
+        legacy_before = self.legacy().read_text()
+
+        # ...and writes to layout.manifest, which is what moves the directory.
+        rerun = make_args(from_stage='texture', rerun=True)
+        fake_run(self.tracker(rerun, read_from=find_manifest(self.root)), rerun)
+
+        self.assertEqual('complete', self.records()['texture']['status'])
+        self.assertEqual(legacy_before, self.legacy().read_text(),
+                         'the pre-1.8 manifest must be left untouched')
+
+
 class TestStagedJobs(TrackerCase):
     def test_a_later_job_resumes_from_the_records_the_first_wrote(self):
         args = make_args(mvs_densify=True)
@@ -378,7 +464,7 @@ class TestStagedJobs(TrackerCase):
 
         # densify consumed the scene convert recorded in the previous job, which
         # it can only have reached by absorbing the skipped stage's outputs.
-        self.assertEqual('mvs/scene.mvs',
+        self.assertEqual('mvs/convert_scene.mvs',
                          self.records()['densify']['inputs']['scene'])
         self.assertEqual([], self.runs(self.tracker(args)))
         self.assertEqual('mvs/obj.obj',
@@ -413,7 +499,7 @@ class TestStagedJobs(TrackerCase):
     def test_dropping_densify_rebuilds_the_mesh_chain_against_real_records(self):
         dense = make_args(mvs_densify=True)
         fake_run(self.tracker(dense), dense)
-        self.assertEqual('mvs/scene_dense.mvs',
+        self.assertEqual('mvs/densify.mvs',
                          self.records()['reconstruct']['inputs']['scene'])
 
         plain = make_args(mvs_densify=False)
@@ -422,7 +508,12 @@ class TestStagedJobs(TrackerCase):
                          self.runs(tracker))
         self.assertEqual('inputs changed: scene', tracker.dirty['reconstruct'])
         fake_run(tracker, plain)
-        self.assertEqual('mvs/scene_mesh.ply',
+        # The mesh keeps its name across the shape change (ADR 0006) and is
+        # rebuilt in place: what moved is reconstruct's *input*, back to the
+        # scene convert wrote, which is what clause 4 saw.
+        self.assertEqual('mvs/convert_scene.mvs',
+                         self.records()['reconstruct']['inputs']['scene'])
+        self.assertEqual('mvs/reconstruct_mesh.ply',
                          self.records()['reconstruct']['outputs']['mesh'])
 
 

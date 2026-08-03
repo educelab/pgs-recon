@@ -21,6 +21,9 @@ reconstruct refine texture`. `pgs-recon --from <stage> --to <stage>` selects an
 **inclusive, contiguous** window; both default to the ends, so existing
 invocations are unchanged. State lives in the run's existing
 `<output>/metadata.json` under a new `stages` key. See `pgs_recon/stages.py`.
+(1.8 renamed that file `pgs-recon.json` —
+[ADR 0007](./0007-name-the-manifest-for-the-tool.md) — with a read-fallback, so
+everything below holds under either name.)
 
 **What runs is decided by an artifact graph, not by position in the stage list.**
 Artifacts are nodes, stages are edges. `STAGE_IO` declares, per stage, the
@@ -40,7 +43,7 @@ each stage, dirty **after** `--to` is a warning naming each stage.
 
 Four things were deliberately *not* done:
 
-- **No second state file.** The manifest is `metadata.json`, which already
+- **No second state file.** The manifest is the run's own JSON, which already
   records every command; a parallel state file would be a second thing to keep
   consistent with it.
 - **The range does not replace the enable flags.** `--mvg-robust`,
@@ -87,17 +90,19 @@ import…reconstruct and starts at refine. No range flags needed.
   subsumes the other.** `sfm` rewrites `mvg/recon_dir/sfm_data.bin` at the same
   deterministic path every time, so only the *producer's* dirtiness reveals that
   `robust` must re-run (clause 3). Conversely, dropping `--mvs-densify` moves
-  `reconstruct`'s `scene` from `mvs/scene_dense.mvs` back to convert's
-  `mvs/scene.mvs` with nothing incomplete anywhere, and only the *rebinding*
-  reveals it (clause 4). Stages outside the shape bind nothing, which is what
+  `reconstruct`'s `scene` from `mvs/densify.mvs` back to convert's
+  `mvs/convert_scene.mvs` with nothing incomplete anywhere, and only the
+  *rebinding* reveals it (clause 4). Stages outside the shape bind nothing, which is what
   makes clause 4 fire on a shrunken shape. A stale `complete` record for an
   out-of-shape stage stays in the manifest and is simply never consulted.
 - **Rehydration is by semantic role** (`scene`, `mesh`, `cloud`), not by artifact
-  name. The names are *chained* (`scene_dense_mesh_refine.ply`), so a name
-  encodes which stages ran and cannot be reconstructed from args without
-  duplicating the naming logic; a role's recorded path is read from the manifest
-  and handed to the stage as-is. This is safe only because an output name is
-  derived from the artifacts a stage consumes and from nothing else —
+  name: a role's recorded path is read from the manifest and handed to the stage
+  as-is, never rebuilt from a naming rule. That was originally forced — the names
+  were *chained* (`scene_dense_mesh_refine.ply`), so a name encoded which stages
+  ran — and it is what since made
+  [ADR 0006](./0006-stage-named-artifacts.md)'s rename safe on directories
+  already on disk. This is safe only because an output name is a function of the
+  output root and nothing else —
   **byte-identical artifact names between a single-shot and a staged run is the
   acceptance test** (automated in `test_pipeline.py`), and anything that breaks it
   makes resumed outputs diverge. Every wrapper therefore consumes its inputs
@@ -140,9 +145,9 @@ import…reconstruct and starts at refine. No range flags needed.
   output directory. An override targeting a stage *inside* the range re-runs it
   (the primary use case: retry refine with a new `--refine-resolution-level`);
   *outside* the range it is warned and reverted to the manifest value, because
-  out-of-range values determine downstream filenames — flipping `--mvs-densify`
-  on a `--from refine` job would send refine looking for a `scene_dense_mesh.ply`
-  that was never built. Reverting happens *before* the graph is built, so the
+  out-of-range values determine what the in-range stages consume — flipping
+  `--mvs-densify` on a `--from refine` job would send refine reading a scene that
+  was never densified. Reverting happens *before* the graph is built, so the
   graph never sees the override: the principle is not to mutate parts of the
   graph this run is not prepared to recompute. Global args (`--threads`,
   `--path`: per-node facts) apply silently. The manifest always records the
@@ -172,7 +177,7 @@ import…reconstruct and starts at refine. No range flags needed.
 - **A completed in-range stage re-runs when a stage feeding it will run**, since
   its input is about to be rebuilt. Without this,
   `--from refine --refine-resolution-level 2` (with `--to` unset) would re-refine
-  and then *skip* texture, leaving a fresh `scene_refine.ply` beside a stale
+  and then *skip* texture, leaving a fresh `refine_mesh.ply` beside a stale
   `obj.obj`. The cascade follows the graph rather than stage order, so
   invalidating `colorize` — a leaf whose `colorized` ply nothing consumes —
   re-runs colorize and nothing else. It never crosses `--to`, so

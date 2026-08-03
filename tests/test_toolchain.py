@@ -26,6 +26,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from enum import IntEnum
 from pathlib import Path
 from unittest import mock
 
@@ -60,6 +61,19 @@ def make_fake_prefix(root: Path, mvg=(), mvs=()) -> Path:
             exe.touch()
             exe.chmod(0o755)
     return root
+
+
+def flag(argv, name: str):
+    """The value following ``name`` in ``argv``, or None if it is absent.
+
+    The argv-inspection convention every wrapper test shares, so it is defined
+    beside :func:`make_fake_prefix` rather than once per module. ``argv`` is
+    stringified on the way in: ``toolchain.run`` has already done that by the time
+    the ``run_command`` seam sees it, but a caller inspecting a half-built command
+    has not.
+    """
+    argv = [str(a) for a in argv]
+    return argv[argv.index(name) + 1] if name in argv else None
 
 
 class ToolchainCase(unittest.TestCase):
@@ -417,6 +431,64 @@ class TestUsing(ToolchainCase):
         with using(prefix='/inner'):
             self.assertIs(recorder, toolchain._recorder)
         self.assertIs(recorder, toolchain._recorder)
+
+
+class Lying(int):
+    """An ``int`` subclass whose ``str()`` is not its value.
+
+    The narrowing is invisible to a value assertion on a modern interpreter --
+    ``str()`` of an ``IntEnum`` is already its value from Python 3.11 on -- so an
+    enum cannot prove the narrowing happened here. This can: without the
+    ``int()``, ``str()`` returns ``'BAD'`` on every Python, so the test fails on
+    the runner in front of you rather than only on a 3.9 one.
+    """
+
+    def __str__(self):
+        return 'BAD'
+
+
+class Method(IntEnum):
+    L2 = 2
+
+
+class TestArgvNarrowing(ToolchainCase):
+    """``run`` is the one place argv becomes strings, so it is the one place an
+    ``int`` subclass is narrowed. Everything the wrappers hand over -- flags from
+    a ``_optional`` helper and flags they assemble by hand -- goes through it."""
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch('pgs_recon.toolchain.run_command')
+        self.run_command = patch.start()
+        self.addCleanup(patch.stop)
+
+    def argv(self, *command):
+        run(list(command))
+        return self.run_command.call_args[0][0]
+
+    def test_an_int_subclass_is_narrowed_before_stringifying(self):
+        self.assertEqual(['-x', '5'], self.argv('-x', Lying(5)))
+
+    def test_an_enum_reaches_argv_as_its_value(self):
+        """What OpenMVG parses. On 3.9/3.10 an unnarrowed member would arrive as
+        ``'Method.L2'``."""
+        self.assertEqual(['-R', '2'], self.argv('-R', Method.L2))
+
+    def test_a_bool_becomes_zero_or_one(self):
+        """The binaries declare these as options over a bool, not as presence
+        switches, so ``'True'`` would not parse."""
+        self.assertEqual(['-u', '1', '-f', '0'],
+                         self.argv('-u', True, '-f', False))
+
+    def test_a_float_is_left_alone(self):
+        """The narrowing keys on ``int``, so a ratio must not be truncated."""
+        self.assertEqual(['-r', '0.8'], self.argv('-r', 0.8))
+
+    def test_a_hand_built_flag_is_narrowed_too(self):
+        """The reason this lives at the chokepoint: ``--archive-type`` and
+        ``--max-texture-size`` never pass through a ``_optional`` helper."""
+        self.assertEqual(['--archive-type', '-1'],
+                         self.argv('--archive-type', Lying(-1)))
 
 
 class TestRun(ToolchainCase):

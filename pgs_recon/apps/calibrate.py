@@ -57,6 +57,7 @@ import numpy as np
 
 from pgs_recon import layout, toolchain
 from pgs_recon.openmvg import mvg_localize, CameraModel, ResectionMethod
+from pgs_recon.stages import write_manifest
 from pgs_recon.toolchain import Recorder, resolve_exe, run
 from pgs_recon.utility import ToolFailed
 from pgs_recon.utils.apps import setup_logging
@@ -425,7 +426,14 @@ def main():
         sys.exit(e.exit_code)
 
 
-def _main():
+def build_parser() -> configargparse.ArgumentParser:
+    """The argument surface, separable from the run so it can be inspected.
+
+    Same seam ``reconstruct.build_parser`` provides, and for the same reason:
+    ``--camera-model`` and ``--resection-method`` derive their ``choices`` from
+    the :mod:`pgs_recon.openmvg` enums, and ``test_calibrate`` is what holds
+    those to what ``openMVG_main_SfM_Localization`` actually accepts.
+    """
     parser = configargparse.ArgumentParser(
         prog='pgs-calibrate',
         description='Localize a new camera image against an existing pgs-recon '
@@ -441,7 +449,7 @@ def _main():
     parser.add_argument('--recon-dir', '-r', required=True,
                         help='A pgs-recon output directory. The solved SfM (with '
                              'structure) and database regions are located from '
-                             'its metadata.json (override the SfM with '
+                             'its manifest (override the SfM with '
                              '--sfm-data). The run must have reached the MVS '
                              'convert stage for the SfM to be found here; with '
                              '--sfm-data an SfM-only run (--no-mvs / --to '
@@ -556,7 +564,11 @@ def _main():
     parser.add_argument('--log-level', default='INFO', type=str.upper,
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                         help='Logging level')
-    args = parser.parse_args()
+    return parser
+
+
+def _main():
+    args = build_parser().parse_args()
 
     setup_logging(args.log_level)
     global logger
@@ -575,7 +587,7 @@ def _main():
     # --sfm-data has not named one. That is what lets a run which stopped before
     # convert (--no-mvs / --to colorize) still be calibrated against: what
     # localization actually needs from -r is the database regions checked below,
-    # and features/matches exist in an SfM-only run. metadata.json is still
+    # and features/matches exist in an SfM-only run. The manifest is still
     # required (load_manifest), being the record that makes -r a reconstruction
     # rather than a bare directory.
     resolved_sfm = resolve_solved_sfm(recon_dir)
@@ -657,7 +669,7 @@ def _main():
             f.write(f"{arg.replace('_', '-')} = {getattr(args, arg)}\n")
 
     metadata = {'args': ' '.join(sys.argv), 'parsed': vars(args), 'commands': {}}
-    paths['metadata'] = output / f'{args.name}_calibrate_metadata.json'
+    paths['manifest'] = output / f'{args.name}_calibrate.json'
 
     # Where the binaries are and what records their invocations: process-wide, so
     # no wrapper takes either as an argument (ADR 0005).
@@ -667,8 +679,7 @@ def _main():
     @atexit.register
     def write_metadata():
         metadata['paths'] = {k: str(v) for k, v in paths.items()}
-        with paths['metadata'].open('w') as mf:
-            mf.write(json.dumps(metadata, indent=4, sort_keys=False))
+        write_manifest(paths['manifest'], metadata)
 
     write_metadata()
 

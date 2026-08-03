@@ -35,13 +35,20 @@ The only tests are `tests/`: `python3 -m unittest discover -s tests`. They cover
 the staged-run planner (`test_stages.py`, pure logic, no filesystem), the stage
 records `StageTracker` writes (`test_tracker.py`, a temp dir but no binaries),
 artifact naming (`test_layout.py`), binary resolution and the run/record
-chokepoint (`test_toolchain.py`), `run_command`'s exit statuses
+chokepoint (`test_toolchain.py`), the MVS and MVG wrappers' flag surfaces
+(`test_openmvs.py` and `test_openmvg.py`, whose `SURFACES` tables are what make
+ADR 0005's "every flag reachable" enforceable — the MVG one maps each keyword
+argument to its argv flag, because OpenMVG's spellings are per-binary and cannot
+be derived), `run_command`'s exit statuses
 (`test_utility.py`), and `pgs-recon` end to end against a prefix of fake binaries
 plus its `--dry-run` (`test_pipeline.py`, `test_reconstruct.py`, which skip
 themselves when `configargparse`/`sfm_utils`/`exiftool` are missing). All
 stdlib-only, so they run anywhere in seconds — no reconstruction math is
 exercised, only what the pipeline asks the binaries to do. CI
-(`.gitlab-ci.yml`) runs that suite, then verifies that
+(`.gitlab-ci.yml`) runs that suite three ways — bare Python, with the Python deps
+installed, and inside `ghcr.io/educelab/pgs-recon:edge` (`test:in-image`, the only
+one where the binaries exist, so tests reaching the default prefix cannot pass for
+the wrong reason) — then verifies that
 dependencies build and the package pip-installs on Ubuntu 22.04 / 24.04. The
 canonical GitHub Actions workflow (`.github/workflows/build_docker.yml`)
 builds/publishes Docker images.
@@ -107,16 +114,18 @@ them and no `metadata` argument:
   that may legitimately be absent. Both are recorded paths read back from the
   manifest, never recomputed names.
 - **Outputs** are named by `pgs_recon/layout.py`, pure functions over the output
-  root (plus, until ADR 0006 lands, the input artifact a chained name derives
-  from). A wrapper never invents a filename; `layout` is the only place a name is
-  written, which is what makes renaming safe.
+  root: an intermediate is `<stage>_<role>.<ext>` and nothing in its name records
+  which other stages ran (ADR 0006). A wrapper never invents a filename; `layout`
+  is the only place a name is written, which is what makes renaming safe.
 - **Where the binaries are and what records them** is process-wide:
   `toolchain.configure(prefix=..., recorder=...)` once in `main()`.
   `toolchain.run()` is the single chokepoint that appends to
   `metadata['commands'][timestamp]` (a compatibility surface: `recon_dir.py` greps
   it) and then executes, so no wrapper can forget to record what it ran. An
-  `atexit` hook writes the manifest to `<output>/metadata.json`; the effective
-  config goes to `<output>/*_recon_config.txt`.
+  `atexit` hook writes the manifest to `<output>/pgs-recon.json`; the effective
+  config goes to `<output>/*_recon_config.txt`. `stages.find_manifest()` is what
+  reads it, falling back to a pre-1.8 `metadata.json` (ADR 0007) — the one
+  filesystem check in `stages.py`.
 
 When adding a stage: add a `layout` function for its output, add the wrapper as a
 pure argv builder ending in `run()`, and wire it in `run_pipeline` between
@@ -128,14 +137,24 @@ the wrappers stay a complete library surface over each binary's flags.
 ### Module layout
 
 - `pgs_recon/openmvg.py`, `pgs_recon/openmvs.py` — thin wrappers, one function per
-  binary, all routing through `toolchain.run`.
+  binary, all routing through `toolchain.run`. Each is its binary's *complete*
+  registered flag surface, transcribed from the pinned source and held to that by
+  the `SURFACES` tables above; when upstream moves, the wrapper and the table are
+  edited together. In `openmvg.py` a flag's spelling depends on how OpenMVG
+  registered it: `make_switch` flags are plain `bool` (no value exists to emit),
+  `make_option` over a bool is tri-state (`None` omits, `False` sends `0`), and
+  everything else is `None`-means-omit.
 - `pgs_recon/toolchain.py` — binary resolution, the run/record chokepoint, and
   what the binaries that resolve names against a directory need: `work_dir()`
   returns the directory a set of artifacts shares, refusing with
   `ArtifactsNotColocated` (a `ToolFailed`) when they disagree — OpenMVS really
   does require co-location. `relative_to_dir()` instead *translates*, for
   `openMVG_main_SfM`'s `-M`, whose join onto `-m` resolves `../`, so the matches
-  file may live anywhere; only an absolute path is unusable there.
+  file may live anywhere; only an absolute path is unusable there. `run()` is also
+  the one place argv becomes strings, so `_argv_token` narrows every `int`
+  subclass there rather than in each wrapper's flag builder — that is what makes a
+  `bool` reach argv as `0`/`1` and an `IntEnum` as its value (`str()` of one is its
+  member name before Python 3.11), including for flags a wrapper assembles by hand.
 - `pgs_recon/layout.py` — what every artifact of a run is called.
 - `pgs_recon/pgs_data.py` — import logic for EduceLab "PGS Scan" directories,
   including grid-scan neighbor lookup that generates an OpenMVG **view pairs file**
@@ -145,7 +164,7 @@ the wrappers stay a complete library surface over each binary's flags.
   and exits `128 + signum` for a signal death) and timestamp helper.
 - `pgs_recon/utils/` — shared helpers: `apps.py` (logging setup), `geometry.py`,
   `quality.py`, `charuco.py`, `wavefront.py`, `educelab.py` (ChArUco/board detection),
-  `recon_dir.py` (locate a finished run's SfM/mesh from its `metadata.json`),
+  `recon_dir.py` (locate a finished run's SfM/mesh from its manifest),
   `sfm_json.py` (OpenMVG SfM_Data JSON surgery: cereal polymorphic registration,
   extrinsic frame transforms), `images.py` (8-bit sRGB normalization).
 - `pgs_recon/apps/` — standalone CLI utilities (one `main()` each). Apps must NOT

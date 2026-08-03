@@ -14,6 +14,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from pgs_recon import layout
+
 DEPS = ('configargparse', 'sfm_utils', 'exiftool')
 MISSING = [d for d in DEPS if importlib.util.find_spec(d) is None]
 
@@ -49,7 +51,7 @@ class TestDryRun(unittest.TestCase):
 
     def test_leaves_an_existing_manifest_untouched(self):
         self.out.mkdir()
-        manifest = self.out / 'metadata.json'
+        manifest = layout.manifest(self.out)
         manifest.write_text(json.dumps({
             'effective_args': {'input': str(self.images), 'name': 'obj',
                                'mvs_refine': True, 'mvs_densify': False},
@@ -81,6 +83,72 @@ class TestArgMap(unittest.TestCase):
         from pgs_recon.apps.reconstruct import build_parser
         from pgs_recon.stages import validate_arg_map
         validate_arg_map(build_parser())
+
+
+#: What each binary actually parses for the arguments we offer a ``choices`` list
+#: for, transcribed from the pinned revisions -- OpenMVG ``c92ed1b``, and
+#: ``dependencies/utilities/src/global_scaler.cpp`` for the last one. The same
+#: move ``test_openmvg.SURFACES`` makes for flags, for values: a name we offer
+#: that the binary does not know is a stage that dies partway into a run, and no
+#: signature or ``choices`` list can catch it alone.
+ACCEPTED = {
+    # main_ComputeFeatures.cpp:192-210, stringToEnum:45-58
+    'describer_method': ('SIFT', 'SIFT_ANATOMY', 'AKAZE_FLOAT', 'AKAZE_MLDB'),
+    'describer_preset': ('NORMAL', 'HIGH', 'ULTRA'),
+    # main_ComputeMatches.cpp:232-291
+    'matching_method': ('AUTO', 'BRUTEFORCEL2', 'BRUTEFORCEHAMMING', 'HNSWL2',
+                        'HNSWL1', 'HNSWHAMMING', 'CASCADEHASHINGL2',
+                        'FASTCASCADEHASHINGL2'),
+    # main_GeometricFilter.cpp:165-183
+    'matching_geometric_model': ('f', 'e', 'h', 'a', 'u', 'o'),
+    # main_SfM.cpp:66-72 -- plus 'direct', which is ours: it routes to
+    # ComputeStructureFromKnownPoses rather than naming an -s engine.
+    'mvg_recon_method': ('incremental', 'incrementalv2', 'global', 'stellar',
+                         'direct'),
+    # main_SfM.cpp:86-92
+    'mvg_initializer': ('EXISTING_POSE', 'MAX_PAIR', 'AUTO_PAIR', 'STELLAR'),
+    # global_scaler.cpp:129-143
+    'autoscale_method': ('markers', 'sample-square'),
+}
+
+
+@unittest.skipIf(MISSING, f'requires {", ".join(MISSING)}')
+class TestChoicesMatchThePinnedBinaries(unittest.TestCase):
+    """No ``choices`` list may offer a value the binary rejects.
+
+    ``--matching-method ANNL2`` was offered for as long as this parser has
+    existed and stopped parsing when upstream replaced ANN with HNSW: choosing it
+    got you an ``Invalid Nearest Neighbor method`` and a dead matches stage, after
+    features had already run. Offering *fewer* values than the binary accepts is a
+    curation and stays allowed -- ``describer_method`` omits ``SIFT_ANATOMY`` --
+    so this is a subset assertion, not an equality one.
+    """
+
+    @staticmethod
+    def choices():
+        from pgs_recon.apps.reconstruct import build_parser
+        return {a.dest: a.choices for a in build_parser()._actions
+                if a.choices is not None}
+
+    def test_every_offered_choice_is_understood(self):
+        offered = self.choices()
+        for dest, accepted in ACCEPTED.items():
+            with self.subTest(argument=dest):
+                self.assertIn(dest, offered,
+                              f'--{dest.replace("_", "-")} no longer has a '
+                              f'choices list; drop it from ACCEPTED too')
+                self.assertEqual(
+                    set(), set(offered[dest]) - set(accepted),
+                    f'--{dest.replace("_", "-")} offers a value the pinned '
+                    f'binary does not parse')
+
+    def test_the_hnsw_matchers_are_reachable(self):
+        """The other half of the ANNL2 fix: the matchers that replaced it were
+        never added, so the only approximate matcher at this pin was
+        unreachable."""
+        offered = set(self.choices()['matching_method'])
+        self.assertLessEqual({'HNSWL2', 'HNSWL1', 'HNSWHAMMING'}, offered)
+        self.assertNotIn('ANNL2', offered)
 
 
 if __name__ == '__main__':

@@ -117,9 +117,12 @@ already independent of the shape keeps it, including every name a binary chooses
 for itself (`mvg/sfm_data.json`, `recon_dir/sfm_data.bin`) and the final
 deliverable `mvs/<name>.<ext>`, which is a user-facing contract. An artifact name
 is only ever *written* — a resumed job finds an existing artifact through the
-**manifest**, never by rebuilding its name. Not yet in effect: until
-[ADR 0006](./docs/adr/0006-stage-named-artifacts.md) lands, names chain off the
-input's stem and so *do* encode the shape (`scene_dense_refine.ply`).
+**manifest**, never by rebuilding its name
+([ADR 0006](./docs/adr/0006-stage-named-artifacts.md), which replaced the chained
+names an output directory used to carry: `scene_dense_refine.ply`). One stage
+cannot spell out two roles: `densify` hands `DensifyPointCloud` a single `-o`
+from which it names both files it writes, so the pair is `densify.mvs` /
+`densify.ply` — stem for the stage, suffix for the role.
 _Avoid_: path, key, stem, filename
 
 **Binding**:
@@ -140,7 +143,7 @@ than an error. Never inferred from what is on disk.
 _Avoid_: stale, invalid, out-of-date, needs-rebuild
 
 **Manifest**:
-The run's `metadata.json`, the single record of what a reconstruction has
+The run's `pgs-recon.json`, the single record of what a reconstruction has
 finished: each stage's status, the artifacts it produced, and the effective
 arguments it ran with. It is what makes a run resumable and what a later job
 consults instead of being told again.
@@ -197,7 +200,7 @@ Resulting layout (stem `IR940`, recon name `scroll`):
             IR940_scene.mvs
             IR940_input.ply              # staged copy of the mesh being textured
             IR940.obj                    # final, beside the recon's scroll.obj
-      IR940_retexture_metadata.json      # sidecar; recon's metadata.json untouched
+      IR940_retexture.json               # sidecar; recon's manifest untouched
       <datetime>_IR940_retexture_config.txt
 
 The only hard collision the convention removes is the **undistorted-images

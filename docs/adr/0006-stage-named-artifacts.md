@@ -1,9 +1,8 @@
 # Name artifacts for the stage that produced them
 
-**Status: proposed — not yet implemented.** Describes MR3 of the issue #17
-series; see [the plan](../wrapper-refactor-plan.md). Until it lands, names chain
-off the input's stem exactly as described under Context, so an output directory on
-disk today still contains `scene_dense_refine.ply` and friends.
+**Status: accepted.** Landed as MR3 of the issue #17 series. Output directories
+built before it still contain the chained names described under Context, and stay
+resumable — see the consequences.
 
 ## Context
 
@@ -39,7 +38,7 @@ tested.
 | autoscale | `sfm_data_structured_scaled.bin` | `autoscale_sfm.bin` |
 | colorize | `sfm_data_structured_scaled_colorized.ply` | `colorize_sfm.ply` |
 | convert | `scene.mvs` | `convert_scene.mvs` |
-| densify | `scene_dense.mvs` / `scene_dense.ply` | `densify_scene.mvs` / `densify_cloud.ply` |
+| densify | `scene_dense.mvs` / `scene_dense.ply` | `densify.mvs` / `densify.ply` |
 | reconstruct | `scene_dense_mesh.ply` | `reconstruct_mesh.ply` |
 | refine | `scene_dense_refine.ply` | `refine_mesh.ply` |
 
@@ -49,6 +48,15 @@ picks for itself (`mvg/sfm_data.json`, `recon_dir/sfm_data.bin`,
 `sfm_data_expanded.json`), the already-role-named `matches.bin` /
 `matches_filtered.bin` / `matches_dir/`, `pgs-global-scaler`'s
 `landmarks[_scaled].ply`, and the deliverable `mvs/<name>.<ext>`.
+
+**Densify is the one stage that names no role**, because it cannot: OpenMVS
+takes a single `-o` and writes both files from its stem — the scene as `.mvs`,
+the dense cloud as `.ply` (`DensifyPointCloud.cpp`, `baseFileName+".ply"`). The
+two names are therefore not independently choosable, so the stem carries the
+stage and the suffix carries the role. The alternative, naming the pair after
+one of its two roles, would have produced either a cloud called
+`densify_scene.ply` or a scene called `densify_cloud.mvs` — a mislabel of exactly
+the kind this ADR exists to end.
 
 **Stage-prefixed rather than bare role names** (`mesh.ply`) because roles are
 *rebound*: `reconstruct` and `refine` both produce `mesh`, so bare names would
@@ -79,6 +87,15 @@ on existing output directories, and it is the thing to not break.
   argument is unchanged — but the division of labour shifted. Two different
   producers can never share a name under this scheme, which is what keeps a
   rebinding always visible to clause 4.
+- **The `direct` method now writes the solve's name, `recon_dir/sfm_data.bin`.**
+  It previously borrowed `robust`'s chained name, which under this scheme would
+  be `robust_sfm.bin` — and `--mvg-recon-method direct` can be combined with
+  `--mvg-robust`, so the `robust` stage would have read and written one file.
+  Naming it for the stage rather than for the binary that implements it also
+  makes the two `sfm` branches interchangeable, which is what they are: the same
+  stage producing the same role, only one of them ever running. Switching
+  methods on an existing directory still re-runs the stage — `mvg_recon_method`
+  is one of its `STAGE_ARGS`, so clause 2 fires.
 - **Legacy output directories stay resumable, and a verbatim re-run is still a
   no-op.** Completed stages bind from their records, so nothing goes dirty. The
   first stage that *does* run writes the new name and cascades downstream —

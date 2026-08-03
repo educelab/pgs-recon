@@ -1,4 +1,4 @@
-"""Locate a pgs-recon run's artifacts from the ``metadata.json`` it wrote.
+"""Locate a pgs-recon run's artifacts from the manifest it wrote.
 
 ``pgs-retexture`` and ``pgs-calibrate`` both start from a finished ``pgs-recon``
 output directory, and both must answer the same non-obvious question: *which* of
@@ -27,6 +27,8 @@ import sys
 from pathlib import Path
 from typing import NamedTuple, Optional
 
+from pgs_recon.stages import find_manifest
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,15 +51,19 @@ class Resolved(NamedTuple):
 
 
 def load_manifest(recon_dir: Path):
-    """Read ``<recon_dir>/metadata.json``. Returns ``(meta_path, meta)``.
+    """Read the run's manifest. Returns ``(meta_path, meta)``.
 
     Required unconditionally: the manifest is the run's tracking record, and its
     absence means ``recon_dir`` is not a pgs-recon output at all -- there is
     nothing to resolve against and no frame to trust.
+
+    Reads whichever name is there (``find_manifest``), so these tools keep
+    working on directories built before 1.8 renamed it. Unlike ``pgs-recon``,
+    nothing here writes it back, so nothing moves.
     """
-    meta_path = recon_dir / 'metadata.json'
+    meta_path = find_manifest(recon_dir)
     if not meta_path.is_file():
-        sys.exit(f'No metadata.json in {recon_dir}; '
+        sys.exit(f'No {meta_path.name} in {recon_dir}; '
                  f'is this a pgs-recon output directory?')
     return meta_path, json.loads(meta_path.read_text())
 

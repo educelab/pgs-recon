@@ -21,7 +21,7 @@ from pgs_recon.openmvs import (mvs_densify, mvs_reconstruct, mvs_refine,
 from pgs_recon.pgs_data import init_sfm_pgs, get_tag_option
 from pgs_recon.stages import (CONTROL_ARGS, NO_PERSIST, STAGES, StageError,
                               StageTracker, apply_stored, drifted_stages,
-                              explicit_dests, load_manifest,
+                              explicit_dests, find_manifest, load_manifest,
                               pipeline_shape, resolve_range,
                               revert_out_of_range, utc_now, validate_arg_map,
                               write_manifest)
@@ -121,12 +121,12 @@ def build_parser() -> configargparse.ArgumentParser:
     parser.add_argument('--input', '-i',
                         help='directory of input images. Required for a new '
                              'reconstruction; recovered from the output '
-                             'directory\'s metadata.json when resuming.')
+                             'directory\'s manifest when resuming.')
     parser.add_argument('--output', '-o', required=True,
                         help='directory for output files')
     parser.add_argument('--name', '-n', type=str,
                         help='Experiment name. Recovered from the output '
-                             'directory\'s metadata.json when resuming.')
+                             'directory\'s manifest when resuming.')
     parser.add_argument('--file-type', choices=['ply', 'obj'],
                         default='obj', type=str.lower,
                         help='Output format for final textured mesh')
@@ -169,15 +169,26 @@ def build_parser() -> configargparse.ArgumentParser:
                                 'always "upright" w.r.t the ground plane.')
 
     opts_matcher = parser.add_argument_group('matcher options')
+    # These are the matchers openMVG_main_ComputeMatches builds at the pinned
+    # revision, and nothing else parses -- an unrecognized name is a hard failure
+    # in the binary, not a fallback. ANNL2 was offered here long after upstream
+    # replaced it with the HNSW matchers, so choosing it failed the stage.
     opts_matcher.add_argument('--matching-method',
                               choices=['AUTO',
                                        'BRUTEFORCEL2',
-                                       'ANNL2',
+                                       'HNSWL2',
+                                       'HNSWL1',
                                        'CASCADEHASHINGL2',
                                        'FASTCASCADEHASHINGL2',
-                                       'BRUTEFORCEHAMMING'],
+                                       'BRUTEFORCEHAMMING',
+                                       'HNSWHAMMING'],
                               default='FASTCASCADEHASHINGL2', type=str.upper,
-                              help='Feature matching method.')
+                              help='Feature matching method. BRUTEFORCEHAMMING '
+                                   'and HNSWHAMMING are for binary descriptors '
+                                   '(--describer-method AKAZE_MLDB), the rest '
+                                   'for scalar ones; AUTO chooses from the '
+                                   'descriptor type. HNSWL1 is tuned for '
+                                   'quantized/histogram descriptors.')
     opts_matcher.add_argument('--matching-geometric-model',
                               choices=['f', 'e', 'h', 'a', 'u', 'o'],
                               type=str.lower,
@@ -236,7 +247,7 @@ def build_parser() -> configargparse.ArgumentParser:
                           )
     opts_mvg.add_argument('--autoscale-marker-pix', type=int,
                           help="Minimum marker size in pixels. see the "
-                               "pgs-global-scaler --min-marker-size flag "
+                               "pgs-global-scaler --min-marker-pix flag "
                                "for more information")
     opts_mvg.add_argument('--autoscale-include-from',
                           help='text file containing a list of scene image '
@@ -295,6 +306,14 @@ def build_parser() -> configargparse.ArgumentParser:
     opts_mvs.add_argument('--refine-scale-step', default=None, type=float,
                           help='image scale factor used at each mesh '
                                'optimization step')
+    # Refine's mesh *preparation*, where a large mesh now spends its wall clock.
+    opts_mvs.add_argument('--refine-ensure-edge-size', default=None, type=int,
+                          help='improve edge sizes and vertex valence before '
+                               'refinement (0 - disabled, 1 - auto, 2 - force). '
+                               'Pass 0 if refine stalls in preparation.')
+    opts_mvs.add_argument('--refine-max-face-area', default=None, type=int,
+                          help='maximum projected face area left unsubdivided '
+                               'before refinement (0 - disabled)')
     opts_mvs.add_argument('--texture-resolution-level', default=None, type=int,
                           help='how many times to scale down images before '
                                'TextureMesh')
@@ -314,7 +333,7 @@ def build_parser() -> configargparse.ArgumentParser:
     opts_stage = parser.add_argument_group(
         'staged run options',
         'Split one reconstruction across several jobs, each sized for the '
-        'stages it runs. State lives in <output>/metadata.json; re-running the '
+        'stages it runs. State lives in <output>/pgs-recon.json; re-running the '
         'original command verbatim resumes where the last job stopped.')
     opts_stage.add_argument('--from', dest='from_stage', choices=STAGES,
                             metavar='STAGE',
@@ -364,17 +383,24 @@ def _main():
 
     out_dir = Path(args.output).resolve()
     manifest_path = layout.manifest(out_dir)
+    # Read from wherever this directory's manifest actually is; write to the
+    # current name, which is what moves a pre-1.8 directory onto it.
+    read_from = find_manifest(out_dir)
 
     # Load the previous run(s) in this directory. Recorded effective arguments
     # become defaults, so --input/--name are not needed to resume.
-    metadata = load_manifest(manifest_path)
+    metadata = load_manifest(read_from)
     stored = metadata.get('effective_args') or {}
     apply_stored(args, stored, explicit)
 
     setup_logging(args.log_level)
     logger = logging.getLogger("pgs-recon")
     if stored:
-        logger.info(f'Loaded arguments from {manifest_path}')
+        logger.info(f'Loaded arguments from {read_from}')
+    if read_from != manifest_path:
+        logger.warning(f'Resuming from {read_from.name}, written by pgs-recon '
+                       f'before 1.8. This run records to {manifest_path.name}; '
+                       f'the old file is left in place and goes stale.')
 
     if args.mvs is False:
         if args.to_stage not in (None, 'colorize'):
@@ -416,7 +442,7 @@ def _main():
         'recon_dir': layout.recon_dir(out_dir),
         'mvs': layout.mvs_dir(out_dir),
         'undistorted_images': layout.undistorted_images(out_dir),
-        'metadata': manifest_path,
+        'manifest': manifest_path,
     }
     if args.input is not None:
         paths['input'] = Path(args.input)
@@ -432,7 +458,7 @@ def _main():
                              f'{manifest_path} and --input was not given, so '
                              f'there is no name to derive it from.')
         args.name = datetime_str + '_' + str(Path(args.input).stem)
-    # One config per reconstruction, not per job; metadata.json's 'runs' has the
+    # One config per reconstruction, not per job; the manifest's 'runs' has the
     # per-invocation history.
     config = layout.config(out_dir, args.name)
     paths['config'] = config
@@ -505,7 +531,7 @@ def _main():
     @atexit.register
     def flush_manifest():
         metadata['paths'] = {key: str(val) for key, val in paths.items()}
-        write_manifest(paths['metadata'], metadata)
+        write_manifest(paths['manifest'], metadata)
 
     flush_manifest()
 
@@ -529,9 +555,9 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
     Each block asks the tracker whether its stage runs, takes its inputs from the
     artifact chain (``require`` for what a stage cannot run without, ``path`` for
     what may legitimately be absent), names its outputs through ``layout``, and
-    reports them back under semantic roles. Because a name is derived from the
-    input paths and nothing else, a staged run produces exactly the filenames a
-    single-shot run would.
+    reports them back under semantic roles. Because a name is a function of the
+    output root and nothing else (ADR 0006), a staged run produces exactly the
+    filenames a single-shot run would.
 
     The invariants that are ours rather than the binaries' live here, not in the
     wrappers (ADR 0005): notably that ``reconstruct`` is handed the dense cloud
@@ -611,7 +637,9 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
             logger.info('Computing structure from known poses')
             matches_in = tracker.require('matches')
             inputs['matches'] = matches_in
-            solved = layout.robust_sfm(output, sfm_in)
+            # Same name the openMVG engines produce: this is the solve, however
+            # it was computed, and only one of the two branches ever runs.
+            solved = layout.solved_sfm(output)
             mvg_compute_known(sfm_in, features_dir=features_in,
                               matches=matches_in, output=solved, direct=True,
                               bundle_adjustment=args.sfm_ba)
@@ -634,7 +662,7 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
         sfm_in = tracker.require('sfm')
         features_in = tracker.require('features')
         matches_in = tracker.require('matches')
-        robust = layout.robust_sfm(output, sfm_in)
+        robust = layout.robust_sfm(output)
         mvg_compute_known(sfm_in, features_dir=features_in, matches=matches_in,
                           output=robust, bundle_adjustment=args.robust_ba)
         tracker.end('robust', inputs={'sfm': sfm_in, 'features': features_in,
@@ -644,7 +672,7 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
     if tracker.begin('autoscale'):
         logger.info('Auto-scaling SfM scene')
         sfm_in = tracker.require('sfm')
-        scaled = layout.autoscale_sfm(output, sfm_in)
+        scaled = layout.autoscale_sfm(output)
         mvg_autoscale(sfm_in, output=scaled, marker_size=args.mvg_autoscale,
                       detection_method=args.autoscale_method,
                       min_marker_pix=args.autoscale_marker_pix,
@@ -656,11 +684,11 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
                     outputs={'sfm': scaled})
 
     # colorize is a leaf: it produces a side artifact, so its output is recorded
-    # under its own role and the pre-colorize SfM stays the chained one.
+    # under its own role and the ``sfm`` role stays bound to what it coloured.
     if tracker.begin('colorize'):
         logger.info('Colorizing SfM scene')
         sfm_in = tracker.require('sfm')
-        colorized = layout.colorize_sfm(sfm_in)
+        colorized = layout.colorize_sfm(output)
         mvg_colorize_sfm(sfm_in, output=colorized)
         tracker.end('colorize', inputs={'sfm': sfm_in},
                     outputs={'colorized': colorized})
@@ -678,8 +706,8 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
     if tracker.begin('densify'):
         logger.info('Densifying point cloud')
         scene_in = tracker.require('scene')
-        scene = layout.densify_scene(scene_in)
-        cloud = layout.densify_cloud(scene_in)
+        scene = layout.densify_scene(output)
+        cloud = layout.densify_cloud(output)
         mvs_densify(scene_in, output=scene,
                     resolution_level=args.densify_resolution_level,
                     ignore_mask_label=args.mask_value)
@@ -693,7 +721,7 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
         # the scene it wrote still holds the sparse one, so omitting -p meshes
         # that instead, silently.
         cloud_in = tracker.path('cloud')
-        mesh = layout.reconstruct_mesh(scene_in)
+        mesh = layout.reconstruct_mesh(output)
         mvs_reconstruct(scene_in, output=mesh, point_cloud=cloud_in,
                         free_space_support=args.free_space_support,
                         smooth=args.mvs_smooth)
@@ -707,13 +735,15 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
         logger.info('Refining mesh')
         scene_in = tracker.require('scene')
         mesh_in = tracker.require('mesh')
-        refined = layout.refine_mesh(scene_in)
+        refined = layout.refine_mesh(output)
         mvs_refine(scene_in, mesh=mesh_in, output=refined,
                    decimate=args.decimation_factor,
                    resolution_level=args.refine_resolution_level,
                    min_resolution=args.refine_min_resolution,
                    scales=args.refine_scales,
-                   scale_step=args.refine_scale_step)
+                   scale_step=args.refine_scale_step,
+                   ensure_edge_size=args.refine_ensure_edge_size,
+                   max_face_area=args.refine_max_face_area)
         tracker.end('refine', inputs={'scene': scene_in, 'mesh': mesh_in},
                     outputs={'mesh': refined})
 

@@ -2,7 +2,8 @@
 
 Both ``pgs-retexture`` (which needs the mesh and the frame it lives in) and
 ``pgs-calibrate`` (which needs neither the mesh nor, given ``--sfm-data``, the
-recorded SfM) resolve against the same ``metadata.json``. Each artifact has its
+recorded SfM) resolve against the same manifest, under whichever of its two names
+this directory has (``stages.find_manifest``, ADR 0007). Each artifact has its
 own resolver returning a `Resolved`, so the contract worth pinning is: a resolver
 either hands back a path that really exists on disk, or a reason explaining why
 it could not -- never a path that cannot be opened, and never silence.
@@ -15,6 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from pgs_recon import layout
 from pgs_recon.utils.recon_dir import (
     Resolved,
     load_manifest,
@@ -53,7 +55,7 @@ class ReconDirCase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
 
     def write(self, meta, sfm=True, mesh=True):
-        (self.recon / 'metadata.json').write_text(json.dumps(meta))
+        layout.manifest(self.recon).write_text(json.dumps(meta))
         if sfm:
             (self.recon / 'mvg' / 'recon_dir').mkdir(parents=True, exist_ok=True)
             (self.recon / 'mvg' / 'recon_dir' / 'sfm_data.bin').write_text('{}')
@@ -73,7 +75,7 @@ class TestLoadManifest(ReconDirCase):
     def test_returns_path_and_parsed_manifest(self):
         recon = self.write(STAGES_FULL)
         meta_path, meta = load_manifest(recon)
-        self.assertEqual(meta_path, recon / 'metadata.json')
+        self.assertEqual(meta_path, layout.manifest(recon))
         self.assertIn('convert', meta['stages'])
 
 

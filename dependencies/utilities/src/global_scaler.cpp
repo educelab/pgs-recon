@@ -101,7 +101,7 @@ auto main(int argc, char* argv[]) -> int
     ("undistort-images", po::bool_switch(), "undistort images before running marker detection")
     ("min-marker-pix", po::value<int>()->default_value(32), "minimum marker size in pixels")
     ("detect-inverted", po::bool_switch(), "attempt to detect inverted markers")
-    ("no-ransac", po::bool_switch(), "use RANSAC to make marker triangulation more resilient to false positive matches")
+    ("no-ransac", po::bool_switch(), "disable the RANSAC marker triangulation that makes scaling resilient to false positive matches")
     ("save-debug-images", po::value<std::string>(), "save debug images to the given directory")
     ("save-landmarks", po::value<std::string>(), "save unscaled, triangulated landmarks to the given mesh file (obj, ply)")
     ("save-scaled-landmarks", po::value<std::string>(), "save scaled, triangulated landmarks to the given mesh file (obj, ply)")

@@ -338,6 +338,24 @@ class Recorder:
         self._commands[key] = entry
 
 
+def _argv_token(value) -> str:
+    """One argv element, stringified the way the binaries parse.
+
+    Every ``int`` subclass is narrowed to a plain ``int`` first, which covers two
+    cases at once. A ``bool`` becomes ``0``/``1``, since the binaries declare
+    those flags as options over a bool rather than as presence switches. An
+    :class:`~enum.IntEnum` becomes its value, which it must be *here*: ``str()``
+    of an ``IntEnum`` is its value only on Python 3.11 and later, and on 3.9 and
+    3.10 -- both supported -- it is ``'RotationAveraging.L1'``, which OpenMVG
+    cannot parse.
+
+    This lives at the chokepoint rather than in each module's flag builder so it
+    holds for every argv element, including the ones a wrapper assembles by hand
+    (``--archive-type``, ``--max-texture-size``) and every future module's.
+    """
+    return str(int(value)) if isinstance(value, int) else str(value)
+
+
 def run(command: Sequence, cwd: Optional[PathLike] = None,
         recorder: Optional[Recorder] = None) -> None:
     """Record ``command``, then run it to completion.
@@ -347,12 +365,16 @@ def run(command: Sequence, cwd: Optional[PathLike] = None,
     binary that dies still leaves the invocation that killed it. Raises
     ``ToolFailed`` carrying the child's exit status.
 
+    Also the single place argv becomes strings, so :func:`_argv_token`'s
+    narrowing covers every wrapper rather than only the flags routed through a
+    ``_optional`` helper.
+
     ``cwd`` is for the two binaries that write relative to their working
     directory rather than to an output path. Their argv[0] comes from
     :func:`resolve_exe` and is absolute, which is what keeps ``cwd`` from
     changing which file gets executed.
     """
-    argv = [str(c) for c in command]
+    argv = [_argv_token(c) for c in command]
     rec = _recorder if recorder is None else recorder
     if rec is not None:
         rec.command(argv)
