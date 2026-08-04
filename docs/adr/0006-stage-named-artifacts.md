@@ -1,6 +1,7 @@
 # Name artifacts for the stage that produced them
 
-**Status: accepted.** Landed as MR3 of the issue #17 series. Output directories
+**Status: accepted.** Landed as MR3 of the issue #17 series, and shipped in 2.0.
+Output directories
 built before it still contain the chained names described under Context, and stay
 resumable — see the consequences.
 

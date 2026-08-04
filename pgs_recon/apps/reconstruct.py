@@ -384,7 +384,7 @@ def _main():
     out_dir = Path(args.output).resolve()
     manifest_path = layout.manifest(out_dir)
     # Read from wherever this directory's manifest actually is; write to the
-    # current name, which is what moves a pre-1.8 directory onto it.
+    # current name, which is what moves a pre-2.0 directory onto it.
     read_from = find_manifest(out_dir)
 
     # Load the previous run(s) in this directory. Recorded effective arguments
@@ -399,7 +399,7 @@ def _main():
         logger.info(f'Loaded arguments from {read_from}')
     if read_from != manifest_path:
         logger.warning(f'Resuming from {read_from.name}, written by pgs-recon '
-                       f'before 1.8. This run records to {manifest_path.name}; '
+                       f'before 2.0. This run records to {manifest_path.name}; '
                        f'the old file is left in place and goes stale.')
 
     if args.mvs is False:

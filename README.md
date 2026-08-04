@@ -68,7 +68,7 @@ jq -r '.stages.convert.inputs.sfm'   recon/pgs-recon.json   # the solved SfM it 
 Upgrading from 1.7, where the manifest was `metadata.json` and intermediates were
 named by chaining (`scene_dense_refine.ply`)? Those directories are still read,
 but a 1.7 manifest carries no per-stage record, so a run against one rebuilds it
-from the start. See [docs/migrating-to-1.8.md](docs/migrating-to-1.8.md).
+from the start. See [docs/migrating-to-2.0.md](docs/migrating-to-2.0.md).
 
 ### Staged and resumable runs
 The pipeline records what it has finished in `<output>/pgs-recon.json`, so
@@ -177,7 +177,7 @@ docker pull ghcr.io/educelab/pgs-recon:latest
 docker pull ghcr.io/educelab/pgs-recon:edge
 
 # Pull a specific version
-docker pull ghcr.io/educelab/pgs-recon:1.7.1
+docker pull ghcr.io/educelab/pgs-recon:2.0.0
 ```
 
 CUDA-enabled images are available by appending `-cudaX.X` to any of the standard

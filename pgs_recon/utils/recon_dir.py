@@ -58,7 +58,7 @@ def load_manifest(recon_dir: Path):
     nothing to resolve against and no frame to trust.
 
     Reads whichever name is there (``find_manifest``), so these tools keep
-    working on directories built before 1.8 renamed it. Unlike ``pgs-recon``,
+    working on directories built before 2.0 renamed it. Unlike ``pgs-recon``,
     nothing here writes it back, so nothing moves.
     """
     meta_path = find_manifest(recon_dir)

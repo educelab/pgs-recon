@@ -82,7 +82,7 @@ def manifest(output: Path) -> Path:
     """The run's manifest: what it has finished, and with what arguments.
 
     Named for the tool that owns the directory. ``metadata.json``, which this
-    replaced in 1.8, is also what an EduceLab **scan** directory calls its
+    replaced in 2.0, is also what an EduceLab **scan** directory calls its
     descriptor (see :mod:`pgs_recon.pgs_data`) -- an input format we do not own,
     so the one filename meant two unrelated things.
     """
@@ -90,7 +90,7 @@ def manifest(output: Path) -> Path:
 
 
 def legacy_manifest(output: Path) -> Path:
-    """Where runs before 1.8 wrote the manifest.
+    """Where runs before 2.0 wrote the manifest.
 
     Read, never written: :func:`stages.find_manifest` falls back to this so an
     output directory built by an earlier version still resumes, and the next

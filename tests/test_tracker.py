@@ -155,7 +155,7 @@ class TrackerCase(unittest.TestCase):
         cannot see another's live bindings.
 
         ``manifest`` is the file written, ``read_from`` the file read. They are
-        the same unless a caller is modelling ``_main()``'s pre-1.8 fallback,
+        the same unless a caller is modelling ``_main()``'s pre-2.0 fallback,
         where the records come from ``metadata.json`` and the writes land on
         ``pgs-recon.json`` -- which is what moves such a directory onto the new
         name.
@@ -371,8 +371,8 @@ class TestRoundTrip(TrackerCase):
         self.assert_round_trips(make_args(mvg_recon_method='direct'))
 
 
-class TestPre18ManifestName(TrackerCase):
-    """1.8 renamed the manifest ``metadata.json`` -> ``pgs-recon.json``.
+class TestPre20ManifestName(TrackerCase):
+    """2.0 renamed the manifest ``metadata.json`` -> ``pgs-recon.json``.
 
     Unlike an artifact name, this one is *located* by name, so a directory
     written by an earlier version would look empty and re-run the whole
@@ -393,7 +393,7 @@ class TestPre18ManifestName(TrackerCase):
         self.assertEqual(self.legacy(), find_manifest(self.root))
 
     def test_the_current_name_wins_when_both_are_present(self):
-        # What a directory looks like after one run under 1.8: the old file is
+        # What a directory looks like after one run under 2.0: the old file is
         # left in place and must never be read again.
         args = make_args()
         fake_run(self.tracker(args, manifest=self.legacy()), args)
@@ -445,7 +445,7 @@ class TestPre18ManifestName(TrackerCase):
 
         self.assertEqual('complete', self.records()['texture']['status'])
         self.assertEqual(legacy_before, self.legacy().read_text(),
-                         'the pre-1.8 manifest must be left untouched')
+                         'the pre-2.0 manifest must be left untouched')
 
 
 class TestStagedJobs(TrackerCase):
