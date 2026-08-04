@@ -1,4 +1,4 @@
-# Migrating to pgs-recon 1.8
+# Migrating to pgs-recon 2.0
 
 For anyone whose code touches a `pgs-recon` output directory or its exit status:
 pipeline orchestrators, cluster submit scripts, downstream ingest, and callers
@@ -8,9 +8,12 @@ Nothing here changes what a reconstruction *is*. The deliverable and the frame
 everything lives in are unchanged; what moved is a set of names, the manifest's
 contents, two spellings on the command line, and what a failed run reports.
 
-**A 1.7 output directory cannot be resumed, only rebuilt.** 1.8 reads its
+**A 1.7 output directory cannot be resumed, only rebuilt.** 2.0 reads its
 manifest, but a 1.7 manifest records no per-stage state, so there is nothing to
-resume from — see §1. Directories built by `v1.8.0-alpha.1` do resume, untouched.
+resume from — see §1. Directories built by the 1.8 pre-release
+(`v1.8.0-alpha.1`, the only 1.8 ever tagged — the rest of that line's work ships
+here instead) do resume, untouched: they carry stage records, so their 1.7-style
+intermediate names are read back from the manifest rather than rebuilt.
 
 ## 1. The manifest: renamed, and larger than it was
 
@@ -28,7 +31,7 @@ format we do not own, so the one name meant two unrelated things.
 * **The old file is left behind and goes stale.** After a resumed run there may
   be two manifests, and `metadata.json` is frozen at the moment of the upgrade.
   If you read it, you will silently get pre-upgrade state — this is the one
-  thing in 1.8 that can mislead rather than fail.
+  thing in 2.0 that can mislead rather than fail.
 
 ```python
 manifest = next((p for p in (recon / 'pgs-recon.json', recon / 'metadata.json')
@@ -39,7 +42,7 @@ The other two tools' sidecars move the same way, and unlike the manifest they ge
 no fallback — nothing locates them by name, so there is nothing to fall back
 *for*:
 
-| Tool | 1.7 | 1.8 |
+| Tool | 1.7 | 2.0 |
 |---|---|---|
 | `pgs-retexture` | `<stem>_retexture_metadata.json` | `<stem>_retexture.json` |
 | `pgs-calibrate` | `<name>_calibrate_metadata.json` | `<name>_calibrate.json` |
@@ -49,14 +52,14 @@ In all three files the `paths` entry pointing at the file itself is now keyed
 
 ### 1b. New keys
 
-1.8 added staged, resumable runs
+2.0 added staged, resumable runs
 ([ADR 0004](./adr/0004-staged-resumable-runs.md)), and with them four top-level
 keys. The change is **additive**: every key 1.7 wrote is still written, with the
 same meaning, and `commands` keeps its `timestamp → space-joined string` format
 (which is why `recon_dir.py` can still recover the solved SfM from a 1.7
 manifest by grepping it for `openMVG2openMVS`).
 
-| Key | 1.7 | 1.8 |
+| Key | 1.7 | 2.0 |
 |---|---|---|
 | `args`, `parsed`, `commands` | ✔ | ✔ unchanged |
 | `paths` | ✔ | ✔ **different contents** — see below |
@@ -69,14 +72,14 @@ manifest by grepping it for `openMVG2openMVS`).
 
 **`paths` is no longer a lookup table for artifacts.** In 1.7 it carried the
 binaries (`BIN`, `MVS_BIN`, `PATH`, `CAM_DB`) and individual artifacts (`sfm`,
-`matches_file`, `mvs_scene`, `view_pairs`); in 1.8 it is the output layout only
+`matches_file`, `mvs_scene`, `view_pairs`); in 2.0 it is the output layout only
 (`output`, `mvg`, `matches_dir`, `recon_dir`, `mvs`, `undistorted_images` — 1.7's
 `mvs_images` — plus `config`, `manifest` — 1.7's `metadata` — and
 `input`/`input_calib` when set). The binaries left because they are resolved per
 invocation now (§4); the artifacts left because `stages` records them properly.
 Nothing in this project reads `paths` back; it is a record for a human.
 
-### 1c. What a 1.7 directory does when 1.8 runs against it
+### 1c. What a 1.7 directory does when 2.0 runs against it
 
 * Its manifest is found and read — nothing crashes, and `pgs-retexture` /
   `pgs-calibrate` still resolve the mesh and SfM out of it, from the recorded
@@ -98,7 +101,7 @@ than re-running it.
 An intermediate is now `<stage>_<role>.<ext>`, so no filename encodes which
 *other* stages ran ([ADR 0006](./adr/0006-stage-named-artifacts.md)):
 
-| Stage | 1.7 | 1.8 |
+| Stage | 1.7 | 2.0 |
 |---|---|---|
 | robust | `mvg/recon_dir/sfm_data_structured.bin` | `mvg/recon_dir/robust_sfm.bin` |
 | autoscale | `mvg/recon_dir/sfm_data_structured_scaled.bin` | `mvg/recon_dir/autoscale_sfm.bin` |
@@ -111,7 +114,7 @@ An intermediate is now `<stage>_<role>.<ext>`, so no filename encodes which
 The 1.7 column depended on the shape, because each name chained off its input's
 stem: with `--mvs-densify` off, reconstruct wrote `scene_mesh.ply`; with
 `--mvg-robust` off, autoscale wrote `sfm_data_scaled.bin` and colorize
-`sfm_data_colorized.ply`. The 1.8 column does not: these are the names for every
+`sfm_data_colorized.ply`. The 2.0 column does not: these are the names for every
 shape, which is the point of the change.
 
 `densify` is the exception to `<stage>_<role>`: OpenMVS takes one `-o` and
@@ -123,7 +126,7 @@ derives both files from its stem, so the pair is `densify.mvs` / `densify.ply`.
 `mvg/recon_dir/landmarks[_scaled].ply`, `mvs/undistorted_images/`.
 
 **The config file lost its timestamp.** Given `--name`, 1.7 wrote
-`<datetime>_<name>_recon_config.txt`, a fresh file per invocation; 1.8 always
+`<datetime>_<name>_recon_config.txt`, a fresh file per invocation; 2.0 always
 writes `<name>_recon_config.txt`, one per reconstruction, because several jobs now
 share the directory. (1.7 wrote the un-prefixed name only when `--name` was
 *omitted*, since the derived name already started with a timestamp.) A glob for
@@ -158,7 +161,7 @@ sfm = resolve_solved_sfm(recon).require()
 `run_command` used to `sys.exit(str)`, so **every** failure exited 1. It now
 raises `ToolFailed`, and each `main()` translates it:
 
-| Situation | 1.7 | 1.8 |
+| Situation | 1.7 | 2.0 |
 |---|---|---|
 | Binary exited non-zero | 1 | that exit code |
 | Binary killed by a signal | 1 | `128 + signum` (an OOM-killed `RefineMesh` is **137**) |
@@ -182,15 +185,15 @@ Two consequences for a runner:
   is deliberately *not* inherited by a resumed job — a staged run's refine node
   may have a different prefix than the node that ran SfM — so if you do use it,
   pass it to every job.
-* A `*_recon_config.txt` written by 1.8 omits arguments that were never set,
+* A `*_recon_config.txt` written by 2.0 omits arguments that were never set,
   where 1.7 wrote `path = /usr/local/`.
 
 Omitting the unset arguments is also what makes the file loadable at all. **A
-1.7 config cannot be fed back in with `-c`** — not to 1.8 and not to 1.7 either:
+1.7 config cannot be fed back in with `-c`** — not to 2.0 and not to 1.7 either:
 it spells every unset argument as the literal `None` (`import-pgs-scan = None`,
 `focal-length = None`), and the parser rejects the first one it reaches
 (`error: Unexpected value for import-pgs-scan: 'None'`). Re-run from the original
-command line, or strip the `None` lines. A config written by 1.8 round-trips.
+command line, or strip the `None` lines. A config written by 2.0 round-trips.
 
 ## 5. Two CLI changes
 
@@ -205,7 +208,7 @@ command line, or strip the `None` lines. A config written by 1.8 round-trips.
 
 ## 6. Library callers
 
-If you `import pgs_recon`, the wrapper interface changed wholesale in 1.8
+If you `import pgs_recon`, the wrapper interface changed wholesale in 2.0
 ([ADR 0005](./adr/0005-wrappers-mirror-the-binary.md)). The wrappers in
 `pgs_recon.openmvg` / `pgs_recon.openmvs` took a `paths` dict plus `*_key`
 strings and returned the key(s) they had inserted into it; they now take and
@@ -217,7 +220,7 @@ paths = {'scene_key': ..., 'MVS_BIN': ..., 'mvs': ...}
 scene_key, cloud_key = mvs_densify(paths, 'scene_key', metadata=meta,
                                    resolution_lvl=2)
 
-# 1.8
+# 2.0
 from pgs_recon import toolchain
 toolchain.configure(prefix=prefix, recorder=recorder)   # once, per process
 mvs_densify(scene, output=out, resolution_level=2)

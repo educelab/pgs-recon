@@ -38,7 +38,7 @@ Three invariants hold this together, and all three are load-bearing:
   from changing the plan. Deleting an intermediate by hand therefore does not
   trigger a rebuild -- that is ``--rerun``. The lone exception is
   :func:`find_manifest`, which has to look at the disk to answer a question no
-  record can: whether this directory's manifest is under the pre-1.8 name.
+  record can: whether this directory's manifest is under the pre-2.0 name.
 
 This depends on every MVS intermediate being portable (``MVSI`` scene + ``.ply``
 geometry, ``--archive-type -1`` on all four builders, dense cloud handed to
@@ -274,7 +274,7 @@ def describe_shape(shape: Sequence[str]) -> str:
 def find_manifest(output: Path) -> Path:
     """The manifest to *read* for a run in ``output``.
 
-    :func:`layout.manifest` unless only the pre-1.8 ``metadata.json`` is there,
+    :func:`layout.manifest` unless only the pre-2.0 ``metadata.json`` is there,
     in which case that -- so a directory built by an earlier version resumes
     with nothing re-run. A caller writes to :func:`layout.manifest` regardless,
     which is what moves a legacy directory onto the new name the first time it

@@ -21,7 +21,7 @@ reconstruct refine texture`. `pgs-recon --from <stage> --to <stage>` selects an
 **inclusive, contiguous** window; both default to the ends, so existing
 invocations are unchanged. State lives in the run's existing
 `<output>/metadata.json` under a new `stages` key. See `pgs_recon/stages.py`.
-(1.8 renamed that file `pgs-recon.json` —
+(2.0 renamed that file `pgs-recon.json` —
 [ADR 0007](./0007-name-the-manifest-for-the-tool.md) — with a read-fallback, so
 everything below holds under either name.)
 

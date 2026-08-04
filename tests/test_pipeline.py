@@ -483,7 +483,7 @@ class TestResumeIsIdempotent(PipelineCase):
         self.assertTrue((out / 'mvs' / 'reconstruct_mesh.ply').is_file())
 
 
-class TestPre18ManifestName(PipelineCase):
+class TestPre20ManifestName(PipelineCase):
     """A directory whose manifest is still called ``metadata.json``.
 
     The artifact rename was safe because names are only ever written; the
@@ -492,7 +492,7 @@ class TestPre18ManifestName(PipelineCase):
     """
 
     def make_legacy(self, out: Path, *shape) -> None:
-        """A finished run as pgs-recon before 1.8 left it."""
+        """A finished run as pgs-recon before 2.0 left it."""
         self.run_recon(out, *shape)
         layout.manifest(out).rename(layout.legacy_manifest(out))
         self.commands.clear()

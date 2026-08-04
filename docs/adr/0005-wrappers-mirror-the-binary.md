@@ -1,7 +1,7 @@
 # Wrappers mirror the binary; the pipeline owns policy
 
-**Status: accepted, implemented.** Landed as MR2 of the issue #17 series; see
-[the plan](../wrapper-refactor-plan.md). It moved naming into `layout.py` while
+**Status: accepted, implemented.** Landed as MR2 of the issue #17 series, and
+shipped in 2.0. It moved naming into `layout.py` while
 reproducing the old chained names exactly;
 [ADR 0006](./0006-stage-named-artifacts.md) then changed those names, and
 `layout.py`'s return values were all it had to touch.

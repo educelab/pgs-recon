@@ -1,6 +1,6 @@
 # Name the run manifest for the tool that owns the directory
 
-**Status: accepted.** Landed in 1.8, alongside the issue #17 series. Directories
+**Status: accepted.** Landed in 2.0, alongside the issue #17 series. Directories
 written by earlier versions are still read — the rename takes nothing away from
 them — see the consequences.
 
@@ -35,7 +35,7 @@ to `metadata.json` when only that is present, so the rename costs an existing
 directory nothing: one built by `v1.8.0-alpha.1` resumes with nothing re-run, and
 one built by 1.7 is read exactly as well as it was before (which is not very --
 it predates stage records, so it has nothing to resume *from*; see
-[the migration notes](../migrating-to-1.8.md)). `utils/recon_dir.py` resolves
+[the migration notes](../migrating-to-2.0.md)). `utils/recon_dir.py` resolves
 through the same function, so `pgs-retexture` and `pgs-calibrate` — the two apps
 that read a run's manifest — keep working on old directories too.
 `pgs-quality-check` is not one of them: it reads a *scan* directory's
@@ -59,7 +59,7 @@ The scan `metadata.json` is untouched: it is an input format we do not define.
   `mkdir`-in-advance makes a stage permanently un-dirtyable. Which file the
   records live in is a different question, and no record can answer it.
 - **The old file is left in place, and goes stale.** The first run to resume a
-  pre-1.8 directory reads `metadata.json`, warns once, and records to
+  pre-2.0 directory reads `metadata.json`, warns once, and records to
   `pgs-recon.json` from then on. Anything still reading the old file sees a
   manifest frozen at the moment of the upgrade — the sharp edge of this
   decision, and the reason the warning names both files. Deleting or renaming
@@ -72,8 +72,8 @@ The scan `metadata.json` is untouched: it is an input format we do not define.
 - **The manifest's own `paths` entry is renamed with the file**: `metadata` ->
   `manifest`, so no key inside `pgs-recon.json` still calls it the thing this ADR
   stopped calling it. Safe to do in the same release because `paths` has no
-  programmatic consumer -- it is a record for a human, and 1.8 had already
-  reshaped it (ADR 0005 shrank it to the output layout).
+  programmatic consumer -- it is a record for a human, and the same release had
+  already reshaped it (ADR 0005 shrank it to the output layout).
 - **The per-tool sidecars are renamed with it**: `<stem>_retexture_metadata.json`
   -> `<stem>_retexture.json` (`apps/retexture.py`) and
   `<name>_calibrate_metadata.json` -> `<name>_calibrate.json`

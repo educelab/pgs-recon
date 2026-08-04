@@ -124,7 +124,7 @@ them and no `metadata` argument:
   it) and then executes, so no wrapper can forget to record what it ran. An
   `atexit` hook writes the manifest to `<output>/pgs-recon.json`; the effective
   config goes to `<output>/*_recon_config.txt`. `stages.find_manifest()` is what
-  reads it, falling back to a pre-1.8 `metadata.json` (ADR 0007) — the one
+  reads it, falling back to a pre-2.0 `metadata.json` (ADR 0007) — the one
   filesystem check in `stages.py`.
 
 When adding a stage: add a `layout` function for its output, add the wrapper as a
