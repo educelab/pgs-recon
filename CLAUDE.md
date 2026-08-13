@@ -30,6 +30,12 @@ python3 -m pip install .
 
 Disable building bundled libs with `-DBUILD_<EIGEN|JPEG|JPEG_TURBO|OPENCV|CGAL>=OFF`
 to use system versions. Note: OpenMVS and OpenCV must link against the same libjpeg.
+The libpng and libtiff development headers must **either both be present or both
+be absent**. OpenMVG bundles zlib 1.2.3 whenever it misses either one; if the
+other is then a system library it keeps calling the system zlib, and the
+statically linked 1.2.3 wins at symbol resolution — aborting with `libpng error:
+bad parameters to zlib` the first time a run reads a mask. `BuildOpenMVG.cmake`
+fails configuration on that mismatch. The images install both.
 
 The only tests are `tests/`: `python3 -m unittest discover -s tests`. They cover
 the staged-run planner (`test_stages.py`, pure logic, no filesystem), the stage

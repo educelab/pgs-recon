@@ -19,6 +19,7 @@ libqt5opengl5-dev
 libmpfr-dev
 libqt5svg5-dev
 libqt5x11extras5-dev
+libtiff-dev
 ninja-build
 pkg-config
 python3-dev
