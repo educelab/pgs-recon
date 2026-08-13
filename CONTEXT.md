@@ -6,11 +6,25 @@ cause mistakes; it is not a description of the code.
 
 ## Language
 
+**Capture**:
+One slot in a scan's per-position image stack — the `{capture}` index in the
+`{prefix}_{camera}_{position}_{capture}` filename, described by the matching
+`scan.capture_settings` entry (its lights, exposure, gain, participating cameras,
+and a free-text `name`). Every capture spans the same capture positions, but each
+declares its own subset of cameras, so two captures need not contain the same
+images — one may be all five rig cameras under white light, the next a single
+camera under IR940. A capture is usually a **modality**, but may also be a
+*derived* product of other captures (an RGB composed from bands), which is why
+the term names the scan's slot and not what fills it. A capture is identified by
+its index; the `name` is a label, not a key.
+_Avoid_: capture group, cap, band, pass, exposure
+
 **Capture position**:
 A physical rig pose, identified by the position index in the
 `{prefix}_{camera}_{position}_{capture}` filename. The same capture position is
-shared across all cameras and all modalities of a scan, so it is the key that
-aligns an image from one set to a solved view in another.
+shared across all cameras and all captures of a scan, so it is the key that
+aligns an image from one set to a solved view in another. Distinct from a
+**capture**, with which it shares a word: a capture spans every capture position.
 _Avoid_: shot, frame, station
 
 **Camera**:
@@ -26,8 +40,32 @@ _Avoid_: photo, frame
 **Modality**:
 An alternate imaging condition captured at the same capture positions as an
 existing camera (e.g. IR940 illumination vs monochrome white light). A modality
-reuses that camera's solved poses and intrinsics; only the pixels differ.
+reuses that camera's solved poses and intrinsics; only the pixels differ. This is
+the reconstruction-level term: it says how an image set is *consumed*, whereas a
+**capture** is the scan-level slot the images arrive in. A capture that is an
+imaging condition is a modality; one that is a derivative of other captures is
+not.
 _Avoid_: channel, mode, lighting
+
+**Capture retexture**:
+Re-texturing an existing mesh with a different **capture** of the same scan —
+the same rig cameras at the same capture positions, under different
+illumination. Correspondence between an image and a solved view is by
+`(camera, position)`, so every camera present in both the solved capture and the
+texturing capture can contribute. The solve and the texture are two captures of
+one scan, and which capture each came from is the only thing that distinguishes
+them. Distinct from **localized-camera retexture**, with which it shares a tool.
+_Avoid_: modality swap, remap, reprojection
+
+**Localized-camera retexture**:
+Re-texturing an existing mesh with images from a camera that was never part of
+the solve — an **overhead camera** brought into the solved frame by
+**localization**. There are no capture positions to correspond, because the
+camera's pose comes from its **calibration** rather than from the rig, so a
+single image can texture the whole mesh. Inherently one camera; that is what
+makes it different in kind from **capture retexture**, which is inherently as
+many cameras as the capture has.
+_Avoid_: calibration retexture, external retexture
 
 **Solved frame** (a.k.a. MVS frame):
 The arbitrary coordinate frame produced by the SfM solve

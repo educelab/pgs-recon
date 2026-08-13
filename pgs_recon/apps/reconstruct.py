@@ -142,6 +142,13 @@ def build_parser() -> configargparse.ArgumentParser:
                         help='When importing a PGS Scan, merge provided PGS '
                              'calibration file with the imported camera '
                              'configurations.')
+    parser.add_argument('--import-capture', type=int, default=0, metavar='n',
+                        help='When importing a PGS Scan, the capture to '
+                             'reconstruct from, as it appears in the '
+                             '{prefix}{camera}_{position}_{capture} filename. '
+                             'A scan captures every position once per capture, '
+                             'each with its own lighting and camera set; this '
+                             'selects one of them (default: %(default)s)')
     parser.add_argument('--log-level', default='INFO', type=str.upper,
                         choices=['ERROR', 'WARNING', 'INFO', 'DEBUG'])
 
@@ -426,6 +433,13 @@ def _main():
     if args.mask_value is not None and args.mask_value < 0:
         args.mask_value = None
 
+    # Only the PGS importer reads capture indices. Warn rather than fail, so a
+    # shared config carrying PGS settings still drives a generic run.
+    if args.import_capture != 0 and not args.import_pgs_scan:
+        logger.warning(f'--import-capture={args.import_capture} is ignored '
+                       f'without --import-pgs-scan; the generic importers take '
+                       f'every image in the input directory.')
+
     # Where the binaries are and what records their invocations: process-wide, so
     # no stage takes either as an argument (ADR 0005). The command log has to
     # exist before the recorder wraps it, and the recorder before any stage runs.
@@ -576,6 +590,7 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
                 view_pairs_file=layout.view_pairs(output),
                 calib_file=args.import_calib,
                 pairs_file_radius=args.matching_pairs_radius,
+                capture=args.import_capture,
                 recorder=recorder)
             if pairs is not None:
                 outputs['view_pairs'] = pairs

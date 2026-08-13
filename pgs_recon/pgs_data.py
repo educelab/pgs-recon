@@ -70,8 +70,12 @@ def neighbor_lookup_gridscan(scan_meta):
 
     # Neighbor lookup function
     def get_neighbors(pos_idx, radius):
+        # A position off the grid (unparsed, or past its end) has no neighbors
+        hit = np.where(lut == pos_idx)
+        if hit[0].size != 1:
+            return np.array([], dtype=lut.dtype)
         # Only search in XY
-        _, y, x = [a.item() for a in np.where(lut == pos_idx)]
+        _, y, x = [a.item() for a in hit]
         ly, hy = max(0, y - radius), min(rows, y + radius + 1)
         lx, hx = max(0, x - radius), min(cols, x + radius + 1)
         n = lut[:, ly:hy, lx:hx].flatten()
@@ -80,9 +84,57 @@ def neighbor_lookup_gridscan(scan_meta):
     return get_neighbors
 
 
+def parse_scan_name(name: str, prefix: str, ext: str) -> tuple:
+    """Parse ``(camera, position, capture)`` out of a PGS scan image name.
+
+    A field the name does not supply comes back as ``None``, except the capture:
+    the field is optional in the convention, and a name without one is capture 0.
+    A name that does not parse at all comes back all ``None`` -- a missing field
+    and an unrecognized name are different things, and only the first belongs to
+    a capture.
+    """
+    match = re.fullmatch(
+        rf'{re.escape(prefix)}(?P<camera>\d*)_(?P<position>\d*)'
+        rf'(_(?P<capture>\d*))?\.{re.escape(ext)}', name)
+    if match is None:
+        return None, None, None
+    cam = int(match.group('camera')) if match.group('camera') else None
+    pos = int(match.group('position')) if match.group('position') else None
+    cap = int(match.group('capture')) if match.group('capture') else 0
+    return cam, pos, cap
+
+
+def select_capture(images, prefix: str, ext: str, capture: int) -> tuple:
+    """Keep the images belonging to ``capture``, parsed.
+
+    Returns ``([(path, camera, position), ...], {captures seen})``; the second
+    element is what an empty selection is reported against, so a name that does
+    not parse stays out of it rather than claiming to be capture 0. Selection is
+    by filename, so it runs before exiftool sees the images.
+    """
+    logger = logging.getLogger(__name__)
+    selected = []
+    found = set()
+    unrecognized = []
+    for img in images:
+        cam, pos, cap = parse_scan_name(img.name, prefix, ext)
+        if cap is None:
+            unrecognized.append(img.name)
+            continue
+        found.add(cap)
+        if cap == capture:
+            selected.append((img, cam, pos))
+    if unrecognized:
+        logger.warning(f'Skipping {len(unrecognized)} file(s) matching the scan '
+                       f'pattern but not its naming convention: '
+                       f'{sorted(unrecognized)}')
+    return selected, found
+
+
 def import_pgs_scan(scan_dir: Path, cam_db: dict,
                     cam_calib: dict = None,
-                    pairs_file_radius: int = 2) -> tuple[sfm.Scene, list]:
+                    pairs_file_radius: int = 2,
+                    capture: int = 0) -> tuple[sfm.Scene, list]:
     logger = logging.getLogger(__name__)
     # Load scan metadata
     meta_path = scan_dir / 'metadata.json'
@@ -104,13 +156,38 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict,
     images = list(scan_dir.glob(f'{prefix}*.{ext}'))
     images.sort()
 
-    # Get image metadata
-    files = [str(i) for i in images]
-    if len(files) == 0:
+    if len(images) == 0:
         logger.error(
             'Provided scan metadata specifies file pattern, but no files match.')
-        raise RuntimeError()
+        raise RuntimeError(
+            'Provided scan metadata specifies file pattern, but no files match.')
 
+    # Pick the capture. Filenames are what it is selected by; the metadata only
+    # names it, and a derived capture need not be declared there at all. So a
+    # capture the scan does not declare is a warning, and the empty selection is
+    # the only hard failure.
+    settings = scan_meta['scan'].get('capture_settings')
+    declared = settings is not None and 0 <= capture < len(settings)
+    if settings is not None and not declared:
+        logger.warning(f'Requested capture {capture}, but the scan declares '
+                       f'{len(settings)} capture(s): '
+                       f'{[c.get("name", i) for i, c in enumerate(settings)]}')
+
+    selected, found = select_capture(images, prefix, ext, capture)
+    if len(selected) == 0:
+        msg = (f'No images for capture {capture}. Captures present in the '
+               f'filenames: {sorted(found)}')
+        logger.error(msg)
+        raise RuntimeError(msg)
+
+    label = ''
+    if declared and settings[capture].get('name'):
+        label = f' ({settings[capture]["name"]})'
+    logger.info(f'Importing capture {capture}{label}: '
+                f'{len(selected)} of {len(images)} images')
+
+    # Get image metadata
+    files = [str(i) for i, _, _ in selected]
     with exiftool.ExifToolHelper() as et:
         img_metadata = et.get_metadata(files)
 
@@ -123,7 +200,7 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict,
 
     # Fill out sfm with data
     intrinsics = {}
-    for img in images:
+    for img, cam_idx, pos_idx in selected:
         # Lookup this images tags
         tags = next((i for i in img_metadata if i['File:FileName'] == img.name),
                     None)
@@ -138,25 +215,6 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict,
         view.height = get_tag_option(tags, ['File:ImageHeight', 'EXIF:ImageHeight'])
         view.make = tags['EXIF:Make']
         view.model = tags['EXIF:Model']
-
-        # Get the camera idx and the position idx
-        cam_idx = None
-        pos_idx = None
-        cap_idx = 0
-        match = re.fullmatch(
-            rf'{re.escape(prefix)}(?P<camera>\d*)_(?P<position>\d*)(_(?P<capture>\d*))?\.{ext}',
-            img.name)
-        if match:
-            cam_idx = int(match.group('camera'))
-            pos_idx = int(match.group('position'))
-            if match.group('capture'):
-                cap_idx = int(match.group('capture'))
-
-        # Skip anything but the primary capture
-        # TODO: Handle other captures
-        if cap_idx != 0:
-            logger.warning(f'Skipping {img.name} from capture group {cap_idx}')
-            continue
 
         # Setup intrinsic
         intrinsic = sfm.IntrinsicRadialK3()
@@ -230,6 +288,13 @@ def import_pgs_scan(scan_dir: Path, cam_db: dict,
         # Get the neighbor positions
         neighbors = neighbor_lookup(pos_idx, pairs_file_radius)
 
+        # A view in no pair is a view OpenMVG never matches, so say so
+        if len(neighbors) == 0:
+            logger.warning(
+                f'Capture position {pos_idx} is not in the scan grid. '
+                f'{len(view_list)} view(s) will not be matched.')
+            continue
+
         # Calculate the view pairs this position to all neighbor positions
         for n in neighbors:
             neighbor_list = position_views.get(n, [])
@@ -258,7 +323,7 @@ def export_view_pairs(path: Path, view_pairs: list):
 
 def init_sfm_pgs(scan_dir: Path, sfm_file: Path, cam_db: Path,
                  view_pairs_file: Path = None, calib_file: Path = None,
-                 pairs_file_radius: int = 2,
+                 pairs_file_radius: int = 2, capture: int = 0,
                  recorder: Recorder = None) -> Optional[Path]:
     """Import a PGS Scan directory as an SfM scene, written to ``sfm_file``.
 
@@ -287,11 +352,12 @@ def init_sfm_pgs(scan_dir: Path, sfm_file: Path, cam_db: Path,
     # Load the pgs file
     scene, view_pairs = import_pgs_scan(Path(scan_dir).resolve(),
                                         cam_db=cam_db_data, cam_calib=calib,
-                                        pairs_file_radius=pairs_file_radius)
+                                        pairs_file_radius=pairs_file_radius,
+                                        capture=capture)
     if recorder is not None:
         recorder.step('import_pgs_scan', scan_dir=scan_dir, cam_db=cam_db,
                       cam_calib=calib_file,
-                      pairs_file_radius=pairs_file_radius)
+                      pairs_file_radius=pairs_file_radius, capture=capture)
 
     # Write the SFM
     sfm.export_scene(path=sfm_file, scene=scene)
@@ -310,6 +376,10 @@ def main():
     parser.add_argument('--cam-db', '-d', default=__OPENMVG_CAMDB_DEFAULT_PATH,
                         help='Camera database path')
     parser.add_argument('--cam-calib', '-c', help="Camera calibrations file")
+    parser.add_argument('--capture', '-C', type=int, default=0, metavar='n',
+                        help='Capture index to import, as it appears in the '
+                             '{prefix}{camera}_{position}_{capture} filename '
+                             '(default: %(default)s)')
     parser.add_argument('--output-sfm', '-o', type=Path,
                         default='sfm_data.json', help='Output SFM file')
     parser.add_argument('--view-pairs', '-v', type=Path,
@@ -333,7 +403,8 @@ def main():
     # Load the pgs file
     logger.info('Loading PGS Scan')
     pgs_dir_path = Path(args.pgs_dir)
-    scene, view_pairs = import_pgs_scan(pgs_dir_path, cam_db, calib)
+    scene, view_pairs = import_pgs_scan(pgs_dir_path, cam_db, calib,
+                                        capture=args.capture)
 
     # Write the SFM
     logger.info('Exporting SfM scene')
