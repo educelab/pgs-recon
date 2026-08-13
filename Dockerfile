@@ -42,6 +42,7 @@ RUN apt update \
       libqt5x11extras5-dev \
       libssh-4 \
       libsuitesparse-dev \
+      libtiff-dev \
       locales \
       nano \
       ninja-build \
