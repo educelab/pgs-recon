@@ -54,7 +54,9 @@ illumination. Correspondence between an image and a solved view is by
 `(camera, position)`, so every camera present in both the solved capture and the
 texturing capture can contribute. The solve and the texture are two captures of
 one scan, and which capture each came from is the only thing that distinguishes
-them. Distinct from **localized-camera retexture**, with which it shares a tool.
+them — so the texturing capture is named by its index, like any other capture,
+not by having been separated into a directory of its own. Distinct from
+**localized-camera retexture**, with which it shares a tool.
 _Avoid_: modality swap, remap, reprojection
 
 **Localized-camera retexture**:
@@ -217,9 +219,11 @@ that is gone.)
 **Stem**: the namespacing token prefixed onto every retexture artifact, so they
 coexist with the recon's files and with other retexture runs. It is **derived,
 not supplied** — there is no `--name` flag. The stem is the `--output-mesh`
-filename stem if that flag is given, otherwise the modality input's name (the
-image directory name in the default mode, the image stem in `--calibration`
-mode).
+filename stem if that flag is given, otherwise the modality input's name: the
+scan directory's name plus the capture it textures from (`scan_c3`) in capture
+retexture, the image stem in `--calibration` mode. The capture belongs in the
+stem because one scan directory is the input for all of its captures, so the
+directory name alone would name every capture's artifacts identically.
 
 **`--output-mesh`/`-o`**: the exact path + filename of the final textured mesh.
 Its extension sets the output format (overrides `--file-type`, with a warning).
@@ -228,18 +232,34 @@ renamed to the target stem with `map_Kd` patched, so the deliverable is
 self-contained anywhere. Omitted, the final mesh defaults to `mvs/<stem>.obj`
 (or the chosen `--file-type`) — a sibling of the recon's `mvs/<recon>.obj`.
 
-Resulting layout (stem `IR940`, recon name `scroll`):
+Resulting layout (stem `scan_c3` — capture 3 of the scan dir `scan/`, recon name
+`scroll`):
 
     recon/
-      mvg/  IR940_sfm_full.json          # exported SfM (no longer a generic name)
-            IR940_sfm.json               # filtered/re-pointed to the modality
-      mvs/  IR940_modality/              # 8-bit modality images
-            IR940_undistorted_images/    # NOT the recon's shared undistorted_images/
-            IR940_scene.mvs
-            IR940_input.ply              # staged copy of the mesh being textured
-            IR940.obj                    # final, beside the recon's scroll.obj
-      IR940_retexture.json               # sidecar; recon's manifest untouched
-      <datetime>_IR940_retexture_config.txt
+      mvg/  scan_c3_sfm_full.json        # exported SfM (no longer a generic name)
+            scan_c3_sfm.json             # filtered/re-pointed to the modality
+      mvs/  scan_c3_modality/            # 8-bit modality images
+            scan_c3_undistorted_images/  # NOT the recon's shared undistorted_images/
+            scan_c3_scene.mvs
+            scan_c3_input.ply            # staged copy of the mesh being textured
+            scan_c3.obj                  # final, beside the recon's scroll.obj
+      scan_c3_retexture.json             # sidecar; recon's manifest untouched
+      <datetime>_scan_c3_retexture_config.txt
+
+`--camera-index` deliberately stays out of the stem: it selects a subset of one
+capture's cameras rather than a different deliverable, so encoding it would make
+the ordinary whole-capture name depend on how the flag was spelled. Two runs of
+one capture with different camera subsets therefore share a stem and overwrite —
+legal, and reported path by path before it happens; `--output-mesh` is how they
+are kept side by side.
+
+The sidecar config and the manifest are not the same record. The config is
+**replayed** — every line is re-parsed as if typed — so it carries only what was
+asked for, plus the capture (pinned, so a scan that later grows another still
+replays the same one). The manifest is **read by nobody**, so it states what the
+run resolved: `capture` and `cameras` beside the `parsed` arguments. Writing the
+derived camera set into the config instead would silently narrow a replay that
+overrides `--capture`.
 
 The only hard collision the convention removes is the **undistorted-images
 dir**, which both tools otherwise name `undistorted_images/`. The

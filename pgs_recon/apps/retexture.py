@@ -1,34 +1,30 @@
 """Re-texture an existing reconstructed mesh using an alternate imaging
-modality (e.g. IR940) captured at the same camera positions as one of the
-cameras in the original reconstruction.
+modality (e.g. IR940) captured at the same camera positions as the cameras of
+the original reconstruction.
 
 This tool serves two modes that are different in kind, and only one of them is
 inherently single-camera:
 
   - **Capture retexture** (default mode): the texturing images are another
     *capture* of the same scan -- the same rig, the same capture positions,
-    different illumination. Correspondence is by ``(camera, position)``, and
-    every camera present in both captures could contribute.
+    different illumination. Correspondence is by ``(camera, position)``, so
+    every camera present in both captures contributes.
   - **Localized-camera retexture** (``--calibration``): the images come from a
     camera that was never in the solve, placed in the solved frame by
-    ``pgs-calibrate``. One camera, one pose, no positional correspondence.
-
-**Both modes are currently restricted to a single camera**, which is inherent
-only to the second. For capture retexture it is a limitation, not a design, and
-it is what stops you texturing with a capture in which the whole rig fired. See
-``docs/multi-camera-capture-retexture.md``.
+    ``pgs-calibrate``. One camera, one pose, no positional correspondence --
+    inherently single-camera, and unaffected by everything below.
 
 OpenMVS has no native "texture with a different image set" option (verified
 against OpenMVS v2.3.0), so this tool rebuilds a minimal MVS scene from the
-original SfM solution restricted to a single camera, with that camera's views
-re-pointed at the modality images. The pipeline is:
+original SfM solution restricted to the texturing capture's cameras, with those
+views re-pointed at the modality images. The pipeline is:
 
   1. (optional) Convert 16-bit modality images to 8-bit with a fixed linear
      map (bit-shift), uniform across all frames to preserve relative radiometry
      and keep the merged texture seamless.
   2. Convert the solved OpenMVG SfM_Data to JSON (views/intrinsics/extrinsics
-     only) and filter it to the requested camera, re-pointing each view at the
-     matching modality image (matched by capture-position index).
+     only) and filter it to the requested cameras, re-pointing each view at the
+     modality image sharing its ``(camera, position)``.
   3. openMVG2openMVS on the filtered scene -> undistorts the modality images
      with the original camera intrinsics and writes a new MVS scene.
   4. TextureMesh the *existing* mesh against that scene.
@@ -43,34 +39,45 @@ directly instead (``--sfm-data``, ``--mesh``), and in ``--calibration`` mode the
 calibration .json *is* the scene, so the reconstruction's SfM is never read;
 each artifact is only demanded of ``--recon-dir`` when the run actually reads it.
 
-REQUIRES THE PGS-SCAN FILENAME CONVENTION on both image sets. The correspondence
-between a modality image and a camera pose in the SfM solution is established
-*entirely by filename* — there is no EXIF, ordering, or geometric fallback. Every
-filename must match ``{prefix}_{camera}_{position}_{capture}`` (see ``_NAME_RE``),
-and matching is keyed on ``(camera, position)`` (the ``capture`` field is parsed
-but ignored). Concretely:
+CAPTURE RETEXTURE TAKES A PGS SCAN DIRECTORY, not a directory of pre-separated
+modality images: ``-i`` must hold a ``metadata.json``, and ``--capture`` names
+which of the captures in it to texture from (inferred when the scan holds only
+one). The metadata is what says how to read the directory -- ``scan.file_prefix``
+and ``scan.format`` select the images, exactly as ``pgs_data.import_pgs_scan``
+does for the solve, so two images of one ``(camera, position)`` in different
+formats or from different captures cannot be confused for each other.
 
-  - Modality images are grouped by ``(camera, position)``; ``--camera-index``
-    selects which camera, or it is inferred if the files share one.
-  - Each SfM view's stored filename is parsed the same way; views for the chosen
-    camera are re-pointed at the modality image with the *same position index*.
+The correspondence between a modality image and a camera pose in the SfM solution
+is established *entirely by filename* — there is no EXIF, ordering, or geometric
+fallback. Names must match ``{prefix}{camera}_{position}[_{capture}]``, and
+matching is keyed on ``(camera, position)``. Concretely:
+
+  - Modality images are indexed by ``(camera, position)`` for the selected
+    capture; every camera in it is textured from, unless ``--camera-index``
+    narrows the set.
+  - Each SfM view's stored filename is parsed with the same scan prefix (any
+    extension, since a solve may have been imported from converted copies), and
+    views are re-pointed at the modality image sharing their
+    ``(camera, position)``.
+
+The two image sets need not cover the same cameras or positions. A solved view
+with no modality image is simply not textured from — an expected consequence of a
+capture that fired fewer cameras. A modality image with no solved view is warned
+about loudly: it was never calibrated, so nothing can place it.
 
 This means the original reconstruction must itself have been run on PGS-named
 images (e.g. imported via ``pgs-import`` / ``init_sfm_pgs``). If the SfM views
 carry arbitrary filenames (e.g. a generic EXIF-based import), none will parse and
-the run aborts with "No views matched camera". Modality position indices must
-correspond 1:1 to the original camera's positions (the captures must be the same
-shots from the same poses).
+the run aborts saying so.
 """
 import atexit
 import json
 import logging
-import re
 import shutil
 import sys
 from datetime import datetime as dt, timezone as tz
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import configargparse
 import cv2
@@ -89,6 +96,7 @@ from pgs_recon.utils.recon_dir import (
     resolve_solved_sfm,
     resolve_textured_mesh,
 )
+from pgs_recon.utils.scan_names import parse_scan_name, parse_view_name
 from pgs_recon.utils.sfm_json import (
     bare_polymorphic_id,
     camera_from_calibration,
@@ -98,82 +106,140 @@ from pgs_recon.utils.sfm_json import (
 
 logger = logging.getLogger(__name__)
 
-# PGS-scan filename convention: {prefix}_{camera}_{position}_{capture}.{ext}.
-# This is the ONLY correspondence mechanism between modality images and SfM
-# views (see module docstring); both image sets must follow it, and matching is
-# keyed on (camera, position).
-_NAME_RE = re.compile(r'^(?P<prefix>.*)_(?P<cam>\d+)_(?P<pos>\d+)_(?P<cap>\d+)$')
 
-# Image extensions we treat as modality inputs
-_IMG_EXTS = {'.tif', '.tiff', '.jpg', '.jpeg', '.png'}
+def index_modality_images(scan_dir: Path, capture: Optional[int],
+                          cameras: Optional[Sequence[int]]):
+    """Index one capture of a PGS scan directory by ``(camera, position)``.
 
+    ``scan_dir`` must be a PGS scan directory: its ``metadata.json`` is what says
+    which files are images (``scan.file_prefix``, ``scan.format``) and what the
+    captures in it are, so this reads the directory the same way the importer
+    reads it for the solve. Selection is by *filename*, matching
+    ``pgs_data.select_capture``: a capture the metadata does not declare is a
+    warning (a derived capture need not be declared), and an empty selection is
+    the only hard failure.
 
-def parse_name(stem: str):
-    """Parse a PGS image stem into (camera, position, capture) ints.
+    ``capture`` is inferred when the scan holds exactly one; several without a
+    choice is an error, because texturing from an arbitrary one of them is
+    silently wrong. ``cameras`` *restricts* the capture's cameras rather than
+    asserting them: a requested camera the capture does not hold is warned about
+    loudly and skipped, and only an empty result is fatal.
 
-    Returns None if the stem does not match the expected pattern.
+    Returns ``(capture, prefix, {(camera, position): path})``.
     """
-    m = _NAME_RE.match(stem)
-    if m is None:
-        return None
-    return int(m.group('cam')), int(m.group('pos')), int(m.group('cap'))
+    meta_path = scan_dir / 'metadata.json'
+    if not meta_path.is_file():
+        sys.exit(f'No metadata.json in {scan_dir}. Capture retexture reads a '
+                 f'PGS scan directory (the same one the reconstruction was '
+                 f'imported from), and selects the texturing capture from it '
+                 f'with --capture.')
+    # The metadata is what says how to read the directory, so a malformed one is
+    # reported against the file rather than as a KeyError from inside the read.
+    try:
+        scan_meta = json.loads(meta_path.read_text())
+        prefix = scan_meta['scan']['file_prefix']
+        ext = scan_meta['scan']['format'].lower()
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+        sys.exit(f'Could not read scan.file_prefix / scan.format from '
+                 f'{meta_path}: {e}')
 
-
-def index_modality_images(image_dir: Path, camera_index: Optional[int]):
-    """Map capture-position index -> modality image path for a single camera.
-
-    If ``camera_index`` is None it is inferred from the files (they must all
-    share one camera index).
-    """
-    by_cam: Dict[int, Dict[int, Path]] = {}
-    for p in sorted(image_dir.iterdir()):
-        if not p.is_file() or p.suffix.lower() not in _IMG_EXTS:
-            continue
-        parsed = parse_name(p.stem)
-        if parsed is None:
+    by_capture: Dict[int, Dict[tuple, Path]] = {}
+    matched = 0
+    for p in sorted(scan_dir.glob(f'{prefix}*.{ext}')):
+        matched += 1
+        cam, pos, cap = parse_scan_name(p.name, prefix, ext)
+        if cap is None or cam is None or pos is None:
             logger.warning(f'Skipping unrecognized filename: {p.name}')
             continue
-        cam, pos, _cap = parsed
-        existing = by_cam.setdefault(cam, {}).get(pos)
+        images = by_capture.setdefault(cap, {})
+        existing = images.get((cam, pos))
         if existing is not None:
-            logger.warning(f'Multiple modality images for camera {cam} '
+            logger.warning(f'Multiple capture {cap} images for camera {cam} '
                            f'position {pos}: keeping {p.name}, '
                            f'dropping {existing.name}')
-        by_cam[cam][pos] = p
+        images[(cam, pos)] = p
 
-    if not by_cam:
-        sys.exit(f'No modality images found in {image_dir}')
+    # An empty selection has two causes, and they point at different fixes: no
+    # file matched the metadata's prefix/format, or files did and none of their
+    # names follow the convention.
+    if not by_capture:
+        if matched:
+            sys.exit(f'None of the {matched} images matching {prefix}*.{ext} in '
+                     f'{scan_dir} follow the naming convention '
+                     f'{prefix}{{camera}}_{{position}}[_{{capture}}].{ext}')
+        sys.exit(f'No images matching {prefix}*.{ext} in {scan_dir}')
 
-    if camera_index is None:
-        if len(by_cam) > 1:
-            sys.exit(f'Modality dir contains multiple camera indices '
-                     f'{sorted(by_cam)}; specify --camera-index')
-        camera_index = next(iter(by_cam))
-    elif camera_index not in by_cam:
-        sys.exit(f'No modality images for camera {camera_index} in '
-                 f'{image_dir} (found {sorted(by_cam)})')
+    if capture is None:
+        if len(by_capture) > 1:
+            sys.exit(f'{scan_dir} holds captures {sorted(by_capture)}; specify '
+                     f'which one to texture from with --capture')
+        capture = next(iter(by_capture))
+    elif capture not in by_capture:
+        sys.exit(f'No images for capture {capture}. Captures present in the '
+                 f'filenames: {sorted(by_capture)}')
 
-    logger.info(f'Using camera index {camera_index} '
-                f'({len(by_cam[camera_index])} modality images)')
-    return camera_index, by_cam[camera_index]
+    # The metadata names a capture; the filenames are what select it. A capture
+    # it does not declare is legitimate (a derived one need not be), so warn.
+    settings = scan_meta['scan'].get('capture_settings')
+    declared = settings is not None and 0 <= capture < len(settings)
+    if settings is not None and not declared:
+        logger.warning(f'Texturing from capture {capture}, but the scan declares '
+                       f'{len(settings)} capture(s): '
+                       f'{[c.get("name", i) for i, c in enumerate(settings)]}')
+
+    images = by_capture[capture]
+    available = sorted({cam for cam, _pos in images})
+    if cameras is not None:
+        requested = sorted(set(cameras))
+        absent = [c for c in requested if c not in available]
+        if absent:
+            logger.warning(f'--camera-index requested camera(s) {absent}, which '
+                           f'capture {capture} does not contain (it has '
+                           f'{available}); they are skipped')
+        images = {k: v for k, v in images.items() if k[0] in set(requested)}
+        if not images:
+            sys.exit(f'None of the requested cameras {requested} have images in '
+                     f'capture {capture} (it has {available})')
+        available = sorted({cam for cam, _pos in images})
+
+    label = ''
+    if declared and settings[capture].get('name'):
+        label = f' ({settings[capture]["name"]})'
+    logger.info(f'Texturing from capture {capture}{label}: {len(images)} images '
+                f'from camera(s) {available}')
+    return capture, prefix, images
 
 
-def convert_modality_images(pos_map: Dict[int, Path], out_dir: Path,
-                            bit_shift: int) -> Dict[int, str]:
+def convert_modality_images(img_map: Dict[tuple, Path], out_dir: Path,
+                            bit_shift: int) -> Dict[tuple, str]:
     """Ensure every modality image is an 8-bit file usable by openMVG/OpenMVS.
 
     16-bit images are mapped to 8-bit with a fixed bit-shift (>> bit_shift),
     applied identically to every frame. Float images are scaled from an assumed
-    [0, 1] range by a fixed factor. Already-8-bit images are copied through
-    unchanged. All conversions are uniform across frames to preserve relative
-    radiometry. Returns position index -> output filename (basename).
+    [0, 1] range by a fixed factor. All conversions are uniform across frames to
+    preserve relative radiometry — including *across* cameras, since the exposure
+    and gain of a capture are properties of the capture, not of each camera in
+    it.
+
+    An image that is already 8-bit in a format the toolchain reads is copied
+    through byte-for-byte rather than re-encoded: ``-i`` is a scan directory, so
+    a scan captured as JPEG would otherwise pay a second lossy generation to say
+    nothing new. Returns ``(camera, position)`` -> output filename (basename).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_names: Dict[int, str] = {}
-    for pos, src in sorted(pos_map.items()):
+    out_names: Dict[tuple, str] = {}
+    copied = 0
+    for key, src in sorted(img_map.items()):
         img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
         if img is None:
             sys.exit(f'Could not read modality image: {src}')
+        # Read first regardless: a .png says nothing about its bit depth.
+        if img.dtype == np.uint8 and src.suffix.lower() in ('.jpg', '.jpeg',
+                                                            '.png'):
+            shutil.copy2(src, out_dir / src.name)
+            out_names[key] = src.name
+            copied += 1
+            continue
         if img.dtype == np.uint16:
             img = (img >> bit_shift).astype(np.uint8)
         elif img.dtype != np.uint8:
@@ -182,11 +248,15 @@ def convert_modality_images(pos_map: Dict[int, Path], out_dir: Path,
             # relative radiometry is preserved and the merged texture stays
             # consistent. Per-frame normalization would break that.
             img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+        # The source stem carries camera, position and capture, so output names
+        # cannot collide across the cameras of one capture.
         out_name = f'{src.stem}.jpg'
         cv2.imwrite(str(out_dir / out_name), img,
                     [cv2.IMWRITE_JPEG_QUALITY, 100])
-        out_names[pos] = out_name
-    logger.info(f'Prepared {len(out_names)} 8-bit modality images in {out_dir}')
+        out_names[key] = out_name
+    logger.info(f'Prepared {len(out_names)} 8-bit modality images in {out_dir} '
+                f'({copied} copied unchanged, {len(out_names) - copied} '
+                f'converted)')
     return out_names
 
 
@@ -409,38 +479,66 @@ def sfm_to_json(sfm_path: Path, out_json: Path) -> Path:
     return out_json
 
 
-def filter_sfm_for_camera(sfm_json: Path, camera_index: int,
-                          modality_dir: Path,
-                          pos_to_name: Dict[int, str],
-                          out_json: Path) -> int:
-    """Rewrite the SfM scene to contain only the requested camera's views,
-    each re-pointed at its matching modality image. Returns kept view count."""
+def filter_sfm_for_cameras(sfm_json: Path, prefix: str,
+                           modality_dir: Path,
+                           key_to_name: Dict[tuple, str],
+                           out_json: Path) -> int:
+    """Rewrite the SfM scene to the views that have a modality image, each
+    re-pointed at it. Returns kept view count.
+
+    The cameras textured from are whatever ``key_to_name`` and the solve share;
+    ``--camera-index`` has already narrowed the former, so no camera filter is
+    applied here. The two absences are not symmetric: a solved view with no
+    modality image is dropped quietly (the texturing capture simply fired fewer
+    cameras, or fewer positions), while a modality image with no solved view is
+    warned about loudly, because it was never calibrated and nothing can place it.
+    """
     data = json.loads(sfm_json.read_text())
     kept = []
-    missing = 0
+    parsed_views = 0
+    missing: Dict[int, int] = {}
+    matched_keys = set()
     kept_intrinsics = set()
     kept_poses = set()
     for v in data['views']:
         vd = v['value']['ptr_wrapper']['data']
-        parsed = parse_name(Path(vd['filename']).stem)
+        parsed = parse_view_name(Path(vd['filename']).name, prefix)
         if parsed is None:
             continue
-        cam, pos, _cap = parsed
-        if cam != camera_index:
+        parsed_views += 1
+        cam, pos = parsed
+        if (cam, pos) not in key_to_name:
+            missing[cam] = missing.get(cam, 0) + 1
             continue
-        if pos not in pos_to_name:
-            logger.warning(f'No modality image for position {pos} '
-                           f'(view {vd["filename"]}); dropping view')
-            missing += 1
-            continue
-        vd['filename'] = pos_to_name[pos]
+        vd['filename'] = key_to_name[(cam, pos)]
         vd['local_path'] = ''
+        matched_keys.add((cam, pos))
         kept_intrinsics.add(vd['id_intrinsic'])
         kept_poses.add(vd['id_pose'])
         kept.append(v)
 
     if not kept:
-        sys.exit(f'No views matched camera {camera_index}; nothing to texture')
+        # Nothing parsing at all is a different failure from nothing matching:
+        # the first says the recon was not built from PGS-named images of this
+        # scan, the second that its cameras and positions are elsewhere.
+        if parsed_views == 0:
+            sys.exit(f'No SfM view in {sfm_json.name} matched the scan prefix '
+                     f'{prefix!r} ({len(data["views"])} views did not parse). '
+                     f'Was this reconstruction built from this scan, with '
+                     f'PGS-named images?')
+        sys.exit('No solved view shares a (camera, position) with the modality '
+                 'images; nothing to texture')
+
+    # Images the solve cannot place: they were not part of the reconstruction, so
+    # there is no pose to texture them from. Loud, because it means the capture
+    # covers cameras or positions the solve does not.
+    uncalibrated = sorted(set(key_to_name) - matched_keys)
+    if uncalibrated:
+        cams = sorted({cam for cam, _pos in uncalibrated})
+        logger.warning(f'{len(uncalibrated)} modality image(s) have no solved '
+                       f'view and are unused (camera(s) {cams}, e.g. '
+                       f'{key_to_name[uncalibrated[0]]}). Those '
+                       f'(camera, position) pairs were not reconstructed.')
 
     # Drop orphan intrinsics/poses; openMVG2openMVS rejects scenes that carry
     # intrinsics or poses not referenced by any view.
@@ -455,8 +553,14 @@ def filter_sfm_for_camera(sfm_json: Path, camera_index: int,
     data['structure'] = []
     data['control_points'] = []
     out_json.write_text(json.dumps(data, indent=2))
-    logger.info(f'Filtered SfM to {len(kept)} views for camera {camera_index} '
-                f'({missing} positions had no modality image)')
+    cameras = sorted({cam for cam, _pos in matched_keys})
+    logger.info(f'Filtered SfM to {len(kept)} views for camera(s) {cameras}')
+    if missing:
+        # Not necessarily an absence in the capture: --camera-index has already
+        # narrowed the image set, and from here the two are indistinguishable.
+        logger.info('Solved views with no modality image, per camera: '
+                    + ', '.join(f'{cam}: {n}'
+                                for cam, n in sorted(missing.items())))
     return len(kept)
 
 
@@ -556,18 +660,19 @@ def _main():
     parser.add_argument('--config', '-c', is_config_file=True,
                         help='Config file path')
     parser.add_argument('--modality-images', '-i', required=True,
-                        help='Modality image input. Without --calibration: a '
-                             'DIRECTORY of images for one rig camera, matched to '
-                             'SfM views by the PGS-scan filename convention '
-                             '{prefix}_{camera}_{position}_{capture}. With '
-                             '--calibration: a SINGLE image file captured from '
-                             'the calibrated pose (any filename).')
+                        help='Modality image input. Without --calibration: a PGS '
+                             'SCAN DIRECTORY (with its metadata.json), whose '
+                             '--capture supplies the texturing images; they are '
+                             'matched to SfM views by the PGS-scan filename '
+                             'convention {prefix}{camera}_{position}_{capture}. '
+                             'With --calibration: a SINGLE image file captured '
+                             'from the calibrated pose (any filename).')
     parser.add_argument('--calibration', default=None,
                         help='A pgs-calibrate calibration .json (one localized '
                              'view). Textures the mesh from that new pose with '
                              'the single image given by -i, instead of reusing a '
-                             'rig camera\'s positions. --camera-index/--sfm-data '
-                             'are ignored in this mode.')
+                             'rig camera\'s positions. --capture, --camera-index '
+                             'and --sfm-data are ignored in this mode.')
     parser.add_argument('--use-openmvs', action='store_true',
                         help='With --calibration, texture via OpenMVS TextureMesh '
                              '(regenerates UVs into a resampled atlas; does true '
@@ -628,10 +733,22 @@ def _main():
                              '<working-dir>/mvs/<stem>.<file-type>. The <stem> '
                              '(prefixed onto every scratch artifact) is this '
                              'file\'s stem if given, else the modality input '
-                             'name.')
-    parser.add_argument('--camera-index', '-k', type=int, default=None,
-                        help='Camera index the modality images correspond to. '
-                             'Inferred from filenames if omitted.')
+                             'name plus the capture textured from '
+                             '(<scan-dir>_c<capture>).')
+    parser.add_argument('--capture', type=int, default=None, metavar='n',
+                        help='Capture index in --modality-images to texture from. '
+                             'Inferred when the scan holds only one capture; '
+                             'required when it holds several. Independent of '
+                             'pgs-recon\'s --import-capture: any pair is valid '
+                             '(solve from capture 0, texture from capture 3). '
+                             'Ignored in --calibration mode.')
+    parser.add_argument('--camera-index', '-k', type=int, nargs='+',
+                        default=None, metavar='n',
+                        help='Restrict texturing to these camera indices '
+                             '(e.g. -k 1 3). Default: every camera the capture '
+                             'and the solve share. A requested camera the '
+                             'capture lacks is warned about and skipped. '
+                             'Ignored in --calibration mode.')
     parser.add_argument('--bit-shift', type=int, default=8,
                         help='Right bit-shift applied to 16-bit modality images '
                              'to map to 8-bit (default 8 = divide by 256). '
@@ -722,12 +839,34 @@ def _main():
         sys.exit('--sfm-transform requires --mesh pointing at the centered mesh '
                  '(the transformed camera poses must match a centered mesh)')
 
+    # Index the texturing capture before anything is named after it: the stem
+    # carries the capture, so a scan directory's captures cannot collide.
+    capture = None
+    scan_prefix = None
+    img_map = None
+    if calibration is None:
+        logger.info('Indexing modality images')
+        capture, scan_prefix, img_map = index_modality_images(
+            modality_input, args.capture, args.camera_index)
+        # Pin the capture so a replayed config textures the same one even if the
+        # scan later grows another. NOT the camera list: it is derived from the
+        # capture, so recording it as if it were requested would silently narrow
+        # a replay that overrides --capture. It goes in the manifest instead.
+        args.capture = capture
+    else:
+        for name in ('capture', 'camera_index'):
+            if getattr(args, name) is not None:
+                logger.warning(f'--{name.replace("_", "-")} is ignored in '
+                               f'--calibration mode: the calibration is one '
+                               f'camera at one pose')
+
     # Resolve the final mesh path + format and derive the artifact stem.
     # --output-mesh sets the exact deliverable; its extension wins over
     # --file-type. The stem is prefixed onto every scratch artifact so they
     # coexist with the recon's files (there is no --name flag): the
-    # --output-mesh stem if given, else the modality input's name (the image
-    # directory in the default mode, the image stem in --calibration mode).
+    # --output-mesh stem if given, else the modality input's name -- the scan
+    # directory plus the capture textured from (one directory serves every
+    # capture), the image stem in --calibration mode.
     output_mesh = Path(args.output_mesh) if args.output_mesh else None
     if output_mesh is not None:
         ext = output_mesh.suffix.lstrip('.').lower()
@@ -742,7 +881,7 @@ def _main():
     else:
         file_format = args.file_type
         stem = (modality_input.resolve().stem if calibration
-                else modality_input.resolve().name)
+                else f'{modality_input.resolve().name}_c{capture}')
 
     working_dir = Path(args.working_dir) if args.working_dir else recon_dir
     working_dir.mkdir(parents=True, exist_ok=True)
@@ -763,9 +902,6 @@ def _main():
     # Final mesh: --output-mesh if given, else mvs/<stem>.<file_format>.
     paths['output_mesh'] = (output_mesh if output_mesh is not None
                             else paths['mvs'] / f'{stem}.{file_format}')
-    if paths['output_mesh'].exists():
-        logger.warning(f'Final mesh target already exists and will be '
-                       f'overwritten: {paths["output_mesh"]}')
 
     # Config + metadata, mirroring pgs-recon conventions (sidecar files; the
     # recon's own manifest is never touched).
@@ -780,9 +916,24 @@ def _main():
                 continue
             f.write(f"{arg.replace('_', '-')} = {getattr(args, arg)}\n")
 
+    # `parsed` is what was asked for; `capture`/`cameras` are what the run
+    # resolved that to. The manifest is a record, never read back as input, so
+    # inferred values are safe to state here in a way a config file is not.
     metadata = {'args': ' '.join(sys.argv), 'parsed': vars(args),
                 'commands': {}}
+    if img_map is not None:
+        metadata['capture'] = capture
+        metadata['cameras'] = sorted({cam for cam, _pos in img_map})
     paths['manifest'] = working_dir / f'{stem}_retexture.json'
+
+    # Both a recon artifact the stem happened to match and this retexture's own
+    # previous output are overwritten -- re-running has to stay legal -- but
+    # neither silently.
+    existing = sorted(str(p) for k, p in paths.items()
+                      if k not in ('working', 'mvg', 'mvs') and p.exists())
+    if existing:
+        logger.warning('These artifact paths already exist and will be '
+                       'overwritten: ' + ', '.join(existing))
 
     # Where the binaries are and what records their invocations: process-wide, so
     # no wrapper takes either as an argument (ADR 0005).
@@ -796,7 +947,7 @@ def _main():
 
     write_metadata()
 
-    # 1-2. Build the single-camera SfM scene to texture from. Two modes:
+    # 1-2. Build the SfM scene to texture from. Two modes:
     if calibration is not None:
         # New pose from pgs-calibrate: texture from one localized view, swapping
         # in the chosen modality image. No filename convention is needed.
@@ -830,20 +981,18 @@ def _main():
         logger.info('Re-pointing calibration at the modality image')
         repoint_calibration(calibration, conv, paths['sfm_filtered'])
     else:
-        # Legacy mode: reuse a rig camera's solved positions, matched by the
-        # PGS-scan filename convention.
-        logger.info('Indexing modality images')
-        camera_index, pos_map = index_modality_images(modality_input,
-                                                      args.camera_index)
+        # Capture retexture: reuse the rig's solved positions, matched by the
+        # PGS-scan filename convention. The capture was indexed before the stem
+        # was derived from it, so only the pixels and the scene remain.
         logger.info('Preparing 8-bit modality images')
-        pos_to_name = convert_modality_images(pos_map, paths['modality_8bit'],
+        key_to_name = convert_modality_images(img_map, paths['modality_8bit'],
                                               args.bit_shift)
         logger.info('Exporting SfM solution to JSON')
         sfm_to_json(sfm_data, paths['sfm_full'])
-        logger.info('Filtering SfM scene to the modality camera')
-        filter_sfm_for_camera(paths['sfm_full'], camera_index,
-                              paths['modality_8bit'], pos_to_name,
-                              paths['sfm_filtered'])
+        logger.info('Filtering SfM scene to the modality images')
+        filter_sfm_for_cameras(paths['sfm_full'], scan_prefix,
+                               paths['modality_8bit'], key_to_name,
+                               paths['sfm_filtered'])
         if sfm_transform is not None:
             logger.info('Transforming SfM extrinsics to centered mesh frame')
             transform_sfm_extrinsics(paths['sfm_filtered'], sfm_transform)

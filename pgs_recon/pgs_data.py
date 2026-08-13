@@ -3,7 +3,6 @@ import itertools
 import json
 import logging
 import math
-import re
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +13,7 @@ from scipy.spatial.transform import Rotation as Rot
 from sfm_utils.openmvg import __OPENMVG_CAMDB_DEFAULT_PATH
 
 from pgs_recon.toolchain import Recorder
+from pgs_recon.utils.scan_names import parse_scan_name
 
 
 def get_tag_option(tags, opts):
@@ -82,26 +82,6 @@ def neighbor_lookup_gridscan(scan_meta):
         return n
 
     return get_neighbors
-
-
-def parse_scan_name(name: str, prefix: str, ext: str) -> tuple:
-    """Parse ``(camera, position, capture)`` out of a PGS scan image name.
-
-    A field the name does not supply comes back as ``None``, except the capture:
-    the field is optional in the convention, and a name without one is capture 0.
-    A name that does not parse at all comes back all ``None`` -- a missing field
-    and an unrecognized name are different things, and only the first belongs to
-    a capture.
-    """
-    match = re.fullmatch(
-        rf'{re.escape(prefix)}(?P<camera>\d*)_(?P<position>\d*)'
-        rf'(_(?P<capture>\d*))?\.{re.escape(ext)}', name)
-    if match is None:
-        return None, None, None
-    cam = int(match.group('camera')) if match.group('camera') else None
-    pos = int(match.group('position')) if match.group('position') else None
-    cap = int(match.group('capture')) if match.group('capture') else 0
-    return cam, pos, cap
 
 
 def select_capture(images, prefix: str, ext: str, capture: int) -> tuple:
