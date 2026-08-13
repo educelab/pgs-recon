@@ -124,7 +124,7 @@ STAGE_IO: Dict[str, IO] = {
 # that every parser dest lands in exactly one bucket.
 STAGE_ARGS: Dict[str, Tuple[str, ...]] = {
     'import': ('input', 'focal_length', 'new_importer', 'import_pgs_scan',
-               'import_calib', 'matching_pairs_radius'),
+               'import_calib', 'import_capture', 'matching_pairs_radius'),
     'features': ('describer_method', 'describer_preset', 'describer_upright'),
     'matches': ('matching_method', 'matching_ratio', 'matching_pairs_file'),
     'filter': ('matching_geometric_model',),

@@ -197,7 +197,7 @@ usage: pgs-recon [-h] [--config CONFIG] [--input INPUT] --output OUTPUT
                  [--name NAME] [--file-type {ply,obj}] [--focal-length n]
                  [--new-importer | --no-new-importer]
                  [--import-pgs-scan | --no-import-pgs-scan | -p]
-                 [--import-calib IMPORT_CALIB]
+                 [--import-calib IMPORT_CALIB] [--import-capture n]
 ...
 ```
 

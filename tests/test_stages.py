@@ -29,7 +29,8 @@ ROOT = Path('/recon')
 DEFAULTS = dict(
     # import
     input='/images', focal_length=None, new_importer=False,
-    import_pgs_scan=False, import_calib=None, matching_pairs_radius=2,
+    import_pgs_scan=False, import_calib=None, import_capture=0,
+    matching_pairs_radius=2,
     # features / matches / filter
     describer_method='SIFT', describer_preset='HIGH', describer_upright=False,
     matching_method='FASTCASCADEHASHINGL2', matching_ratio=None,

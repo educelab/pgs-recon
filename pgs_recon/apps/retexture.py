@@ -2,6 +2,22 @@
 modality (e.g. IR940) captured at the same camera positions as one of the
 cameras in the original reconstruction.
 
+This tool serves two modes that are different in kind, and only one of them is
+inherently single-camera:
+
+  - **Capture retexture** (default mode): the texturing images are another
+    *capture* of the same scan -- the same rig, the same capture positions,
+    different illumination. Correspondence is by ``(camera, position)``, and
+    every camera present in both captures could contribute.
+  - **Localized-camera retexture** (``--calibration``): the images come from a
+    camera that was never in the solve, placed in the solved frame by
+    ``pgs-calibrate``. One camera, one pose, no positional correspondence.
+
+**Both modes are currently restricted to a single camera**, which is inherent
+only to the second. For capture retexture it is a limitation, not a design, and
+it is what stops you texturing with a capture in which the whole rig fired. See
+``docs/multi-camera-capture-retexture.md``.
+
 OpenMVS has no native "texture with a different image set" option (verified
 against OpenMVS v2.3.0), so this tool rebuilds a minimal MVS scene from the
 original SfM solution restricted to a single camera, with that camera's views
