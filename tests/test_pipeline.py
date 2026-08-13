@@ -655,37 +655,55 @@ class TestRetextureUsesTheSameToolchain(PipelineCase):
         from pgs_recon.apps import retexture
         recon = self.tmp / 'recon'
         self.run_recon(recon)
-        # A modality image set following the PGS naming convention, and an SfM
-        # whose views match it. The retexture-specific machinery (image
-        # conversion, SfM filtering) is not what is under test here, so it is
-        # stubbed; the wrapper calls are not.
-        modality = self.tmp / 'ir'
-        modality.mkdir()
-        (modality / 'ir_0_0_0.tif').write_bytes(b'')
+        # A PGS scan directory holding two captures, which is what capture
+        # retexture reads: its metadata.json says how to select the images. The
+        # retexture-specific machinery (image conversion, SfM filtering) is not
+        # what is under test here, so it is stubbed; the wrapper calls are not.
+        scan = self.tmp / 'ir'
+        scan.mkdir()
+        (scan / 'metadata.json').write_text(json.dumps(
+            {'scan': {'file_prefix': 'ir_', 'format': 'tif'}}))
+        for cap in (0, 3):
+            for cam in (0, 1):
+                (scan / f'ir_{cam}_0_{cap}.tif').write_bytes(b'')
         self.commands.clear()
-        argv = ['pgs-retexture', '-i', str(modality), '-r', str(recon),
-                '--path', str(self.prefix), '--log-level', 'ERROR']
+        argv = ['pgs-retexture', '-i', str(scan), '-r', str(recon),
+                '--capture', '3', '--path', str(self.prefix),
+                '--log-level', 'ERROR']
         with mock.patch.object(sys, 'argv', argv), \
                 mock.patch('pgs_recon.toolchain.run_command', self.fake), \
                 mock.patch('atexit.register', lambda fn: fn), \
                 mock.patch.object(retexture, 'convert_modality_images',
-                                  return_value={0: 'ir_0_0_0.jpg'}), \
-                mock.patch.object(retexture, 'filter_sfm_for_camera',
+                                  return_value={(0, 0): 'ir_0_0_3.jpg',
+                                                (1, 0): 'ir_1_0_3.jpg'}), \
+                mock.patch.object(retexture, 'filter_sfm_for_cameras',
                                   side_effect=self._stub_filter), \
                 mock.patch.object(retexture, 'ensure_ply_mesh',
                                   side_effect=self._stub_mesh):
             retexture._main()
         # The scene it built and the mesh it staged both sit in the recon's mvs/,
-        # which is what lets TextureMesh reference them by basename.
+        # which is what lets TextureMesh reference them by basename. The stem
+        # names the capture, so another capture of this scan cannot overwrite it.
         argv = self.argv_for('TextureMesh')
         self.assertEqual(str(recon / 'mvs'), flag(argv, '-w'))
-        self.assertEqual('ir_scene.mvs', flag(argv, '-i'))
-        self.assertEqual('ir.obj', flag(argv, '-o'))
-        self.assertTrue((recon / 'mvs' / 'ir.obj').is_file())
+        self.assertEqual('ir_c3_scene.mvs', flag(argv, '-i'))
+        self.assertEqual('ir_c3.obj', flag(argv, '-o'))
+        self.assertTrue((recon / 'mvs' / 'ir_c3.obj').is_file())
+
+        # What the run resolved is recorded, but only what the user chose is
+        # replayable. The camera set is derived from the capture, so pinning it
+        # into the config would silently narrow a replay that overrides
+        # --capture to a capture with more cameras.
+        manifest = json.loads((recon / 'ir_c3_retexture.json').read_text())
+        self.assertEqual(3, manifest['capture'])
+        self.assertEqual([0, 1], manifest['cameras'])
+        self.assertIsNone(manifest['parsed']['camera_index'])
+        config = next(recon.glob('*_ir_c3_retexture_config.txt')).read_text()
+        self.assertNotIn('camera-index', config)
+        self.assertIn('capture = 3', config)
 
     @staticmethod
-    def _stub_filter(sfm_json, camera_index, modality_dir, pos_to_name,
-                     out_json):
+    def _stub_filter(sfm_json, prefix, modality_dir, key_to_name, out_json):
         out_json.write_text('{}')
         return 1
 
