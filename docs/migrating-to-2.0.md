@@ -6,7 +6,8 @@ that import `pgs_recon` as a library.
 
 Nothing here changes what a reconstruction *is*. The deliverable and the frame
 everything lives in are unchanged; what moved is a set of names, the manifest's
-contents, two spellings on the command line, and what a failed run reports.
+contents, some spellings on the command line, and what a failed run reports. The
+one thing that does change pixels is how a CIELab capture is decoded — §6.
 
 **A 1.7 output directory cannot be resumed, only rebuilt.** 2.0 reads its
 manifest, but a 1.7 manifest records no per-stage state, so there is nothing to
@@ -42,13 +43,26 @@ The other two tools' sidecars move the same way, and unlike the manifest they ge
 no fallback — nothing locates them by name, so there is nothing to fall back
 *for*:
 
-| Tool | 1.7 | 2.0 |
+| Tool | pre-2.0 | 2.0 |
 |---|---|---|
 | `pgs-retexture` | `<stem>_retexture_metadata.json` | `<stem>_retexture.json` |
 | `pgs-calibrate` | `<name>_calibrate_metadata.json` | `<name>_calibrate.json` |
 
+(Neither tool shipped in 1.7; the old names are the 1.8 pre-release's.)
+
 In all three files the `paths` entry pointing at the file itself is now keyed
 `manifest` rather than `metadata`.
+
+`pgs-retexture`'s `<stem>` also changed, because `-i` now names a scan directory
+rather than one camera's images (§5): in capture mode it is
+`<scan-dir>_c<capture>`, so the captures of one scan do not overwrite each other,
+and it prefixes every scratch artifact and the default deliverable
+(`mvs/<stem>.<file-type>`) as before. That sidecar carries two keys beyond
+`args`/`parsed`/`commands`: `capture` and `cameras`, the capture textured from and
+the camera indices it resolved to. `parsed` records the *resolved* `capture`, so
+replaying the config textures the same one even if the scan later grows another;
+the camera list is deliberately only in the manifest, since recording it as if it
+had been requested would silently narrow a replay.
 
 ### 1b. New keys
 
@@ -195,7 +209,9 @@ it spells every unset argument as the literal `None` (`import-pgs-scan = None`,
 (`error: Unexpected value for import-pgs-scan: 'None'`). Re-run from the original
 command line, or strip the `None` lines. A config written by 2.0 round-trips.
 
-## 5. Two CLI changes
+## 5. CLI changes
+
+### 5a. `pgs-recon`
 
 * **`--no-mvs` is deprecated.** It still stops the run after colorize, but it now
   warns, and `--no-mvs` together with any `--to` other than `colorize` is refused
@@ -205,8 +221,73 @@ command line, or strip the `None` lines. A config written by 2.0 round-trips.
   `openMVG_main_ComputeMatches` actually builds: `HNSWL2`, `HNSWL1` and
   `HNSWHAMMING` were added, `ANNL2` removed. A script still passing it fails at
   argument parsing (exit 2) instead of inside the matches stage.
+* **`--import-capture n` is new** (`pgs-import --capture/-C` is the same choice for
+  the standalone importer). A PGS scan holds every capture position once per
+  *capture*, each with its own lighting and camera set; 1.7 hardcoded capture 0
+  and warned once per file it skipped. The default is still 0, so no existing
+  command changes meaning — but a config file written by 2.0 now carries
+  `import-capture`, and the flag warns and is ignored without
+  `--import-pgs-scan`.
 
-## 6. Library callers
+### 5b. `pgs-retexture` (capture mode only; `--calibration` mode is untouched)
+
+If you drove the 1.8 pre-release's `pgs-retexture`, its default mode changed shape:
+
+| | pre-2.0 | 2.0 |
+|---|---|---|
+| `-i` | a directory of one camera's modality images | the **PGS scan directory** (needs its `metadata.json`) |
+| capture | whatever the directory held | `--capture n`, inferred only when the scan holds one |
+| cameras | one, `--camera-index k` or inferred | **every** camera the capture and the solve share; `--camera-index k [k ...]` now *restricts* that set |
+| stem | the input directory's name | `<scan-dir>_c<capture>` (§1a) |
+
+`scan.file_prefix` and `scan.format` from the metadata are what select the images,
+so two files for one `(camera, position)` in different formats or captures can no
+longer be confused for each other. The two image sets need not agree: a solved
+view with no modality image is skipped quietly, a modality image with no solved
+view is warned about loudly, and a camera `--camera-index` asks for that the
+capture lacks is warned about and skipped. Only an empty result is fatal. An
+existing artifact path is still overwritten, but now every one of them is listed
+in a warning first.
+
+## 6. CIELab captures decode differently, and ImageMagick is gone
+
+`pgs-convert`, `pgs-calibrate` and `pgs-retexture` now read pixels through one
+function (`pgs_recon.utils.images.read_srgb`). Nothing shells out for image data,
+and **`imagemagick` is no longer installed in the Docker/Apptainer images** — a job
+that called `convert`/`magick` inside one of our containers has to bring its own.
+`tifffile` is a new Python requirement (a `pip install .` picks it up; a pinned or
+vendored environment needs adding to).
+
+What changes on disk is confined to CIELab TIFFs:
+
+* **Their colors change, and were wrong before.** `pgs-convert` used to rescale a
+  Lab file's samples as if they were RGB; `pgs-calibrate`/`pgs-retexture` shelled
+  out to ImageMagick, which ignores the `WhitePoint` tag and decodes every Lab
+  file as D65 — the EduceLab captures are untagged, i.e. TIFF's D50. 2.0 decodes
+  against the file's own white point. A texture or converted image derived from a
+  Lab capture will not match what any pre-2.0 version produced, and a re-run is
+  the only way to get the corrected colors.
+* **Everything else is bit-for-bit what it was**: a 16-bit greyscale still becomes
+  `round(v / 257)`, an 8-bit RGB still passes through unchanged (both verified
+  against ImageMagick in `tests/test_images.py`).
+* **`pgs-convert --if-same-type copy|skip` no longer passes a Lab file through.**
+  OpenMVG reads sRGB, so no Lab file may reach the output undecoded, which
+  disqualifies both whole-dataset shortcuts for a scan holding any — including
+  `skip`, which used to exit 0 having written nothing. The colorspace is decided
+  per file (a set can mix them), so only the Lab images are converted: with
+  `copy`, the rest of the tree (sidecars included) is still copied wholesale; with
+  `skip`, the non-Lab images are copied byte-for-byte rather than re-encoded. A
+  run with `--filter-cam/-pos/-cap` stays file-by-file either way, so it never
+  brings back what it excluded. Cost on an all-sRGB scan is one header read per
+  file, threaded.
+
+One build note in the same area: OpenMVG bundles zlib 1.2.3 when either libpng or
+libtiff development headers are missing, which aborted a reconstruction with
+`libpng error: bad parameters to zlib` the first time it read a mask. A
+from-source build now fails *configuration* on that mismatch instead, and the
+images install both.
+
+## 7. Library callers
 
 If you `import pgs_recon`, the wrapper interface changed wholesale in 2.0
 ([ADR 0005](./adr/0005-wrappers-mirror-the-binary.md)). The wrappers in
@@ -233,12 +314,19 @@ Flags now mirror the binary's own names: `mask_value` → `ignore_mask_label`,
 `pgs_recon.layout`, whose functions take the output root and nothing else.
 `mvs_reconstruct`/`mvs_refine` no longer return their pass-through scene.
 
+Two smaller surfaces moved with the capture work: `pgs_data.import_pgs_scan` and
+`pgs_data.init_sfm_pgs` take a `capture` keyword (default 0, the capture 1.7
+hardcoded), and the PGS filename convention is parsed by
+`pgs_recon.utils.scan_names` (`parse_scan_name`, `parse_view_name`) rather than by
+a regex private to each app.
+
 ## Checklist for an orchestrator
 
 - [ ] Read `pgs-recon.json`, falling back to `metadata.json`; don't read the old
       one once the new one exists.
 - [ ] Drop `_metadata` from the two sidecar names: `<stem>_retexture.json`,
       `<name>_calibrate.json`. No fallback here — the old names are simply gone.
+      A capture retexture's `<stem>` now ends in `_c<capture>`.
 - [ ] Expect `stages`, `effective_args`, `shape` and `runs` in the manifest, and
       a `paths` that no longer names artifacts or binaries.
 - [ ] Replace any hardcoded intermediate filename with a manifest lookup.
@@ -251,6 +339,13 @@ Flags now mirror the binary's own names: `mask_value` → `ignore_mask_label`,
       reconstruction.
 - [ ] Replace `--no-mvs` with `--to colorize`, and `--matching-method ANNL2`
       with a matcher the binary builds (`HNSWL2`, `FASTCASCADEHASHINGL2`, …).
+- [ ] Point `pgs-retexture -i` at the PGS scan directory rather than one camera's
+      images, pass `--capture` when the scan holds several, and expect every
+      shared camera to be textured from unless `--camera-index` narrows it.
+- [ ] Pass `--import-capture n` if a run should solve from a capture other than 0
+      (the default is unchanged).
+- [ ] Stop calling ImageMagick inside our images, and expect Lab-derived textures
+      and conversions to differ from 1.7's — they were miscolored.
 - [ ] Keep shape flags (`--mvs-densify`, `--mvg-robust`, `--mvg-autoscale`,
       `--mvs-refine`) on the *first* job of a staged run. Adding one later no
       longer renames anything, but it still moves what the mesh stages consume,
