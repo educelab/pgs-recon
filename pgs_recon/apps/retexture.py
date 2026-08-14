@@ -80,7 +80,7 @@ from pathlib import Path
 from typing import Dict, Optional, Sequence
 
 import configargparse
-import cv2
+import imageio.v3 as iio
 import numpy as np
 
 from pgs_recon import toolchain
@@ -90,7 +90,8 @@ from pgs_recon.stages import write_manifest
 from pgs_recon.toolchain import Recorder, resolve_exe, run
 from pgs_recon.utility import ToolFailed
 from pgs_recon.utils.apps import setup_logging
-from pgs_recon.utils.images import prepare_8bit_image
+from pgs_recon.utils.images import (drop_alpha, prepare_8bit_image, read_srgb,
+                                    to_uint8, to_uint8_shifted)
 from pgs_recon.utils.recon_dir import (
     load_manifest,
     resolve_solved_sfm,
@@ -225,34 +226,40 @@ def convert_modality_images(img_map: Dict[tuple, Path], out_dir: Path,
     through byte-for-byte rather than re-encoded: ``-i`` is a scan directory, so
     a scan captured as JPEG would otherwise pay a second lossy generation to say
     nothing new. Returns ``(camera, position)`` -> output filename (basename).
+
+    Reads through :func:`read_srgb` rather than OpenCV, which would take a
+    CIELab TIFF channel-for-channel as BGR. A decoded image has no spare high
+    bits to drop, so the shift does not apply to it -- it is already sRGB.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     out_names: Dict[tuple, str] = {}
     copied = 0
     for key, src in sorted(img_map.items()):
-        img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
-        if img is None:
-            sys.exit(f'Could not read modality image: {src}')
-        # Read first regardless: a .png says nothing about its bit depth.
-        if img.dtype == np.uint8 and src.suffix.lower() in ('.jpg', '.jpeg',
-                                                            '.png'):
+        try:
+            image = read_srgb(src)
+        except (OSError, ValueError) as e:
+            sys.exit(f'Could not read modality image: {src}: {e}')
+        # Read first regardless: a .png says nothing about its bit depth. Only
+        # these formats, so a passed-through file cannot be a (TIFF-only) Lab
+        # one reaching the toolchain undecoded.
+        if image.dtype == np.uint8 and src.suffix.lower() in ('.jpg', '.jpeg',
+                                                              '.png'):
             shutil.copy2(src, out_dir / src.name)
             out_names[key] = src.name
             copied += 1
             continue
-        if img.dtype == np.uint16:
-            img = (img >> bit_shift).astype(np.uint8)
-        elif img.dtype != np.uint8:
-            # Float or other depth: assume a [0, 1] range and apply a fixed
-            # scale (uniform across all frames, like the 16-bit bit-shift) so
-            # relative radiometry is preserved and the merged texture stays
-            # consistent. Per-frame normalization would break that.
-            img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+        # A 16-bit RGBA PNG misses the copy above, so the JPEG writer -- which
+        # refuses a fourth channel -- is where it would land. Channel count is
+        # otherwise left alone: a greyscale modality image has no reason to
+        # triple in size.
+        pixels = drop_alpha(image.pixels)
+        img = (to_uint8_shifted(pixels, bit_shift)
+               if image.dtype == np.uint16 and not image.decoded
+               else to_uint8(pixels))
         # The source stem carries camera, position and capture, so output names
         # cannot collide across the cameras of one capture.
         out_name = f'{src.stem}.jpg'
-        cv2.imwrite(str(out_dir / out_name), img,
-                    [cv2.IMWRITE_JPEG_QUALITY, 100])
+        iio.imwrite(out_dir / out_name, img, quality=100)
         out_names[key] = out_name
     logger.info(f'Prepared {len(out_names)} 8-bit modality images in {out_dir} '
                 f'({copied} copied unchanged, {len(out_names) - copied} '
@@ -296,10 +303,12 @@ def repoint_calibration(calibration_json: Path, image: Path,
                  f'view, pose and intrinsic; is this a pgs-calibrate output?')
     vd = views[0]['value']['ptr_wrapper']['data']
 
-    img = cv2.imread(str(image), cv2.IMREAD_UNCHANGED)
-    if img is None:
-        sys.exit(f'Could not read modality image: {image}')
-    h, w = img.shape[:2]
+    # Header only: the dimensions are all this needs, and a modality capture is
+    # large enough that decoding one to read two of its fields is not free.
+    try:
+        h, w = iio.improps(image).shape[:2]
+    except (OSError, ValueError, IndexError) as e:
+        sys.exit(f'Could not read modality image: {image}: {e}')
     if (w, h) != (vd['width'], vd['height']):
         sys.exit(f'Modality image {image.name} is {w}x{h} but the calibration '
                  f'was solved for {vd["width"]}x{vd["height"]}. All modalities '
@@ -312,7 +321,7 @@ def repoint_calibration(calibration_json: Path, image: Path,
     # pose) so OpenMVS sees a >=2 image scene. New keys/cereal ptr ids are
     # placed above everything already present to avoid collisions.
     dummy_img = image.with_name('__retex_dummy__.jpg')
-    cv2.imwrite(str(dummy_img), np.zeros((1, 1, 3), np.uint8))
+    iio.imwrite(dummy_img, np.zeros((1, 1, 3), np.uint8))
     new_view_key = max(v['key'] for v in views) + 1
     new_intr_key = max(i['key'] for i in intrinsics) + 1
     next_ptr = max(e['value']['ptr_wrapper']['id']
@@ -685,8 +694,8 @@ def _main():
                              'a closed mesh\'s hidden underside).')
     parser.add_argument('--convert-texture', action='store_true',
                         help='With projective UV mapping and --calibration: '
-                             'convert the modality image to 8-bit sRGB via '
-                             'ImageMagick before copying it as the texture. '
+                             'convert the modality image to 8-bit sRGB before '
+                             'copying it as the texture. '
                              'Needed for CIELab TIFFs and other non-sRGB '
                              'inputs that would render with wrong colors in '
                              'standard viewers. Default: copy the original '

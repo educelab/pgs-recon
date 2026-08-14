@@ -9,5 +9,6 @@ PyExifTool
 PySfMUtils
 scikit-image
 scipy
+tifffile
 tqdm
 vtk

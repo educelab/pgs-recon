@@ -172,7 +172,15 @@ the wrappers stay a complete library surface over each binary's flags.
   `quality.py`, `charuco.py`, `wavefront.py`, `educelab.py` (ChArUco/board detection),
   `recon_dir.py` (locate a finished run's SfM/mesh from its manifest),
   `sfm_json.py` (OpenMVG SfM_Data JSON surgery: cereal polymorphic registration,
-  extrinsic frame transforms), `images.py` (8-bit sRGB normalization).
+  extrinsic frame transforms), `images.py` (`read_srgb`, the **single** reader
+  behind `pgs-convert`, `pgs-calibrate` and `pgs-retexture`). OpenMVG reads
+  sRGB, not CIELab, and imageio hands back a Lab TIFF's samples undecoded, so
+  the photometric and WhitePoint tags are read per *file* — a capture set can
+  mix colorspaces. This used to be ImageMagick for two of the three apps, which
+  ignores WhitePoint and decodes every Lab file as D65 while the EduceLab
+  captures are untagged D50; `read_srgb` reproduces it bit-for-bit on 16-bit
+  greyscale and 8-bit RGB and differs only there. Nothing shells out for pixels
+  any more, and `imagemagick` is gone from the Docker/Apptainer images.
 - `pgs_recon/apps/` — standalone CLI utilities (one `main()` each). Apps must NOT
   import each other; anything two apps need belongs in `utils/` (the three modules
   above were extracted from `retexture.py` for exactly this reason).
