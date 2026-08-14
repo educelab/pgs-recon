@@ -75,6 +75,18 @@ inliers, resection RMSE 0.83 px, 1/1 poses localized.
   bit-shift: that keeps a *set* of frames mutually consistent for one atlas,
   whereas each overhead modality is textured independently, so per-image tone
   mapping is fine.
+
+  **Superseded.** ImageMagick ignores a Lab TIFF's `WhitePoint` tag and decodes
+  every one as D65; the MegaVision captures carry no tag and are D50 (confirmed
+  against the ColorChecker in frame — D50 fit better on all 7 patches where the
+  two hypotheses diverge). Once `pgs-convert` grew an in-process decode that
+  honors the tag, the same file textured differently depending on which tool
+  read it. `utils.images.read_srgb` is now the single reader for all three apps,
+  and ImageMagick is gone from the images. It reproduces the old output
+  bit-for-bit on 16-bit greyscale and 8-bit RGB (both verified), differing only
+  on Lab, where it is the one that is right. The claim above that per-image tone
+  mapping was happening was also wrong: `-depth 8` is a straight linear
+  requantization, `round(v / 257)`.
 - **Resolution lock.** The calibrated intrinsic is tied to the calibration
   image's pixel dimensions. `pgs-retexture --calibration` aborts if the modality
   image's dimensions differ; all modalities must share the camera's resolution.

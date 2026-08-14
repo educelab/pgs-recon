@@ -13,10 +13,10 @@ import imageio.v3 as iio
 import numpy as np
 from educelab import imgproc
 from educelab.imgproc import pipeline
-from skimage import img_as_float
 from tqdm import tqdm
 
 from pgs_recon.utility import ToolFailed, run_command
+from pgs_recon.utils.images import lab_encoding, read_srgb
 
 
 def write_config(args, config_path=None):
@@ -35,10 +35,6 @@ def write_config(args, config_path=None):
             attr = getattr(args, arg)
             arg = arg.replace('_', '-')
             file.write(f'{arg} = {attr}\n')
-
-
-def has_group_opt(args, grp):
-    return any([getattr(args, b.dest) is not None for b in grp._group_actions])
 
 
 def main():
@@ -73,7 +69,8 @@ def _main():
                                    '(copy) directly to the output directory, '
                                    '(convert) files anyway. Files are always '
                                    'converted if one of the enhancement '
-                                   'options is provided.')
+                                   'options is provided, and CIE L*a*b* files '
+                                   'are always converted to sRGB regardless.')
     convert_opts.add_argument('--force-copy', default=False,
                               action=argparse.BooleanOptionalAction,
                               help='When performing a dataset copy, ignore '
@@ -97,7 +94,7 @@ def _main():
                                 "converting images")
 
     # add the enhancement pipeline options
-    enhance_opts = pipeline.add_parser_enhancement_group(parser)
+    pipeline.add_parser_enhancement_group(parser)
 
     # parse arguments and commands
     args = parser.parse_args()
@@ -105,6 +102,13 @@ def _main():
 
     logging.basicConfig(level=args.log_level)
     logger = logging.getLogger('pgs-convert')
+
+    # If we're on a SLURM node, os.cpu_count returns the hardware CPUs, which is
+    # not necessarily what's available to the job. To avoid deadlocks, override
+    # the default with what's actually usable.
+    if args.threads is None and 'SLURM_JOB_CPUS_PER_NODE' in os.environ.keys():
+        args.threads = int(os.environ['SLURM_JOB_CPUS_PER_NODE'])
+    logger.debug(f'Max worker threads: {"auto" if args.threads is None else args.threads}')
 
     # Validate the input directory
     scan_dir = Path(args.input)
@@ -127,10 +131,53 @@ def _main():
     prefix = meta['scan']['file_prefix']
     ext = meta['scan']['format'].lower()
 
-    # Handle matching format
+    # File filter
+    cam_f = f'{args.filter_cam:03}' if args.filter_cam is not None else '*'
+    pos_f = f'_{args.filter_pos:05}' if args.filter_pos is not None else '_*'
+    cap_f = f'_{args.filter_cap:02}' if args.filter_cap is not None else '_*'
+    suffix = f'{cam_f}{pos_f}{cap_f}'
+
+    # Get a list of images. Listed before the pass-through branches below only
+    # so colorspaces can be probed; an empty set is still their business.
+    images = list(scan_dir.glob(f'{prefix}{suffix}.{ext}'))
+    images.sort()
+
+    # Whether a file already sRGB in the requested format can simply be moved,
+    # unread and un-re-encoded. Gated on the pipeline that was built rather than
+    # on whether --commands was given, so a --commands that parses to nothing
+    # passes through too.
     fmt_match = ext == args.file_type
-    has_enhance_opt = has_group_opt(args, enhance_opts)
-    if fmt_match and not has_enhance_opt:
+    pass_through = fmt_match and not cmds and args.if_same_type != 'convert'
+
+    # OpenMVG reads sRGB, not L*a*b*, so no Lab file may reach the output
+    # untouched -- which disqualifies the whole-dataset shortcuts below. The
+    # colorspace is decided per file (a set can mix the two), so this only asks
+    # which files force the slow path; the rest are still passed through. One
+    # header read each, threaded: a scan lives on a share often enough that the
+    # latency, not the parsing, is what this costs.
+    lab_images = []
+    if pass_through:
+        with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            lab_images = [p for p, enc in zip(images,
+                                              executor.map(lab_encoding, images))
+                          if enc is not None]
+    if lab_images:
+        logger.info(f'Input contains {len(lab_images)} CIE L*a*b* image(s). '
+                    f'Converting those to sRGB and copying the rest.')
+
+    def copy_dataset(hold_back=frozenset()):
+        """The scan tree wholesale, minus ``hold_back``. Exits on a populated
+        output directory, which is what --force-copy waives."""
+        try:
+            shutil.copytree(scan_dir, output_dir,
+                            ignore=lambda _d, names: hold_back & set(names),
+                            dirs_exist_ok=args.force_copy)
+        except FileExistsError as e:
+            logger.error(e)
+            sys.exit(1)
+
+    # Handle matching format
+    if pass_through and not lab_images:
         # Format matches and not copying
         if args.if_same_type == 'skip':
             logger.info('Input dataset matches requested format. '
@@ -141,37 +188,32 @@ def _main():
         elif args.if_same_type == 'copy':
             logger.info('Input dataset matches requested format. '
                         'Copying to the output directory.')
-            try:
-                shutil.copytree(scan_dir, output_dir,
-                                dirs_exist_ok=args.force_copy)
-            except FileExistsError as e:
-                logger.error(e)
-                sys.exit(1)
+            copy_dataset()
             write_config(args)
             sys.exit(0)
 
-    # File filter
-    cam_f = f'{args.filter_cam:03}' if args.filter_cam is not None else '*'
-    pos_f = f'_{args.filter_pos:05}' if args.filter_pos is not None else '_*'
-    cap_f = f'_{args.filter_cap:02}' if args.filter_cap is not None else '_*'
-    suffix = f'{cam_f}{pos_f}{cap_f}'
-
-    # Get a list of images
-    images = list(scan_dir.glob(f'{prefix}{suffix}.{ext}'))
-    images.sort()
     if len(images) == 0:
         logger.error('No images found in directory.')
         sys.exit(1)
 
+    # A mixed set still owes --if-same-type copy what a whole-dataset copy
+    # promises: the sidecar files a per-image loop never looks at, and the
+    # refusal to write over a populated output directory. So everything but the
+    # Lab images is copied here, wholesale, and only those are converted below.
+    # A filtered run stays file by file, though: it asked for a subset, and the
+    # tree would bring back everything it excluded -- including Lab images this
+    # pass never probed, which is the one thing that must not reach the output.
+    filtered = any(f is not None for f in (args.filter_cam, args.filter_pos,
+                                           args.filter_cap))
+    copy_rest = (bool(lab_images) and args.if_same_type == 'copy'
+                 and not filtered)
+    if copy_rest:
+        copy_dataset({p.name for p in lab_images})
+    to_convert = lab_images if copy_rest else images
+    lab_paths = set(lab_images)
+
     # Setup output directory
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # If we're on a SLURM node, os.cpu_count returns the hardware CPUs, which is
-    # not necessarily what's available to the job. To avoid deadlocks, override
-    # the default with what's actually usable.
-    if args.threads is None and 'SLURM_JOB_CPUS_PER_NODE' in os.environ.keys():
-        args.threads = int(os.environ['SLURM_JOB_CPUS_PER_NODE'])
-    logger.debug(f'Max worker threads: {"auto" if args.threads is None else args.threads}')
 
     # Write config before convert
     write_config(args)
@@ -187,16 +229,23 @@ def _main():
 
     # Define conversion function
     def convert_image(p) -> tuple[bool, Path]:
-        # Load image
-        try:
-            img = iio.imread(p)
-        except (OSError, ValueError):
-            logger.error(f'Failed to load file: {str(p)}')
-            return False, p.name
-        in_dtype = img.dtype
+        # Already sRGB in the requested format, and this run is only opening
+        # files for the sake of the Lab ones -- the --if-same-type skip case,
+        # where no copy ran above. Move the bytes, keeping the original quality.
+        if pass_through and p not in lab_paths:
+            shutil.copy2(p, output_dir / p.name)
+            return True, p.name
 
-        # Convert to float for processing
-        img = img_as_float(img)
+        # Load image, as [0, 1] floats whatever the file stored. A reader hands
+        # back L*a*b* samples undecoded, so scaling them as if they were RGB is
+        # what miscolors the output; read_srgb decodes instead, landing in the
+        # same floats the enhancement pipeline expects.
+        try:
+            image = read_srgb(p)
+        except (OSError, ValueError) as e:
+            logger.error(f'Failed to read {str(p)} as sRGB: {e}')
+            return False, p.name
+        in_dtype, img = image.dtype, image.pixels
 
         # Process the image
         img = apply_pipeline(img)
@@ -229,16 +278,21 @@ def _main():
     # Convert images (single-threaded)
     results = []
     if args.threads == 1:
-        for p in tqdm(images, desc='Converting images'):
+        for p in tqdm(to_convert, desc='Converting images'):
             results.append(convert_image(p))
     # Convert images (multithreaded)
     else:
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            futures = executor.map(convert_image, images)
+            futures = executor.map(convert_image, to_convert)
             results = list(
-                tqdm(futures, total=len(images), desc='Converting images'))
-    # Report success
+                tqdm(futures, total=len(to_convert), desc='Converting images'))
+    # Report success. A dataset where nothing converted is a failed run, not a
+    # quiet one: the output would otherwise be an empty (or copy-only) directory
+    # that only the next stage of the pipeline discovers is unusable.
     failed_files = [r[1] for r in results if not r[0]]
+    if len(failed_files) == len(results):
+        logger.error(f'All {len(results)} images failed to convert.')
+        sys.exit(1)
     if len(failed_files) > 0:
         logger.warning(f'{len(failed_files)} images failed to convert.')
         meta['conversion'] = {'failed': failed_files}
@@ -248,11 +302,6 @@ def _main():
     # Setup metadata copy
     cmd = ['exiftool', '-q', '-P', '-overwrite_original']
 
-    # Skip tags that don't make sense in JPGs
-    if args.file_type in ['jpg', 'png']:
-        cmd.extend(['-XMP-tiff:all=', '-ExifIFD:BitsPerSample=',
-                    '-IFD0:BitsPerSample='])
-
     # Original tags from original files
     # Use dummy _ to get OS separator then strip dummy _
     meta_dir = str(scan_dir / '_')[:-1]
@@ -260,6 +309,29 @@ def _main():
 
     # Map all the other tags
     cmd.append('-all:all')
+
+    # Everything below excludes tags from that copy (--TAG) rather than deleting
+    # them after it (-TAG=): exiftool performs deletions *before* it copies, so
+    # the -XMP-tiff:all= that used to sit ahead of -TagsFromFile removed nothing
+    # the copy then put back. Excluding also leaves a passed-through file's own
+    # tags alone, which deleting would not.
+
+    # The output is sRGB whatever the source was, so nothing describing the
+    # source's colorspace may ride along -- a Lab file's white point on an sRGB
+    # one says the pixels are something they are not. (PhotometricInterpretation
+    # itself exiftool protects, and will not write.)
+    for tag in ('PhotometricInterpretation', 'WhitePoint',
+                'PrimaryChromaticities', 'ReferenceBlackWhite'):
+        cmd.extend([f'--IFD0:{tag}', f'--XMP-tiff:{tag}'])
+
+    # Skip tags that don't make sense in JPGs
+    if args.file_type == 'jpg':
+        cmd.extend(['--XMP-tiff:all', '--ExifIFD:BitsPerSample',
+                    '--IFD0:BitsPerSample'])
+
+    # Say so positively, since writing EXIF at all makes exiftool fill in its
+    # mandatory ColorSpace, whose default is "Uncalibrated".
+    cmd.append('-ExifIFD:ColorSpace=sRGB')
 
     # Iterate over the output dir
     cmd.append(str(output_dir))

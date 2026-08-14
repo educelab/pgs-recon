@@ -10,6 +10,11 @@ differ. An image the solve cannot place is loud (it was never calibrated); a
 solved view the capture does not cover is quiet (the capture simply fired fewer
 cameras).
 
+The other half is the conversion those images go through: ``read_srgb`` replaced
+OpenCV here, and ``convert_modality_images`` maps a *set* of frames to 8-bit with
+one fixed scale, so relative radiometry survives and the merged atlas stays
+seamless. That contract is why it cannot simply call ``prepare_8bit_image``.
+
 No binary runs -- ``index_modality_images`` reads a directory and
 ``filter_sfm_for_cameras`` rewrites a JSON scene, so the fixtures are files.
 """
@@ -21,7 +26,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-DEPS = ('configargparse', 'cv2', 'numpy', 'sfm_utils', 'exiftool')
+DEPS = ('configargparse', 'cv2', 'numpy', 'sfm_utils', 'exiftool', 'imageio',
+        'skimage', 'tifffile')
 MISSING = [d for d in DEPS if importlib.util.find_spec(d) is None]
 
 #: cereal sets this bit on the *first* instance of a polymorphic type.
@@ -252,6 +258,19 @@ class TestConversionPreservesWhatIsAlreadyUsable(RetextureCase):
                          (out_dir / 'PGS_0_0_3.jpg').read_bytes())
         self.assertTrue((out_dir / 'PGS_1_0_3.jpg').is_file())
 
+    def test_a_16bit_rgba_png_loses_its_alpha_rather_than_the_run(self):
+        """Only 8-bit images are copied through, so an RGBA one reaches the JPEG
+        writer -- which refuses four channels, aborting the whole retexture."""
+        from pgs_recon.apps.retexture import convert_modality_images
+        import imageio.v3 as iio
+        import numpy as np
+        import cv2
+        src = self.tmp / 'PGS_0_0_3.png'
+        cv2.imwrite(str(src), np.full((4, 4, 4), 40, dtype=np.uint16))
+        out_dir = self.tmp / 'out'
+        names = convert_modality_images({(0, 0): src}, out_dir, 8)
+        self.assertEqual(iio.imread(out_dir / names[(0, 0)]).shape, (4, 4, 3))
+
     def test_a_16bit_png_is_converted_despite_its_extension(self):
         """The extension says nothing about bit depth, so the decode is what
         decides -- a 16-bit PNG copied through would reach OpenMVS unusable."""
@@ -260,6 +279,97 @@ class TestConversionPreservesWhatIsAlreadyUsable(RetextureCase):
         out_dir = self.tmp / 'out'
         names = convert_modality_images(img_map, out_dir, 8)
         self.assertEqual('PGS_0_0_3.jpg', names[(0, 0)])
+
+
+class TestConversionArithmeticIsFixedPerSet(RetextureCase):
+    """What the conversion does to the pixels it cannot copy through.
+
+    Two behaviours changed when it moved off OpenCV onto ``read_srgb`` and both
+    are asserted here: a CIELab TIFF is now decoded rather than taken
+    channel-for-channel as BGR, and a shift small enough to leave values above
+    255 clips instead of wrapping (``(v >> 6).astype(uint8)`` turned the
+    brightest pixels black).
+    """
+
+    def convert(self, samples, bit_shift=8, photometric='minisblack'):
+        """Run one image through and read back what was written."""
+        import imageio.v3 as iio
+        import tifffile
+        from pgs_recon.apps.retexture import convert_modality_images
+        src = self.tmp / 'IR_000_00000_00.tif'
+        tifffile.imwrite(src, samples, photometric=photometric)
+        out = self.tmp / f'out{bit_shift}'
+        names = convert_modality_images({(0, 0): src}, out, bit_shift)
+        return iio.imread(out / names[(0, 0)])
+
+    def expected(self, pixels):
+        """A reference array through the same JPEG encoder.
+
+        ``convert_modality_images`` writes a lossy file, so comparing its output
+        to a raw array would test libjpeg, not the conversion. Encoding the
+        reference identically cancels that: equal inputs give equal files, so
+        any difference that survives is arithmetic.
+        """
+        import imageio.v3 as iio
+        path = self.tmp / 'expected.jpg'
+        iio.imwrite(path, pixels, quality=100)
+        return iio.imread(path)
+
+    def test_16bit_shift_matches_the_old_bit_shift(self):
+        """The default path must be bit-identical to what OpenCV produced."""
+        import numpy as np
+        src = (np.arange(256, dtype=np.uint16) * 257).reshape(16, 16)
+        for shift in (8, 10, 12):
+            with self.subTest(bit_shift=shift):
+                np.testing.assert_array_equal(
+                    self.convert(src, shift),
+                    self.expected((src >> shift).astype(np.uint8)))
+
+    def test_small_shift_clips_instead_of_wrapping(self):
+        """``(v >> 6).astype(uint8)`` wrapped, turning bright pixels black."""
+        import numpy as np
+        # >> 6 sends these to 0, 256, 512 and 1023: everything but the first
+        # overflows a uint8, and the middle two wrap to exactly 0.
+        src = np.tile(np.array([0, 16384, 32768, 65535], dtype=np.uint16),
+                      (16, 4))
+        np.testing.assert_array_equal(
+            self.convert(src, 6),
+            self.expected(np.clip(src >> 6, 0, 255).astype(np.uint8)))
+        wrapped = (src >> 6).astype(np.uint8)
+        self.assertEqual(int(wrapped[0, 1]), 0, 'the bug this replaces')
+        self.assertEqual(int(wrapped[0, 2]), 0)
+
+    def test_scale_is_uniform_across_frames(self):
+        """Per-frame normalization would break the merged texture."""
+        import numpy as np
+        dim = (np.arange(256, dtype=np.uint16) * 40).reshape(16, 16)
+        bright = (np.arange(256, dtype=np.uint16) * 257).reshape(16, 16)
+        # the dim frame stays dim -- it is not stretched to fill the range
+        self.assertLessEqual(int(self.convert(dim, 8).max()),
+                             int((dim >> 8).max()) + 1)
+        self.assertGreaterEqual(int(self.convert(bright, 8).max()), 254)
+
+    def test_8bit_input_passes_through_unchanged(self):
+        import numpy as np
+        src = np.arange(48, dtype=np.uint8).reshape(4, 4, 3)
+        np.testing.assert_array_equal(self.convert(src, photometric='rgb'),
+                                      self.expected(src))
+
+    def test_lab_is_decoded_not_taken_as_bgr(self):
+        """OpenCV read L/a/b as B/G/R; a decoded neutral ramp proves it does not."""
+        import numpy as np
+        from pgs_recon.utils.images import CIELAB
+        from tests.test_images import encode
+        from skimage.color import rgb2lab
+        # a neutral grey ramp: decoded it must stay grey (R == G == B)
+        grey = np.repeat(np.arange(20, 240, 20, dtype=np.uint8), 3)
+        grey = grey.reshape(1, 11, 3)
+        samples = encode(rgb2lab(grey / 255.), CIELAB, np.uint8)
+        got = self.convert(samples, photometric='cielab').astype(int)
+        self.assertEqual(got.shape[-1], 3)
+        self.assertLessEqual(np.abs(got[..., 0] - got[..., 1]).max(), 2)
+        self.assertLessEqual(np.abs(got[..., 1] - got[..., 2]).max(), 2)
+        np.testing.assert_allclose(got[0, :, 0], grey[0, :, 0], atol=3)
 
 
 class TestViewNamesAreParsedAgainstTheScanPrefix(RetextureCase):

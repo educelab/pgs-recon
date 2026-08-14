@@ -25,7 +25,6 @@ RUN apt update \
       doxygen \
       git \
       graphviz \
-      imagemagick \
       libatlas-base-dev \
       libboost-iostreams-dev \
       libboost-program-options-dev \
