@@ -5,7 +5,6 @@ curl
 doxygen
 git
 graphviz
-imagemagick
 libboost-iostreams-dev
 libboost-program-options-dev
 libboost-serialization-dev
