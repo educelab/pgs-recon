@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+title: PGS Recon
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: Parker
+    given-names: "C. Seth"
+    orcid: "https://orcid.org/0000-0002-3887-1237"
+    affiliation: University of Kentucky
+  - family-names: Gessel
+    given-names: Kristina
+    orcid: "https://orcid.org/0000-0002-9628-0232"
+    affiliation: University of Kentucky
+  - family-names: Parsons
+    given-names: Stephen
+    orcid: "https://orcid.org/0000-0002-0428-9732"
+    affiliation: University of Kentucky
+  - name: maekclena
+  - family-names: McCune
+    given-names: Summer
+repository-code: "https://github.com/educelab/pgs-recon"
+license: AGPL-3.0-or-later
+keywords:
+  - photogrammetry
+  - structure-from-motion
+  - multi-view-stereo
+  - 3d-reconstruction
