@@ -1,0 +1,38 @@
+{
+  "title": "PGS Recon",
+  "description": "A Python-based pipeline for reconstructing photogrammetry datasets using OpenMVG and OpenMVS.",
+  "upload_type": "software",
+  "license": "AGPL-3.0-or-later",
+  "creators": [
+    {
+      "orcid": "0000-0002-3887-1237",
+      "affiliation": "University of Kentucky",
+      "name": "Parker, C. Seth"
+    },
+    {
+      "orcid": "0000-0002-9628-0232",
+      "affiliation": "University of Kentucky",
+      "name": "Gessel, Kristina"
+    },
+    {
+      "orcid": "0000-0002-0428-9732",
+      "affiliation": "University of Kentucky",
+      "name": "Parsons, Stephen"
+    },
+    {"name": "maekclena"},
+    {"name": "McCune, Summer"}
+  ],
+  "keywords": [
+    "photogrammetry",
+    "structure-from-motion",
+    "multi-view-stereo",
+    "3d-reconstruction"
+  ],
+  "related_identifiers": [
+    {
+      "scheme": "url",
+      "identifier": "https://github.com/educelab/pgs-recon",
+      "relation": "isSupplementTo"
+    }
+  ]
+}
