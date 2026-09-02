@@ -146,22 +146,35 @@ different resources. Out of **memory** is the familiar one, and resuming the sam
 command picks up where the kill happened.
 
 Out of **wall clock** looks different: no progress in the log, one core pinned at
-100%, and memory flat. That is mesh *preparation* rather than the optimization —
-before refining anything, `RefineMesh` subdivides the input mesh and remeshes the
-result with single-threaded CGAL, which is silent at the default verbosity and on
-a mesh of a few hundred thousand vertices can run for tens of minutes or more.
-Adding cores or memory does not help. Turning it off does:
+100%, and memory flat. That is mesh *preparation* rather than the optimization.
+Before refining anything, `RefineMesh` decimates the input mesh by CGAL
+Garland-Heckbert edge collapse, which is single-threaded and silent at the default
+verbosity. Across 84 cluster runs that pass took a median of 7 minutes, 28 minutes
+at p90, and 8.6 hours at worst. Adding cores or memory does not help.
+
+Its cost does not track the size of the input mesh; it tracks how far the mesh is
+decimated, and by default OpenMVS chooses that for you. `--decimation-factor` is
+left unset, so OpenMVS's own default of `0` (auto) applies: it derives a target
+from the mesh's *projected* face area in your images and floors it at a tenth of
+the input — so unlucky geometry collapses 90% of the faces. Pinning the factor
+bounds the pass:
 
 ```shell
-# Skip the remesh; refine everything else as before
-pgs-recon -o recon/ --from refine --refine-ensure-edge-size 0
+# Decimate to a fixed half rather than letting auto choose
+pgs-recon -o recon/ --from refine --decimation-factor 0.5
 
-# Or subdivide less aggressively, so preparation has less to remesh
-pgs-recon -o recon/ --from refine --refine-max-face-area 64
+# Or skip decimation, which at the default --refine-ensure-edge-size
+# also skips the edge-size pass that follows it
+pgs-recon -o recon/ --from refine --decimation-factor 1
 ```
 
-Both change the refined mesh, so they are options rather than defaults. If refine
-is not worth its cost on a given dataset, `--no-mvs-refine` drops it from the
+`--refine-ensure-edge-size 0` skips only that following edge-size and vertex-valence
+pass, which is the cheaper of the two. `--refine-max-face-area` is *not* a remedy
+here: it is the denominator auto-decimation divides by, so raising it decimates
+harder. It bounds subdivision, not decimation.
+
+All of these change the refined mesh, so they are options rather than defaults. If
+refine is not worth its cost on a given dataset, `--no-mvs-refine` drops it from the
 pipeline shape and textures the reconstructed mesh directly.
 
 ### Docker images

@@ -392,6 +392,32 @@ class TestDenseCloudIsHandedOver(PipelineCase):
         self.assertIsNone(flag(self.argv_for('ReconstructMesh'), '-p'))
 
 
+class TestReconstructCleanFlags(PipelineCase):
+    """ReconstructMesh's clean block is reachable, so it can be bisected.
+
+    All of it runs at OpenMVS defaults, and the whole block sits between the ROI
+    trim and the mesh being written -- which is where a run that dies in clean
+    dies. Omitted means the binary's default, not ours.
+    """
+
+    def test_clean_flags_are_omitted_by_default(self):
+        self.run_recon(self.tmp / 'recon')
+        argv = self.argv_for('ReconstructMesh')
+        for name in ('--remove-spurious', '--remove-spikes', '--close-holes'):
+            self.assertIsNone(flag(argv, name), f'{name} was not left to OpenMVS')
+
+    def test_clean_flags_reach_argv(self):
+        self.run_recon(self.tmp / 'recon', '--mvs-smooth', '0',
+                       '--mvs-remove-spurious', '0', '--no-mvs-remove-spikes',
+                       '--mvs-close-holes', '0')
+        argv = self.argv_for('ReconstructMesh')
+        self.assertEqual('0', flag(argv, '--smooth'))
+        # float, per OpenMVS's own declaration -- boost parses '0.0' fine.
+        self.assertEqual('0.0', flag(argv, '--remove-spurious'))
+        self.assertEqual('0', flag(argv, '--remove-spikes'))
+        self.assertEqual('0', flag(argv, '--close-holes'))
+
+
 class TestStagedRunsMatchSingleShot(PipelineCase):
     """ADR 0004's acceptance test: a split run must leave the same tree.
 

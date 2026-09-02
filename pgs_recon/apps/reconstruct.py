@@ -298,6 +298,18 @@ def build_parser() -> configargparse.ArgumentParser:
     opts_mvs.add_argument('--mvs-smooth', type=int, default=2,
                           help='Number of smoothing iterations after initial '
                                'surface reconstruction. 0 is disabled.')
+    # The rest of ReconstructMesh's clean block, for bisecting it stage by stage.
+    opts_mvs.add_argument('--mvs-remove-spurious', default=None, type=float,
+                          help='spurious factor for removing faces with too '
+                               'long edges or isolated components after '
+                               'surface reconstruction (0 - disabled)')
+    opts_mvs.add_argument('--mvs-remove-spikes', default=None,
+                          action=argparse.BooleanOptionalAction,
+                          help='remove spike faces after surface '
+                               'reconstruction')
+    opts_mvs.add_argument('--mvs-close-holes', default=None, type=int,
+                          help='close holes up to this many edges after '
+                               'surface reconstruction (0 - disabled)')
     opts_mvs.add_argument('--densify-resolution-level', default=None, type=int,
                           help='how many times to scale down images before '
                                'DensifyPointCloud')
@@ -739,7 +751,10 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
         mesh = layout.reconstruct_mesh(output)
         mvs_reconstruct(scene_in, output=mesh, point_cloud=cloud_in,
                         free_space_support=args.free_space_support,
-                        smooth=args.mvs_smooth)
+                        smooth=args.mvs_smooth,
+                        remove_spurious=args.mvs_remove_spurious,
+                        remove_spikes=args.mvs_remove_spikes,
+                        close_holes=args.mvs_close_holes)
         # ReconstructMesh hands the scene back untouched, so only the mesh is
         # recorded as produced: see STAGE_IO on pass-through roles.
         tracker.end('reconstruct',

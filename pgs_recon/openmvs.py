@@ -210,11 +210,18 @@ def mvs_refine(scene: Path, mesh: Path, output: Path,
     The memory hog of the pipeline, and the reason a run can be split into jobs
     (`ADR 0004 <../docs/adr/0004-staged-resumable-runs.md>`_). At the pinned
     revision it is also the wall-clock hog, in mesh *preparation* rather than in
-    the optimization: at the defaults it subdivides the mesh and then remeshes the
-    result with single-threaded CGAL, silently
-    (``SceneRefine.cpp:551-560``, ``Mesh.cpp:1888``). ``ensure_edge_size=0``
-    disables that; ``decimate=1`` skips it as a side effect of the same guard.
-    Neither is a default here, because both change the mesh that comes out.
+    the optimization: before refining, it decimates by CGAL Garland-Heckbert edge
+    collapse, single-threaded and silent (``Mesh.cpp:925-945``, called from
+    ``SceneRefine.cpp:508-535``).
+
+    That pass costs by how far it decimates, not by input size. ``decimate=None``
+    leaves OpenMVS at ``0`` (auto), whose target is the mesh's median *projected*
+    face area over ``max_face_area``, floored at a tenth of the input. So
+    ``max_face_area`` is the denominator: raising it decimates harder, and it
+    bounds subdivision rather than this. ``decimate=1`` skips decimation, and with
+    ``ensure_edge_size=1`` skips the edge-size pass after it too, via the same
+    guard (``SceneRefine.cpp:556``); ``ensure_edge_size=0`` skips only that pass.
+    None of these are defaults here, because each changes the mesh that comes out.
     """
     work = work_dir(scene, mesh, output)
     command = [
