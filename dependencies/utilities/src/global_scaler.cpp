@@ -5,6 +5,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -133,7 +134,7 @@ auto main(int argc, char* argv[]) -> int
   } else if (method == "sample-square") {
     detect = DetectSampleSquare;
   } else {
-    std::cout << "ERROR: Unrecognized detection method: \'" << method << "\'\n";
+    std::cerr << "ERROR: Unrecognized detection method: \'" << method << "\'\n";
     return BAD_ARG;
   }
 
@@ -216,7 +217,7 @@ auto main(int argc, char* argv[]) -> int
                std::inserter(views, views.end()),
                [&filter](const auto &pair) { return filter(pair.second); });
   if (views.empty()) {
-    std::cout << "ERROR: No views selected!\n";
+    std::cerr << "ERROR: No views selected!\n";
     return NO_VIEWS;
   }
 
@@ -362,26 +363,35 @@ auto main(int argc, char* argv[]) -> int
   std::cout << "Triangulated " << numTriangulated << " of " << landmarks.size()
             << " landmarks\n";
   if (numTriangulated < 2) {
-    std::cout << "ERROR: Not enough landmarks to estimate scale!\n";
+    std::cerr << "ERROR: Not enough landmarks to estimate scale!\n";
     return NO_LDMS;
   }
 
   // Decide which stats to compute
   ScaleStats stats;
+  std::string scaleLabel;
   if (scaleMethod == "edge") {
     stats = ComputeEdgeScaleStats(landmarks, markerIDs, markerSize);
-    std::cout << "Edge-length median scale: " << stats.summary << "\n";
+    scaleLabel = "Edge-length";
   } else {
     stats = ComputeUmeyamaScaleStats(landmarks, markerIDs, markerSize);
-    std::cout << "Umeyama median scale:     " << stats.summary << "\n";
+    scaleLabel = "Umeyama";
   }
 
   // Bail out if no marker yielded a usable scale estimate, rather than
   // silently applying the default scale of 1.0
   if (stats.scales.empty()) {
-    std::cout << "ERROR: Could not estimate scale from the detected markers!\n";
+    std::cerr << "ERROR: Could not estimate scale from the detected markers!\n";
     return NO_SCALES;
   }
+
+  // The one number a run cannot be re-derived without: report it on stderr,
+  // alongside pgs-recon's own log lines, at round-trip precision, and only once
+  // it is a real estimate rather than the 1.0 default.
+  std::cerr << scaleLabel << " " << stats.summaryLabel << " scale factor: "
+            << std::setprecision(std::numeric_limits<double>::max_digits10)
+            << stats.summary << " (from " << stats.scales.size()
+            << " estimates)" << std::endl;
 
   // Save a histogram file
   if (doHistogram) {
