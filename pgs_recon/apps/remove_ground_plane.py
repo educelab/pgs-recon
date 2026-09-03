@@ -1,4 +1,6 @@
 import argparse
+import math
+import sys
 
 import pgs_recon.utils.wavefront as wobj
 from pgs_recon.utils import geometry as geom
@@ -13,6 +15,18 @@ def parse_filter_cc(arg: str):
         return int(arg)
 
 
+def parse_filter_cc_area(arg: str):
+    try:
+        area = float(arg)
+    except ValueError:
+        area = math.nan
+    # nan compares False against every component, so it would save an empty
+    # mesh; a negative would silently mean 'keep everything'
+    if not math.isfinite(area) or area < 0:
+        raise argparse.ArgumentTypeError(f'{arg} is not an area >= 0')
+    return area
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input-file', '-i', required=True,
@@ -21,17 +35,36 @@ def main():
                         help='Output mesh file')
     parser.add_argument('--scale', type=float,
                         help='Scale mesh before processing')
-    parser.add_argument('--distance-threshold', type=float, default=0.1,
-                        help='During ground plane estimation, points are '
-                             'considered inliers if their distance from the '
-                             'plane is less than the distance threshold. This '
-                             'should be tuned based on the point density.')
-    parser.add_argument('--filter-cc', default='largest', type=parse_filter_cc,
-                        help="Filter the mesh's connected components after "
-                             "removing the ground plane:\n"
-                             " - 'none': No filtering\n"
-                             " - 'largest': keep only the largest connected component\n"
-                             " - N: remove all connected components with fewer than N faces")
+    parser.add_argument('--distance-threshold', type=float, default=0.02,
+                        help='During ground estimation, points are considered '
+                             'inliers if their distance from the fitted '
+                             'surface is less than this. Too small and the '
+                             'band is the mesh noise rather than the ground; '
+                             'too large and it reaches the object where that '
+                             'meets the ground. On EduceLab PGS captures '
+                             'anything in 0.01-0.05 works.')
+    parser.add_argument('--surface-degree', type=int, default=2,
+                        help='Degree of the polynomial surface fit to the '
+                             'ground. A scan bed is usually bowed by more than '
+                             'the distance threshold, in which case a plane (0) '
+                             'only removes the strip where the two coincide.')
+    filters = parser.add_mutually_exclusive_group()
+    filters.add_argument('--filter-cc', default='largest', type=parse_filter_cc,
+                         help="Filter the mesh's connected components after "
+                              "removing the ground:\n"
+                              " - 'none': No filtering\n"
+                              " - 'largest': keep only the largest connected component\n"
+                              " - N: remove all connected components with fewer than N faces")
+    filters.add_argument('--filter-cc-area', metavar='AREA',
+                         type=parse_filter_cc_area,
+                         help="Filter the mesh's connected components after "
+                              "removing the ground by surface area instead, "
+                              "keeping those of at least AREA in the mesh's "
+                              "units squared (cm^2 on an autoscaled "
+                              "reconstruction). 0 keeps everything and "
+                              "reports the inventory. An area means the same "
+                              "thing from one scan to the next; a face count "
+                              "does not.")
     parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
 
@@ -44,19 +77,33 @@ def main():
         print('Scaling mesh...')
         mesh.vertices *= args.scale
 
-    print('Fitting plane...')
-    _, plane_inliers = geom.segment_plane(mesh,
-                                          dist_threshold=args.distance_threshold,
-                                          seed=args.seed)
-    print('Removing plane...')
-    geom.remove_vertices_by_index(mesh, plane_inliers)
+    print('Fitting ground surface...')
+    try:
+        surface, ground = geom.segment_ground_surface(
+            mesh, dist_threshold=args.distance_threshold,
+            degree=args.surface_degree, seed=args.seed)
+    except ValueError as e:
+        # Writing the mesh anyway would hand on a silently mangled one
+        sys.exit(f'{args.input_file}: {e}')
+    print(f'Removing ground ({len(ground)} of {mesh.vertices.shape[0]} '
+          f'vertices, warp {surface.warp:.4f}, fit rms {surface.rms:.5f} = '
+          f'{surface.rms / args.distance_threshold:.2f} of the threshold)...')
+    geom.remove_vertices_by_index(mesh, ground)
 
-    if args.filter_cc > 0:
-        print(f'Removing connected components smaller than {args.filter_cc} faces...')
-        geom.remove_connected_components_by_size(mesh, num_faces=args.filter_cc)
+    if args.filter_cc_area is not None:
+        print(f'Filtering components by area '
+              f'(>= {args.filter_cc_area} units^2)...')
+        print(geom.remove_connected_components_by_area(
+            mesh, min_area=args.filter_cc_area))
+    elif args.filter_cc > 0:
+        print(f'Removing connected components smaller than '
+              f'{args.filter_cc} faces...')
+        print(geom.remove_connected_components_by_size(
+            mesh, num_faces=args.filter_cc))
     elif args.filter_cc < 0:
         print('Keeping largest connected component...')
-        geom.keep_largest_connected_component(mesh, filter_vertices=True)
+        print(geom.keep_largest_connected_component(
+            mesh, filter_vertices=True))
 
     print('Saving mesh...')
     obj = geom.mesh_to_wavefront(mesh, obj)
