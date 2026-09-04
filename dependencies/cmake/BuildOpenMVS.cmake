@@ -10,6 +10,13 @@ ExternalProject_Add(
     # in SceneRefineCUDA.cu); FixRefineCUDABounds below cherry-picks the upstream
     # fix (develop a4d652a) rather than bumping the pin, since later commits pull
     # in new SfM dependencies. Only USE_CUDA=ON builds hit this, so CI misses it.
+    # FixSpikeRemovalStaleVertex guards Mesh::Clean's spike-removal loop against
+    # vertices an earlier removal already deleted; circulating one never
+    # terminates and the collection vector grows until the process is OOM-killed
+    # (tens of GiB on a large mesh). Upstream fixed this on develop (9fabec1,
+    # #1297) by rewriting Clean onto cdcseacave/halfmesh, which needs C++20
+    # <format> (GCC 13+; the images are on GCC 11.4), so we carry the equivalent
+    # one-line guard instead of bumping the pin.
     GIT_TAG ca991d50964ad2cfabc94c88d61a444999670a5d
     DOWNLOAD_NO_PROGRESS ON
     DOWNLOAD_EXTRACT_TIMESTAMP OFF
@@ -17,6 +24,7 @@ ExternalProject_Add(
       COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVS-v2.4-OptionalJXL.diff || true
       COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVS-v2.4-RemoveMTLTransparency.diff || true
       COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVS-v2.4-FixRefineCUDABounds.diff || true
+      COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVS-v2.4-FixSpikeRemovalStaleVertex.diff || true
     CMAKE_CACHE_ARGS
         ${GLOBAL_CMAKE_ARGS}
         ${GLOBAL_CUDA_ARGS}
