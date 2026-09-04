@@ -1,0 +1,33 @@
+Mesh::Clean's spike-removal loop collects spikeVerts in one pass, then mutates the
+mesh with Euler::remove_face while iterating that now-stale list. Removing the faces
+around one spike can delete a vertex that appears later in the list. Such a vertex
+still passes the is_isolated() guard, but its half-edge cycle no longer closes, so
+the halfedges_around_target circulator -- which has no termination check -- spins
+forever and toRemove grows until the process is OOM-killed.
+
+On a large mesh a single such vertex can push hundreds of thousands of half-edges in
+one iteration; unguarded, reconstruct grows to tens of GiB and is SIGKILLed. With the
+guard the loop converges in a few iterations at a flat couple of GiB. It fails loudly
+every time -- SIGKILL, no output after "Removed N connected components" -- so it
+cannot produce a silently bad mesh.
+
+Fixed upstream by rewriting Clean onto the halfmesh library (openMVS #1297 on
+develop), which replaces the per-vertex walk with a bulk removal. That rewrite adds
+a dependency needing C++20 <format> (GCC 13+; this container has GCC 11.4), so this
+is the minimal equivalent guard for the pinned commit.
+
+--- a/libs/MVS/Mesh.cpp
++++ b/libs/MVS/Mesh.cpp
+@@ -905,6 +905,12 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned
+ 			if (spikeVerts.empty())
+ 				break;
+ 			for (CLEAN::vertex_descriptor vd : spikeVerts) {
++				// spikeVerts was built before any of the removals below ran; an
++				// earlier iteration may already have deleted this vertex, leaving
++				// a half-edge cycle that never closes for the circulator further
++				// down. is_isolated() does not catch that, is_removed() does.
++				if (sm.is_removed(vd))
++					continue;
+ 				if (sm.is_isolated(vd)) {
+ 					sm.remove_vertex(vd);
+ 					continue;
