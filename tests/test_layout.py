@@ -22,7 +22,7 @@ NAME = 'scroll'
 
 
 def chain(robust=False, autoscale=False, densify=False, refine=False,
-          file_type='obj') -> dict:
+          decimate=False, file_type='obj') -> dict:
     """Walk one pipeline shape, returning role -> path at the end of each stage.
 
     Mirrors ``run_pipeline``'s bindings, including the rebinding: ``sfm`` is
@@ -52,6 +52,9 @@ def chain(robust=False, autoscale=False, densify=False, refine=False,
     mesh = out['reconstruct.mesh'] = layout.reconstruct_mesh(ROOT)
     if refine:
         mesh = out['refine.mesh'] = layout.refine_mesh(ROOT)
+    if decimate:
+        mesh = out['decimate.mesh'] = layout.decimate_mesh(ROOT)
+        out['decimate.deviation'] = layout.decimate_report(ROOT)
     out['texture.mesh'] = layout.final_mesh(ROOT, NAME, file_type)
     # Named so an unused-variable reading of the walk is wrong: the final mesh is
     # textured from whatever 'mesh' ends up bound to.
@@ -63,8 +66,9 @@ SHAPES = {
     'minimal': chain(),
     'densified': chain(densify=True),
     'refined': chain(refine=True),
+    'decimated': chain(decimate=True),
     'everything': chain(robust=True, autoscale=True, densify=True,
-                        refine=True),
+                        refine=True, decimate=True),
 }
 
 
@@ -244,12 +248,29 @@ class TestMvsChain(unittest.TestCase):
         self.assertEqual(ROOT / 'mvs/refine_mesh.ply', c['refine.mesh'])
         self.assertNotIn('scene', c['refine.mesh'].name)
 
+    def test_decimate(self):
+        c = chain(refine=True, decimate=True)
+        self.assertEqual(ROOT / 'mvs/decimate_mesh.ply', c['decimate.mesh'])
+        self.assertEqual(ROOT / 'mvs/decimate_report.json',
+                         c['decimate.deviation'])
+        self.assertEqual(c['decimate.mesh'], c['texture.input'])
+
+    def test_decimate_takes_the_mesh_from_whatever_owns_it(self):
+        # With refine off it coarsens reconstruct's mesh, under the same name:
+        # a stage's output name never records which stages ran before it.
+        with_refine = chain(refine=True, decimate=True)
+        without = chain(decimate=True)
+        self.assertEqual(with_refine['decimate.mesh'],
+                         without['decimate.mesh'])
+        self.assertEqual(without['decimate.mesh'], without['texture.input'])
+
     def test_every_mvs_artifact_stays_in_the_working_dir(self):
-        # Every MVS stage runs with -w mvs/ and refers to its inputs by
-        # basename, so an artifact outside that directory is unreachable.
-        c = chain(densify=True, refine=True)
+        # Every MVS stage runs with -w mvs/ and names inputs by basename. The
+        # decimated mesh is here because TextureMesh addresses it that way.
+        c = chain(densify=True, refine=True, decimate=True)
         for role in ('convert.scene', 'densify.scene', 'densify.cloud',
-                     'reconstruct.mesh', 'refine.mesh', 'texture.mesh'):
+                     'reconstruct.mesh', 'refine.mesh', 'decimate.mesh',
+                     'decimate.deviation', 'texture.mesh'):
             self.assertEqual(ROOT / 'mvs', c[role].parent, role)
 
 
@@ -262,7 +283,7 @@ class TestNamesAreShapeIndependent(unittest.TestCase):
         for key in ('import.sfm', 'sfm.sfm', 'robust.sfm', 'autoscale.sfm',
                     'colorize.colorized', 'convert.scene', 'densify.scene',
                     'densify.cloud', 'reconstruct.mesh', 'refine.mesh',
-                    'texture.mesh'):
+                    'decimate.mesh', 'decimate.deviation', 'texture.mesh'):
             names = {c[key] for c in SHAPES.values() if key in c}
             self.assertEqual(1, len(names), f'{key} moves with the shape')
 

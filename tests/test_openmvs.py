@@ -1,4 +1,4 @@
-"""``openmvs``: the four wrappers are the binaries' complete flag surface.
+"""``openmvs``: the wrappers are the binaries' complete flag surface.
 
 ADR 0005 promises every flag is reachable and every omission deliberate. The
 promise was never checkable, and had stopped being true -- ``mvs_refine`` exposed
@@ -18,18 +18,26 @@ toolchain, so it skips everywhere the binaries are absent and runs in CI's
 ``test:in-image`` job. ``test_openmvg`` needs no equivalent: OpenMVG is a git
 checkout, so its table is transcribed from the pinned source and is already an
 independent record.
+
+:data:`SURFACES` and :data:`BINARIES` are one row per wrapper, ours included:
+``pgs-decimate`` shares none of OpenMVS's conventions -- no ``-w``, no archive
+type, absolute paths, its own artifact spellings, its own prefix subdirectory --
+but every one of those is a *column*, so it stays a row rather than a second
+copy of each table. :data:`OPENMVS` names the four the convention sweeps iterate;
+everything else sweeps all of them, being about ADR 0005 rather than OpenMVS.
 """
 import inspect
 import re
 import subprocess
 import tempfile
 import unittest
+from collections import namedtuple
 from pathlib import Path
 from unittest import mock
 
 from pgs_recon import openmvs, toolchain
-from pgs_recon.toolchain import (MVS_BIN, ArtifactsNotColocated, ToolNotFound,
-                                resolve_exe)
+from pgs_recon.toolchain import (MVG_BIN, MVS_BIN, ArtifactsNotColocated,
+                                ToolNotFound, resolve_exe)
 
 from test_toolchain import ToolchainCase, flag, make_fake_prefix
 
@@ -74,6 +82,14 @@ SURFACES = {
         'orthographic_image_resolution', 'ignore_mask_label',
         'max_texture_size', 'archive_type', 'max_threads',
     ),
+    # Ours, so it has no generic group to take two flags out of and no hidden
+    # group to leave alone.
+    'mvs_decimate': (
+        'report', 'max_error', 'max_faces', 'quadric_error', 'prefer',
+        'preserve_boundary', 'preserve_topology', 'normal_check',
+        'optimal_placement', 'quality_threshold', 'max_rounds',
+        'samples_per_face', 'curvature_samples', 'progress',
+    ),
 }
 
 #: Flags deliberately absent from the wrappers, with the reason: these configure
@@ -81,6 +97,7 @@ SURFACES = {
 #: options" group is excluded wholesale, as upstream excludes it from ``--help``.
 NOT_MIRRORED = {
     'help': 'not a run parameter',
+    'self_test': 'runs instead of a reconstruction, against a generated mesh',
     'config_file': 'would let a config file contradict the recorded argv',
     'process_priority': 'a property of the host, not the reconstruction',
     'verbosity': 'the run log is ours to control, not a stage argument',
@@ -93,15 +110,43 @@ ARTIFACTS = {
     'mvs_reconstruct': ('scene', 'output'),
     'mvs_refine': ('scene', 'mesh', 'output'),
     'mvs_texture': ('scene', 'mesh', 'output'),
+    'mvs_decimate': ('mesh', 'output'),
 }
 
-#: Which binary each wrapper resolves, for the fake prefix.
-BINARIES = {
-    'mvs_densify': 'DensifyPointCloud',
-    'mvs_reconstruct': 'ReconstructMesh',
-    'mvs_refine': 'RefineMesh',
-    'mvs_texture': 'TextureMesh',
+#: Wrapper argument -> the binary's own long flag, for the few that are not a
+#: mechanical underscore-to-dash of the keyword. Only
+#: :class:`TestSurfaceMatchesTheInstalledBinaries` needs these: everything else
+#: in this file compares keyword names, which is exactly the gap that class
+#: closes.
+MVS_LONG_FLAGS = {
+    'scene': 'input-file',
+    'mesh': 'mesh-file',
+    'output': 'output-file',
+    'point_cloud': 'pointcloud-file',
 }
+
+#: What each wrapper resolves: the binary, the prefix subdirectory it lives in,
+#: and its artifact spellings. Ours differs in every column -- it lives in
+#: ``bin/`` beside OpenMVG's and ``pgs-global-scaler``, and spells its two
+#: artifacts its own way -- which is why those are columns and not a fork.
+Binary = namedtuple('Binary', ('name', 'subdir', 'long_flags'))
+BINARIES = {
+    'mvs_densify': Binary('DensifyPointCloud', MVS_BIN, MVS_LONG_FLAGS),
+    'mvs_reconstruct': Binary('ReconstructMesh', MVS_BIN, MVS_LONG_FLAGS),
+    'mvs_refine': Binary('RefineMesh', MVS_BIN, MVS_LONG_FLAGS),
+    'mvs_texture': Binary('TextureMesh', MVS_BIN, MVS_LONG_FLAGS),
+    'mvs_decimate': Binary('pgs-decimate', MVG_BIN,
+                           {'mesh': 'input-mesh', 'output': 'output-mesh'}),
+}
+
+#: The four whose conventions -- ``-w``, ``--archive-type``, basename artifacts
+#: -- are OpenMVS's, for the sweeps that are about those rather than ADR 0005.
+OPENMVS = tuple(w for w, b in BINARIES.items() if b.subdir == MVS_BIN)
+
+
+def _named_under(subdir: str) -> list:
+    """The binaries the fake prefix must stand in for under ``subdir``."""
+    return [b.name for b in BINARIES.values() if b.subdir == subdir]
 
 #: A value to pass for each flag whose argv spelling is not just ``str(value)``,
 #: with what argv should then hold. A ``bool`` becomes ``0``/``1``, because
@@ -109,6 +154,15 @@ BINARIES = {
 #: ``free_space_support`` is the older spelling of the same idea and emits ``1``
 #: only when true.
 PROBES = {
+    # pgs-decimate declares its switches as ``value<bool>`` too, so that every
+    # one of them is negatable from a config file rather than only settable.
+    'prefer': ('faces', 'faces'),
+    'preserve_boundary': (False, '0'),
+    'preserve_topology': (False, '0'),
+    'normal_check': (False, '0'),
+    'optimal_placement': (False, '0'),
+    'curvature_samples': (False, '0'),
+    'progress': (True, '1'),
     'crop_to_roi': (True, '1'),
     'remove_dmaps': (False, '0'),
     'remove_spikes': (False, '0'),
@@ -125,7 +179,7 @@ SHORT_FLAGS = {'point_cloud': '-p', 'mask_path': '-m'}
 
 #: Path-valued flags, probed with a real path so ``resolve()`` has something to
 #: work on rather than an integer.
-PATH_FLAGS = ('view_neighbors_file', 'output_view_neighbors_file')
+PATH_FLAGS = ('view_neighbors_file', 'output_view_neighbors_file', 'report')
 
 #: Flags every invocation carries, per wrapper, and so the ones a
 #: "``None`` omits it" sweep cannot assert against. ``archive_type`` is ADR
@@ -137,18 +191,9 @@ ALWAYS_EMITTED = {
     'mvs_reconstruct': ('archive_type', 'smooth'),
     'mvs_refine': ('archive_type', 'scales'),
     'mvs_texture': ('archive_type', 'max_texture_size', 'export_type'),
-}
-
-#: Wrapper argument -> the binary's own long flag, for the few that are not a
-#: mechanical underscore-to-dash of the keyword. Only
-#: :class:`TestSurfaceMatchesTheInstalledBinaries` needs these: everything else
-#: in this file compares keyword names, which is exactly the gap that class
-#: closes.
-LONG_FLAGS = {
-    'scene': 'input-file',
-    'mesh': 'mesh-file',
-    'output': 'output-file',
-    'point_cloud': 'pointcloud-file',
+    # Nothing: pgs-decimate takes no flag the pipeline must impose, so every one
+    # of them is omittable and the binary's own defaults govern.
+    'mvs_decimate': (),
 }
 
 #: Flags the wrapper supplies with no parameter of its own, and why. ``-w`` is
@@ -164,15 +209,16 @@ DERIVED = {'working-folder': 'derived from the artifacts by toolchain.work_dir'}
 HELP_FLAG = re.compile(r'^ {2}(?:-\S+ \[ )?--([a-z][a-z0-9-]*)')
 
 
-def advertised_flags(binary: str) -> set:
+def advertised_flags(binary: str, subdir: str = MVS_BIN) -> set:
     """Every long flag ``binary --help`` prints, across all of its groups.
 
     The generated help rather than a transcription, which is the whole point of
     the class that uses it. OpenMVS prints its banner and its options to stdout
     together; the parse keys on the declaration column, so the banner lines fall
-    out on their own.
+    out on their own. ``pgs-decimate`` is Boost.ProgramOptions too, so the same
+    parse reads it.
     """
-    exe = resolve_exe(binary, MVS_BIN)
+    exe = resolve_exe(binary, subdir)
     with tempfile.TemporaryDirectory() as quiet:
         # Its own directory: these binaries write a log beside their cwd.
         out = subprocess.run([str(exe), '--help'], cwd=quiet,
@@ -198,7 +244,9 @@ class OpenMVSCase(ToolchainCase):
     def setUp(self):
         super().setUp()
         toolchain.configure(
-            prefix=make_fake_prefix(self.tmp / 'prefix', mvs=BINARIES.values()))
+            prefix=make_fake_prefix(self.tmp / 'prefix',
+                                    mvg=_named_under(MVG_BIN),
+                                    mvs=_named_under(MVS_BIN)))
         # Co-located, because that is what every one of these binaries requires
         # of the artifacts it names by basename.
         self.work = self.tmp / 'mvs'
@@ -335,7 +383,7 @@ class TestArtifactsStayBasenames(OpenMVSCase):
     holding the scene, being the frame its image paths were written against."""
 
     def test_scene_and_output_are_basenames(self):
-        for name in SURFACES:
+        for name in OPENMVS:
             with self.subTest(wrapper=name):
                 argv = self.call(name)
                 self.assertEqual('scene.ply', flag(argv, '-i'))
@@ -362,7 +410,7 @@ class TestArchiveTypeSurvivedTheRewrite(OpenMVSCase):
     """ADR 0003's flag is still always emitted, on all four stages."""
 
     def test_archive_type_is_always_minus_one(self):
-        for name in SURFACES:
+        for name in OPENMVS:
             with self.subTest(wrapper=name):
                 self.assertEqual('-1', flag(self.call(name), '--archive-type'))
 
@@ -375,15 +423,63 @@ class TestResolvedBinaries(OpenMVSCase):
     """argv[0] is the absolute path to the right binary under MVS_BIN."""
 
     def test_each_wrapper_runs_its_own_binary(self):
-        for name, binary in BINARIES.items():
+        for name in OPENMVS:
             with self.subTest(wrapper=name):
                 argv = self.call(name)
-                self.assertEqual(binary, Path(argv[0]).name)
+                self.assertEqual(BINARIES[name].name, Path(argv[0]).name)
                 self.assertIn(MVS_BIN, argv[0])
 
 
+class TestDecimateIsOursNotOpenMVS(OpenMVSCase):
+    """``pgs-decimate`` shares the module but none of OpenMVS's conventions.
+
+    It is in this module because a wrapper sits beside the stage it serves, the
+    way ``mvg_autoscale`` wraps ``pgs-global-scaler`` in ``openmvg``. What it
+    does *not* share is where the binary lives, how paths are spelled, and the
+    archive type -- so those are asserted here rather than swept over with the
+    OpenMVS four.
+    """
+
+    def test_it_resolves_from_the_shared_bin_directory(self):
+        argv = self.call('mvs_decimate')
+        self.assertEqual('pgs-decimate', Path(argv[0]).name)
+        self.assertEqual(str(self.tmp / 'prefix' / MVG_BIN / 'pgs-decimate'),
+                         argv[0])
+
+    def test_its_paths_are_absolute_rather_than_basenames(self):
+        """No ``-w``: the binary resolves what it is given, so a basename would
+        be resolved against the caller's cwd rather than against the mesh."""
+        argv = self.call('mvs_decimate', report=self.work / 'report.json')
+        self.assertEqual(str(self.work / 'mesh.ply'), flag(argv, '-i'))
+        self.assertEqual(str(self.work / 'output.ply'), flag(argv, '-o'))
+        self.assertEqual(str(self.work / 'report.json'), flag(argv, '--report'))
+        self.assertNotIn('-w', argv)
+        self.assertNotIn('--archive-type', argv)
+
+    def test_a_mesh_from_elsewhere_is_allowed(self):
+        """``work_dir`` does not apply, and must not: coarsening a finished
+        run's deliverable into a directory of one's own is the standalone use
+        the tool exists for."""
+        elsewhere = self.tmp / 'elsewhere'
+        with mock.patch('pgs_recon.toolchain.run_command') as ran:
+            openmvs.mvs_decimate(self.work / 'in.ply',
+                                 output=elsewhere / 'out.ply',
+                                 max_faces=1000)
+        argv = [str(a) for a in ran.call_args[0][0]]
+        self.assertEqual(str(elsewhere / 'out.ply'), flag(argv, '-o'))
+        self.assertIsNone(ran.call_args.kwargs.get('cwd'))
+
+    def test_a_budget_of_zero_still_reaches_argv(self):
+        """The pipeline gates the stage on truthiness, but the wrapper is not
+        the pipeline: ``0`` is a value the binary accepts and ``None`` is the
+        only thing that omits a flag (ADR 0005)."""
+        argv = self.call('mvs_decimate', max_error=0, max_faces=0)
+        self.assertEqual('0', flag(argv, '--max-error'))
+        self.assertEqual('0', flag(argv, '--max-faces'))
+
+
 class TestSurfaceMatchesTheInstalledBinaries(unittest.TestCase):
-    """:data:`SURFACES` checked against the binaries instead of against itself.
+    """The tables checked against the binaries instead of against themselves.
 
     Every other class here compares a wrapper's signature to a list of keyword
     names, and the flag is derived from the keyword mechanically -- so the
@@ -395,6 +491,10 @@ class TestSurfaceMatchesTheInstalledBinaries(unittest.TestCase):
     source tree to read -- the binaries' own generated help is the only authority
     available, and it is a better one than a transcription anyway.
 
+    ``pgs-decimate`` is ours and could in principle be transcribed instead, but
+    it is the same argument as ``mvg_autoscale``'s: owning both sides of a flag
+    surface is not what keeps the two in step, tabulating it is.
+
     So this needs the real toolchain, and skips wherever it is absent. That is
     what ``test:in-image`` is for: it is the one CI job where these binaries
     exist, and the only place this class actually runs.
@@ -405,32 +505,57 @@ class TestSurfaceMatchesTheInstalledBinaries(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Parse each binary's help once, or skip the class as a whole.
+        """Parse each binary's help once, skipping the ones not installed.
 
-        Skipping here rather than per assertion keeps the absence of a toolchain
-        one line of output instead of one per wrapper per test, and it is the
-        honest report: without the binaries there is no partial version of this
-        check to run.
+        Per binary rather than for the class as a whole, because a newly added
+        tool is absent from the published image until the next one is built --
+        ``pgs-decimate`` was, for one release -- and taking the OpenMVS checks
+        down with it would remove the coverage exactly when a new surface is at
+        its least settled. The class skips only when nothing at all is
+        installed, which is the honest report for a machine with no toolchain.
         """
         cls.advertised = {}
+        cls.missing = {}
         for wrapper, binary in BINARIES.items():
-            try:
-                cls.advertised[wrapper] = advertised_flags(binary)
-            except ToolNotFound as absent:
-                raise unittest.SkipTest(
-                    f'{binary} is not installed under this prefix, so there is '
-                    f'nothing to compare against: {absent}')
+            cls._parse(wrapper, binary.name, binary.subdir)
+        if not cls.advertised:
+            raise unittest.SkipTest(
+                f'no binary of this module is installed under this prefix, so '
+                f'there is nothing to compare against: '
+                f'{next(iter(cls.missing.values()))}')
+
+    @classmethod
+    def _parse(cls, wrapper: str, binary: str, subdir: str) -> None:
+        try:
+            cls.advertised[wrapper] = advertised_flags(binary, subdir)
+        except ToolNotFound as absent:
+            cls.missing[wrapper] = absent
+
+    def advertised_by(self, wrapper: str) -> set:
+        """What ``wrapper``'s binary advertises, or skip if it is not here."""
+        if wrapper not in self.advertised:
+            self.skipTest(f'not installed: {self.missing[wrapper]}')
+        return self.advertised[wrapper]
 
     @staticmethod
-    def spelled(kwargs) -> set:
-        """Wrapper keyword names as the long flags they reach argv as."""
-        return {LONG_FLAGS.get(k, k.replace('_', '-')) for k in kwargs}
+    def spelled(kwargs, wrapper: str) -> set:
+        """Wrapper keyword names as the long flags they reach argv as.
+
+        Keyed by wrapper because the two artifact names are the one place ours
+        and OpenMVS's disagree: ``-i``/``-o`` are ``input-file``/``output-file``
+        to OpenMVS and ``input-mesh``/``output-mesh`` to ``pgs-decimate``. The
+        wrapper is required rather than defaulted, so that a caller that has one
+        cannot silently get another binary's spellings.
+        """
+        names = BINARIES[wrapper].long_flags
+        return {names.get(k, k.replace('_', '-')) for k in kwargs}
 
     def offered(self, wrapper: str) -> set:
         """The flags the wrapper actually passes: its options and its
         artifacts. ``NOT_MIRRORED`` is not here -- those are the ones it
         deliberately never passes."""
-        return self.spelled(set(SURFACES[wrapper]) | set(ARTIFACTS[wrapper]))
+        return self.spelled(set(SURFACES[wrapper]) | set(ARTIFACTS[wrapper]),
+                            wrapper)
 
     def test_no_flag_the_binary_advertises_is_unaccounted_for(self):
         """The half a transcription cannot check: upstream adding an option.
@@ -441,14 +566,15 @@ class TestSurfaceMatchesTheInstalledBinaries(unittest.TestCase):
         """
         for wrapper in SURFACES:
             with self.subTest(wrapper=wrapper):
-                accounted = (self.offered(wrapper) | self.spelled(NOT_MIRRORED)
+                accounted = (self.offered(wrapper)
+                             | self.spelled(NOT_MIRRORED, wrapper)
                              | set(DERIVED))
-                unreachable = sorted(self.advertised[wrapper] - accounted)
+                unreachable = sorted(self.advertised_by(wrapper) - accounted)
                 self.assertEqual(
                     [], unreachable,
-                    f'{BINARIES[wrapper]} advertises flags {wrapper} cannot '
-                    f'reach; add them to the wrapper and to SURFACES, or name '
-                    f'them in NOT_MIRRORED')
+                    f'{BINARIES[wrapper].name} advertises flags {wrapper} cannot '
+                    f'reach; add them to the wrapper and to its surface table, '
+                    f'or name them in NOT_MIRRORED')
 
     def test_no_flag_the_wrapper_offers_has_gone_away(self):
         """And the other half: upstream removing or renaming one, which reaches
@@ -461,10 +587,10 @@ class TestSurfaceMatchesTheInstalledBinaries(unittest.TestCase):
         for wrapper in SURFACES:
             with self.subTest(wrapper=wrapper):
                 gone = sorted(self.offered(wrapper)
-                              - self.advertised[wrapper])
+                              - self.advertised_by(wrapper))
                 self.assertEqual(
                     [], gone,
-                    f'{wrapper} passes flags {BINARIES[wrapper]} no longer '
+                    f'{wrapper} passes flags {BINARIES[wrapper].name} no longer '
                     f'advertises')
 
 

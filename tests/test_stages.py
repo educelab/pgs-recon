@@ -20,8 +20,9 @@ from pathlib import Path
 
 from pgs_recon import layout
 from pgs_recon.stages import (STAGE_ARGS, STAGE_IO, STAGES, StageError,
-                              StageTracker, drifted_stages, pipeline_shape,
-                              resolve_range, revert_out_of_range)
+                              StageTracker, clear_zeroed_budgets,
+                              drifted_stages, pipeline_shape, resolve_range,
+                              revert_out_of_range, validate_budgets)
 
 ROOT = Path('/recon')
 
@@ -43,8 +44,9 @@ DEFAULTS = dict(
     # mvs
     mvs_densify=False, densify_resolution_level=None, mask_value=0,
     free_space_support=False, mvs_smooth=2,
-    mvs_refine=True, decimation_factor=None, refine_resolution_level=None,
+    mvs_refine=True, refine_decimate=None, refine_resolution_level=None,
     refine_min_resolution=None, refine_scales=3, refine_scale_step=None,
+    decimate_max_error=None, decimate_max_faces=None, decimate_prefer='error',
     name='obj', file_type='obj', texture_resolution_level=None,
     texture_max_size=0,
     # flow control
@@ -132,6 +134,11 @@ def build_records(args, shape=None, status='complete') -> dict:
         refined = layout.refine_mesh(ROOT)
         rec('refine', {'scene': scene, 'mesh': mesh}, {'mesh': refined})
         mesh = refined
+    if 'decimate' in shape:
+        coarse = layout.decimate_mesh(ROOT)
+        rec('decimate', {'mesh': mesh},
+            {'mesh': coarse, 'deviation': layout.decimate_report(ROOT)})
+        mesh = coarse
     rec('texture', {'scene': scene, 'mesh': mesh},
         {'mesh': layout.final_mesh(ROOT, args.name, args.file_type)})
     return {s: records[s] for s in shape}
@@ -236,6 +243,19 @@ class TestTables(unittest.TestCase):
         # direct engine's unfiltered matches are optional.
         self.assertIn('matches_filtered', STAGE_IO['sfm'].needs)
         self.assertIn('matches', STAGE_IO['sfm'].may)
+
+    def test_decimate_consumes_only_the_mesh(self):
+        # It never reads the scene: the deviation budget is about the mesh
+        # alone, so a decimate job needs neither images nor an MVS scene.
+        self.assertEqual(('mesh',), STAGE_IO['decimate'].needs)
+        self.assertIn('mesh', STAGE_IO['decimate'].makes)
+        self.assertIn('deviation', STAGE_IO['decimate'].makes)
+
+    def test_the_deviation_report_is_a_leaf(self):
+        # Nothing may consume it: a later stage reading it is a new edge and a
+        # new dirtiness path, not a free addition (ADR 0008).
+        for stage, io in STAGE_IO.items():
+            self.assertNotIn('deviation', io.needs + io.may, stage)
 
     def test_pass_through_roles_are_not_declared_as_produced(self):
         # mvs_reconstruct/mvs_refine return their input scene unchanged;
@@ -453,7 +473,7 @@ class TestShapeChanges(unittest.TestCase):
         # Finding #1. The dense run's reconstruct recorded densify.mvs; without
         # densify the live binding is convert's own scene, so the mesh stages
         # must re-run against the sparse cloud even though nothing is
-        # incomplete. (Pre-fix: all thirteen stages skipped.)
+        # incomplete. (Pre-fix: every stage skipped.)
         dense = make_args(mvs_densify=True)
         records = build_records(dense)
         self.assertEqual('mvs/densify.mvs',
@@ -499,6 +519,118 @@ class TestShapeChanges(unittest.TestCase):
         self.assertEqual(['colorize'], runs(tracker))
         for stage in ('convert', 'reconstruct', 'refine', 'texture'):
             self.assertEqual('skip', tracker.status_of(stage))
+
+    def test_a_budget_puts_decimate_in_the_shape(self):
+        # The target is the enable flag: there is no --mvs-decimate, so "enabled
+        # with no target" is unrepresentable (ADR 0008 s6).
+        plain = make_args()
+        self.assertNotIn('decimate', pipeline_shape(plain))
+        by_error = make_args(decimate_max_error=0.2)
+        self.assertIn('decimate', pipeline_shape(by_error))
+        by_faces = make_args(decimate_max_faces=2000000)
+        self.assertIn('decimate', pipeline_shape(by_faces))
+
+    def test_decimate_sits_between_refine_and_texture(self):
+        shape = pipeline_shape(make_args(decimate_max_error=0.2))
+        self.assertEqual(('reconstruct', 'refine', 'decimate', 'texture'),
+                         shape[-4:])
+
+    def test_a_zero_budget_leaves_decimate_out(self):
+        # The documented way to turn the stage off on a resume: apply_stored
+        # folds the recorded budget back in, so omitting the flag would not.
+        for off in (make_args(decimate_max_error=0),
+                    make_args(decimate_max_faces=0)):
+            with self.subTest(off=off):
+                self.assertNotIn('decimate', pipeline_shape(off))
+
+    def test_a_zero_budget_clears_the_budget_beside_it(self):
+        # The disable path has to turn the *stage* off, not one target: a run
+        # recorded with both budgets has the face one folded back in by
+        # apply_stored, and would keep decimating to it (ADR 0008 s6).
+        args = make_args(decimate_max_error=0, decimate_max_faces=2000000)
+        logger, handler = capturing_logger()
+        clear_zeroed_budgets(args, {'decimate_max_error'}, logger)
+        self.assertIsNone(args.decimate_max_faces)
+        self.assertNotIn('decimate', pipeline_shape(args))
+        self.assertIn('--decimate-max-faces', handler.text())
+
+    def test_a_zero_beside_an_explicit_budget_is_a_target_change(self):
+        # Naming both on one command line says "not this bound, that one".
+        args = make_args(decimate_max_error=0, decimate_max_faces=2000000)
+        logger, handler = capturing_logger()
+        clear_zeroed_budgets(args, {'decimate_max_error', 'decimate_max_faces'},
+                             logger)
+        self.assertEqual(2000000, args.decimate_max_faces)
+        self.assertIn('decimate', pipeline_shape(args))
+        self.assertEqual('', handler.text())
+
+    def test_an_inherited_zero_clears_nothing(self):
+        # Only a zero the caller typed is a disable; one folded in from the
+        # manifest is just the state the stage was already left in.
+        args = make_args(decimate_max_error=0, decimate_max_faces=2000000)
+        logger, _ = capturing_logger()
+        clear_zeroed_budgets(args, set(), logger)
+        self.assertEqual(2000000, args.decimate_max_faces)
+
+    def test_a_negative_budget_is_refused(self):
+        # pgs-decimate reads a non-positive target as "not given", so -1 would
+        # either fail the run after refine or silently drop the bound.
+        for off in (make_args(decimate_max_error=-1.0),
+                    make_args(decimate_max_faces=-1)):
+            with self.subTest(off=off):
+                with self.assertRaises(StageError) as ctx:
+                    validate_budgets(off)
+                self.assertIn('negative', str(ctx.exception))
+
+    def test_zero_and_none_budgets_are_not_negative(self):
+        for ok in (make_args(), make_args(decimate_max_error=0),
+                   make_args(decimate_max_faces=0),
+                   make_args(decimate_max_error=0.2)):
+            with self.subTest(ok=ok):
+                validate_budgets(ok)
+
+    def test_dropping_decimate_reruns_texture_and_nothing_earlier(self):
+        # Recovering from a bad budget costs one stage, not a pipeline: only
+        # texture's recorded mesh stops matching its binding.
+        coarse = make_args(decimate_max_error=0.2)
+        records = build_records(coarse)
+        self.assertEqual('mvs/decimate_mesh.ply',
+                         records['texture']['inputs']['mesh'])
+        args = make_args(decimate_max_error=0)
+        tracker = make_tracker(args, records, explicit={'decimate_max_error'})
+        self.assertEqual(['texture'], runs(tracker))
+        self.assertEqual('inputs changed: mesh', tracker.dirty['texture'])
+        self.assertEqual('off', tracker.status_of('decimate'))
+        self.assertEqual('skip', tracker.status_of('refine'))
+        self.assertEqual([], tracker.prereq_errors())
+
+    def test_adding_decimate_reruns_it_and_texture_only(self):
+        args = make_args(decimate_max_error=0.2)
+        records = build_records(make_args())
+        tracker = make_tracker(args, records, explicit={'decimate_max_error'})
+        self.assertEqual(['decimate', 'texture'], runs(tracker))
+        self.assertEqual('never run', tracker.dirty['decimate'])
+        self.assertEqual('skip', tracker.status_of('refine'))
+
+    def test_changing_the_budget_reruns_decimate_and_texture(self):
+        # An override of a --decimate-* flag is honoured rather than
+        # warn-and-ignored, which is what the argument-ownership map buys.
+        args = make_args(decimate_max_error=0.2)
+        records = build_records(args)
+        args.decimate_max_error = 0.1
+        tracker = make_tracker(args, records,
+                               explicit={'decimate_max_error'})
+        self.assertEqual(['decimate', 'texture'], runs(tracker))
+        self.assertIn('--decimate-max-error', tracker.dirty['decimate'])
+
+    def test_decimate_survives_refine_being_dropped(self):
+        # It consumes whatever owns `mesh`, which without refine is reconstruct.
+        args = make_args(mvs_refine=False, decimate_max_error=0.2)
+        records = build_records(args)
+        self.assertEqual('mvs/reconstruct_mesh.ply',
+                         records['decimate']['inputs']['mesh'])
+        tracker = make_tracker(args, records)
+        self.assertEqual([], runs(tracker))
 
     def test_disabling_refine_rebuilds_texture(self):
         args = make_args(mvs_refine=False)

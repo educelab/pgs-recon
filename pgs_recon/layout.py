@@ -230,6 +230,27 @@ def refine_mesh(output: Path) -> Path:
     return mvs_dir(output) / 'refine_mesh.ply'
 
 
+def decimate_mesh(output: Path) -> Path:
+    """The coarsened mesh, within its measured deviation budget.
+
+    Written on every run, pass-through included: recording no output would
+    leave ``mesh`` bound to whatever produced it, making a declared graph's
+    edges data-dependent (`ADR 0008
+    <../docs/adr/0008-error-bounded-decimation.md>`_).
+    """
+    return mvs_dir(output) / 'decimate_mesh.ply'
+
+
+def decimate_report(output: Path) -> Path:
+    """What the decimation cost: faces in and out, the measured deviation in
+    both directions, what was cleaned, and which bound stopped it.
+
+    A leaf, like :func:`colorize_sfm`: nothing downstream consumes it. Named
+    ``<stage>_<role>`` as everything else is, the role being ``deviation``.
+    """
+    return mvs_dir(output) / 'decimate_report.json'
+
+
 def final_mesh(output: Path, name: str, file_type: str) -> Path:
     """The deliverable: the textured mesh.
 

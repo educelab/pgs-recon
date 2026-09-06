@@ -16,13 +16,14 @@ from pgs_recon.openmvg import (compute_features, compute_matches,
                                geometric_filter, init_sfm_generic,
                                mvg_colorize_sfm, mvg_compute_known, mvg_sfm,
                                mvg_autoscale, mvg_to_mvs)
-from pgs_recon.openmvs import (mvs_densify, mvs_reconstruct, mvs_refine,
-                               mvs_texture)
+from pgs_recon.openmvs import (mvs_decimate, mvs_densify, mvs_reconstruct,
+                               mvs_refine, mvs_texture)
 from pgs_recon.pgs_data import init_sfm_pgs, get_tag_option
 from pgs_recon.stages import (CONTROL_ARGS, NO_PERSIST, STAGES, StageError,
-                              StageTracker, apply_stored, drifted_stages,
+                              StageTracker, apply_stored,
+                              clear_zeroed_budgets, drifted_stages,
                               explicit_dests, find_manifest, load_manifest,
-                              pipeline_shape, resolve_range,
+                              pipeline_shape, resolve_range, validate_budgets,
                               revert_out_of_range, utc_now, validate_arg_map,
                               write_manifest)
 from pgs_recon.toolchain import Recorder
@@ -336,10 +337,14 @@ def build_parser() -> configargparse.ArgumentParser:
     opts_mvs.add_argument('--texture-resolution-level', default=None, type=int,
                           help='how many times to scale down images before '
                                'TextureMesh')
-    opts_mvs.add_argument('--decimation-factor', type=float,
+    # Renamed in 2.0: --decimation-factor sat one flag away from the decimate
+    # stage's budgets and meant something else entirely.
+    opts_mvs.add_argument('--refine-decimate', type=float,
                           help='Decimation factor in range [0..1] to be '
                                'applied to the input surface before mesh '
-                               'refinement (0 - auto, 1 - disabled)')
+                               'refinement (0 - auto, 1 - disabled). This is '
+                               'RefineMesh\'s own face-fraction decimation, '
+                               'not the decimate stage\'s deviation budget.')
     opts_mvs.add_argument('--mask-value', type=int, default=0,
                           help='Label value in the image mask to ignore during '
                                'mesh densification. Set to a value < 0 to '
@@ -348,6 +353,45 @@ def build_parser() -> configargparse.ArgumentParser:
                           help='Limits the maximum size (edge length) of the'
                                'output texture image. If set to 0 (default), '
                                'the edge length is unbounded.')
+
+    opts_decimate = parser.add_argument_group(
+        'decimate options',
+        'Merge triangles to make the mesh smaller before it is textured, '
+        'stopping while it is still within a distance you state of the mesh it '
+        'started from. That distance is measured on each candidate rather than '
+        'estimated, so the result is never further off than you allowed -- and '
+        'a JSON report beside the mesh records what the coarsening cost. '
+        'Stating a budget is what turns the stage on; there is no separate '
+        'enable flag.')
+    opts_decimate.add_argument('--decimate-max-error', type=float, default=None,
+                               metavar='UNITS',
+                               help='Deviation budget: the largest distance any '
+                                    'point of either surface may end up from '
+                                    'the other. In the solved scene\'s units, '
+                                    'which are physical only when '
+                                    '--mvg-autoscale ran -- otherwise they are '
+                                    'arbitrary and --decimate-max-faces is the '
+                                    'flag you want. Giving this turns the '
+                                    'decimate stage on; giving 0 turns it off '
+                                    'again, which is the only way to, because '
+                                    'a resumed run inherits the budget the '
+                                    'manifest recorded when the flag is simply '
+                                    'omitted. A 0 also drops an inherited '
+                                    '--decimate-max-faces, unless you pass '
+                                    'that one too.')
+    opts_decimate.add_argument('--decimate-max-faces', type=int, default=None,
+                               metavar='n',
+                               help='Face budget, for a scan that was never '
+                                    'scaled to physical units. Turns the stage '
+                                    'on and off exactly as above.')
+    opts_decimate.add_argument('--decimate-prefer', choices=['error', 'faces'],
+                               default='error', type=str.lower,
+                               help='Which budget wins when the two disagree. '
+                                    'The default protects the deviation '
+                                    'budget, so the failure mode is a mesh '
+                                    'larger than you asked for rather than one '
+                                    'that lost a feature (default: '
+                                    '%(default)s)')
 
     opts_stage = parser.add_argument_group(
         'staged run options',
@@ -434,16 +478,34 @@ def _main():
                        'does nothing, as the MVS stages run unless you stop '
                        'the range before them (e.g. --to colorize).')
 
+    # Before the shape is read off them: a negative budget is a mistake no layer
+    # below can act on, and it should cost an exit rather than a reconstruction.
+    validate_budgets(args)
+
     # Enable flags declare the pipeline shape; --from/--to select a window of it
     shape = pipeline_shape(args)
     from_stage, to_stage = resolve_range(args, shape)
     revert_out_of_range(args, stored, explicit, from_stage, to_stage, logger)
+    # An explicit zero clears the budget it was given beside as well as itself,
+    # or the stage it is documented to turn off survives on the other one (ADR
+    # 0008 s6). After the revert, so a zero the range did not authorize is back
+    # to its recorded value before it can drop anything.
+    clear_zeroed_budgets(args, explicit, logger)
     # Reverting an out-of-range override can change the shape back
     shape = pipeline_shape(args)
     from_stage, to_stage = resolve_range(args, shape)
 
     if args.mask_value is not None and args.mask_value < 0:
         args.mask_value = None
+
+    # A world-unit budget against an unscaled solve means nothing physical, and
+    # the binary cannot tell -- it only ever sees a mesh.
+    if args.decimate_max_error and 'autoscale' not in shape:
+        logger.warning(
+            f'--decimate-max-error={args.decimate_max_error} is in the solved '
+            f'scene\'s units, and this reconstruction has no autoscale stage, '
+            f'so those units are arbitrary. Add --mvg-autoscale to work in '
+            f'physical units, or use --decimate-max-faces instead.')
 
     # Only the PGS importer reads capture indices. Warn rather than fail, so a
     # shared config carrying PGS settings still drives a generic run.
@@ -767,7 +829,7 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
         mesh_in = tracker.require('mesh')
         refined = layout.refine_mesh(output)
         mvs_refine(scene_in, mesh=mesh_in, output=refined,
-                   decimate=args.decimation_factor,
+                   decimate=args.refine_decimate,
                    resolution_level=args.refine_resolution_level,
                    min_resolution=args.refine_min_resolution,
                    scales=args.refine_scales,
@@ -776,6 +838,21 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
                    max_face_area=args.refine_max_face_area)
         tracker.end('refine', inputs={'scene': scene_in, 'mesh': mesh_in},
                     outputs={'mesh': refined})
+
+    # Between refine and texture, so the deliverable is textured once, at its
+    # final resolution. Always records a mesh, even when nothing was collapsed:
+    # a stage that sometimes produces nothing makes the graph data-dependent.
+    if tracker.begin('decimate'):
+        logger.info('Decimating mesh')
+        mesh_in = tracker.require('mesh')
+        decimated = layout.decimate_mesh(output)
+        report = layout.decimate_report(output)
+        mvs_decimate(mesh_in, output=decimated, report=report,
+                     max_error=args.decimate_max_error,
+                     max_faces=args.decimate_max_faces,
+                     prefer=args.decimate_prefer)
+        tracker.end('decimate', inputs={'mesh': mesh_in},
+                    outputs={'mesh': decimated, 'deviation': report})
 
     if tracker.begin('texture'):
         logger.info('Texturing mesh')

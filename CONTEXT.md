@@ -123,8 +123,32 @@ A camera that imaged the object but was NOT part of the rig reconstruction
 **localized** before its images can texture the mesh. Contrast a **modality**,
 which reuses an existing rig camera's solved poses. _Avoid_: external camera, witness camera
 
+**Decimation**:
+Reducing a mesh's face count by edge collapse, *ours*: the `decimate` stage and
+`pgs-decimate`, which coarsen a mesh as far as a stated **deviation budget**
+allows. Error-bounded, not count-bounded, which is what distinguishes it from
+the three incidental decimations OpenMVS performs on its own
+(`ReconstructMesh --decimate`/`--target-face-num`, `RefineMesh --decimate`, whose
+CGAL edge collapse this exists as an alternative to, and
+`TextureMesh --decimate`) — all of which take a face fraction or a face count and
+state no geometric bound. Say which one is meant; unqualified, "decimation" is
+ours ([ADR 0008](./docs/adr/0008-error-bounded-decimation.md)).
+_Avoid_: simplification, reduction, coarsening, LOD
+
+**Deviation budget**:
+The geometric error a **decimation** guarantees: the largest distance, in
+solved-frame units, that any point of either surface may lie from the other. It
+is *measured* on the result — a symmetric sampled Hausdorff max, biased toward
+high curvature, recorded in `mvs/decimate_report.json` — rather than predicted,
+which is why the stage searches instead of simply setting a threshold: vcglib's
+quadric error is unitless and under-reports deviation exactly where curvature is
+high. Distinct from that **quadric error**, the library's internal collapse cost,
+which is exposed only as an escape hatch. In physical units only when
+**autoscale** ran.
+_Avoid_: error threshold, tolerance, epsilon, quadric error
+
 **Stage**:
-One of the thirteen steps of a reconstruction, each exactly one binary
+One of the fourteen steps of a reconstruction, each exactly one binary
 invocation, named for what it does rather than for the binary (`densify`,
 `refine`, `texture`). A stage is the unit a run can start and stop at, and the
 unit whose completion is recorded.
@@ -142,7 +166,7 @@ _Avoid_: pipeline, stage list, workflow
 **Role**:
 A semantic artifact slot a stage consumes or produces — `sfm`, `features`,
 `matches`, `matches_filtered`, `view_pairs`, `colorized`, `scene`, `cloud`,
-`mesh`. Roles are how a resumed job finds its inputs, and they are *rebound* as a
+`mesh`, `deviation`. Roles are how a resumed job finds its inputs, and they are *rebound* as a
 run proceeds, so a role names the slot and never the file in it. Declared per
 stage in `stages.STAGE_IO`. Distinct from the **artifact name**, which also
 records which stage produced it.

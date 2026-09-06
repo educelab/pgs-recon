@@ -1,9 +1,14 @@
-"""One function per OpenMVS binary.
+"""One function per binary of the MVS half of the pipeline.
 
 Same contract as :mod:`pgs_recon.openmvg`: one Python call, one binary
 invocation, no ``prefix`` or ``metadata`` parameters, no naming (`ADR 0005
-<../docs/adr/0005-wrappers-mirror-the-binary.md>`_). None of these four returns a
-path -- OpenMVS never chooses a name the caller did not give it.
+<../docs/adr/0005-wrappers-mirror-the-binary.md>`_). None of these returns a
+path -- neither OpenMVS nor ``pgs-decimate`` ever chooses a name the caller did
+not give it.
+
+Four of the five wrap an OpenMVS binary; :func:`mvs_decimate` wraps our own
+``pgs-decimate``, sitting beside the stage it serves as ``mvg_autoscale`` does.
+Everything below about ``-w`` and the archive type is the OpenMVS four's.
 
 Each function mirrors its binary's **own** options group in the binary's own
 order, plus the two generic options that are about the run rather than about
@@ -42,7 +47,7 @@ absolute path verbatim and joins a relative one onto ``-w``.
 """
 from pathlib import Path
 
-from pgs_recon.toolchain import MVS_BIN, resolve_exe, run, work_dir
+from pgs_recon.toolchain import MVG_BIN, MVS_BIN, resolve_exe, run, work_dir
 
 
 def _optional(**flags) -> list:
@@ -242,6 +247,50 @@ def mvs_refine(scene: Path, mesh: Path, output: Path,
         gradient_step=gradient_step, planar_vertex_ratio=planar_vertex_ratio,
         reduce_memory=reduce_memory, export_type=export_type,
         max_threads=max_threads,
+    )
+    run(command)
+
+
+def mvs_decimate(mesh: Path, output: Path, report: Path = None,
+                 max_error: float = None, max_faces: int = None,
+                 quadric_error: float = None, prefer: str = None,
+                 preserve_boundary: bool = None,
+                 preserve_topology: bool = None, normal_check: bool = None,
+                 optimal_placement: bool = None,
+                 quality_threshold: float = None, max_rounds: int = None,
+                 samples_per_face: int = None,
+                 curvature_samples: bool = None,
+                 progress: bool = None) -> None:
+    """Coarsen a mesh as far as a measured deviation budget allows.
+
+    Ours, not OpenMVS's (`ADR 0008
+    <../docs/adr/0008-error-bounded-decimation.md>`_), and the only decimation
+    here stating a geometric bound: ``max_error`` is a distance in the solved
+    frame's units, *measured* on the result rather than predicted. The
+    ``decimate=`` parameters elsewhere in this module are face fractions.
+
+    At least one of ``max_error``, ``max_faces`` and ``quadric_error`` is
+    required; ``prefer`` decides when the first two disagree. ``quadric_error``
+    is vcglib's unitless threshold and turns the search off -- an escape hatch.
+
+    Paths go absolute and no working directory is derived. The output still
+    belongs in ``mvs/``, but that is ``run_pipeline``'s business, because
+    ``TextureMesh`` addresses its mesh by basename.
+    """
+    command = [
+        resolve_exe('pgs-decimate', MVG_BIN),
+        '-i', _absolute(mesh),
+        '-o', _absolute(output),
+    ]
+    command += _optional(
+        report=_absolute(report), max_error=max_error, max_faces=max_faces,
+        quadric_error=quadric_error, prefer=prefer,
+        preserve_boundary=preserve_boundary,
+        preserve_topology=preserve_topology, normal_check=normal_check,
+        optimal_placement=optimal_placement,
+        quality_threshold=quality_threshold, max_rounds=max_rounds,
+        samples_per_face=samples_per_face,
+        curvature_samples=curvature_samples, progress=progress,
     )
     run(command)
 
