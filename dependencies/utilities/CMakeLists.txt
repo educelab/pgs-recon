@@ -8,12 +8,19 @@ find_package(OpenCV 4.7 REQUIRED)
 find_package(Eigen3 3.3 REQUIRED)
 find_package(Boost 1.70 CONFIG REQUIRED COMPONENTS program_options)
 
+# VCG: header-only, no package config, so cmake/FindVCG.cmake finds it via -DVCG_ROOT.
+# Appended here, not at the top: find_package(OpenMVG) drops what the caller appended.
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
+find_package(VCG REQUIRED)
+
 # header-only dependencies
 include(FetchContent)
+# rc.3 for two PLY changes pgs-decimate needs: reading OpenMVS's sized type
+# aliases (educelab/libcore#24) and writing binary PLY (#25, #28).
 FetchContent_Declare(
     libcore
     GIT_REPOSITORY https://github.com/educelab/libcore.git
-    GIT_TAG v0.3.0-rc.2
+    GIT_TAG v0.3.0-rc.3
     EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(libcore)
@@ -93,6 +100,24 @@ target_link_libraries(sfm_orient
 target_compile_features(sfm_orient PUBLIC cxx_std_17)
 set_target_properties(sfm_orient PROPERTIES OUTPUT_NAME "pgs-sfm-orient")
 
+# error-bounded decimation utility
+add_executable(decimate
+        src/decimate.cpp
+        src/decimate_core.hpp
+        src/decimate_core.cpp)
+target_include_directories(decimate
+    PUBLIC
+        $<BUILD_INTERFACE:${libcore_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${indicators_SOURCE_DIR}/include>
+)
+target_link_libraries(decimate
+    Boost::program_options
+    Eigen3::Eigen
+    VCG::VCG
+)
+target_compile_features(decimate PUBLIC cxx_std_17)
+set_target_properties(decimate PROPERTIES OUTPUT_NAME "pgs-decimate")
+
 # generate aruco markers utility
 add_executable(gen_aruco_markers src/gen_aruco_markers.cpp)
 target_include_directories(gen_aruco_markers
@@ -115,4 +140,5 @@ install(TARGETS
     global_scaler
     sfm_orient
     gen_aruco_markers
+    decimate
 )

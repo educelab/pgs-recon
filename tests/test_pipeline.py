@@ -26,8 +26,11 @@ Four things are pinned that nothing pinned before:
 * **One ``-S``.** ``openMVG_main_SfM`` keeps the last it is given, so the priors
   initializer must not be emitted alongside a caller's own.
 """
+import contextlib
 import importlib.util
+import io
 import json
+import logging
 import shutil
 import sys
 import tempfile
@@ -53,7 +56,8 @@ MVG_TOOLS = ('openMVG_main_SfMInit_ImageListing', 'openMVG_main_ComputeFeatures'
              'openMVG_main_SfM', 'openMVG_main_ComputeStructureFromKnownPoses',
              'openMVG_main_ComputeSfM_DataColor', 'openMVG_main_openMVG2openMVS',
              'openMVG_main_ConvertSfM_DataFormat',
-             'openMVG_main_SfM_Localization', 'pgs-global-scaler')
+             'openMVG_main_SfM_Localization', 'pgs-global-scaler',
+             'pgs-decimate')
 MVS_TOOLS = ('DensifyPointCloud', 'ReconstructMesh', 'RefineMesh',
              'TextureMesh')
 
@@ -106,6 +110,13 @@ def fake_binary(argv, cwd=None) -> None:
         for f in ('-i', '-m', '-f'):
             _need(flag(argv, f), argv)
         _write(Path(out))
+    elif tool == 'pgs-decimate':
+        # Ours, and the one MVS-side binary that resolves absolute paths of its
+        # own rather than basenames against -w.
+        _need(flag(argv, '-i'), argv)
+        _write(Path(flag(argv, '-o')))
+        if flag(argv, '--report') is not None:
+            _write(Path(flag(argv, '--report')))
     elif tool == 'pgs-global-scaler':
         _need(flag(argv, '-i'), argv)
         _write(Path(out))
@@ -254,6 +265,143 @@ class TestFullRun(PipelineCase):
         self.assertIn('RefineMesh', str(ctx.exception))
         self.assertIn('configure(prefix=...)', str(ctx.exception))
         self.assertEqual(127, ctx.exception.exit_code)
+
+
+class TestDecimateStage(PipelineCase):
+    """The stage between refine and texture, and what enabling it is.
+
+    ADR 0008: the budget *is* the enable flag, the coarse mesh is what gets
+    textured, and the report is recorded so a finished run states the deviation
+    its deliverable is within.
+    """
+
+    def test_no_budget_means_no_decimate_binary(self):
+        out = self.tmp / 'recon'
+        self.run_recon(out)
+        self.assertNotIn('pgs-decimate', self.ran())
+        self.assertFalse((out / 'mvs' / 'decimate_mesh.ply').exists())
+
+    def test_a_budget_puts_it_between_refine_and_texture(self):
+        self.run_recon(self.tmp / 'recon', '--decimate-max-error', '0.2')
+        ran = self.ran()
+        self.assertEqual(['RefineMesh', 'pgs-decimate', 'TextureMesh'],
+                         ran[-3:])
+
+    def test_the_budget_and_its_paths_reach_argv(self):
+        out = self.tmp / 'recon'
+        self.run_recon(out, '--decimate-max-error', '0.2')
+        argv = self.argv_for('pgs-decimate')
+        self.assertEqual('0.2', flag(argv, '--max-error'))
+        self.assertEqual('error', flag(argv, '--prefer'))
+        self.assertEqual(str(out / 'mvs' / 'refine_mesh.ply'), flag(argv, '-i'))
+        self.assertEqual(str(out / 'mvs' / 'decimate_mesh.ply'),
+                         flag(argv, '-o'))
+        self.assertEqual(str(out / 'mvs' / 'decimate_report.json'),
+                         flag(argv, '--report'))
+        # No face budget was given, so the binary's own default governs.
+        self.assertIsNone(flag(argv, '--max-faces'))
+
+    def test_texture_is_handed_the_coarse_mesh(self):
+        """The deliverable is born coarse: texturing faces that are about to be
+        thrown away is the thing this ordering exists to avoid."""
+        out = self.tmp / 'recon'
+        self.run_recon(out, '--decimate-max-error', '0.2')
+        argv = self.argv_for('TextureMesh')
+        self.assertEqual('decimate_mesh.ply', flag(argv, '-m'))
+        self.assertEqual(str(out / 'mvs'), flag(argv, '-w'))
+
+    def test_the_mesh_and_the_report_are_both_recorded(self):
+        out = self.tmp / 'recon'
+        meta = self.run_recon(out, '--decimate-max-error', '0.2')
+        record = meta['stages']['decimate']
+        self.assertEqual('complete', record['status'])
+        self.assertEqual({'mesh': 'mvs/refine_mesh.ply'}, record['inputs'])
+        self.assertEqual({'mesh': 'mvs/decimate_mesh.ply',
+                          'deviation': 'mvs/decimate_report.json'},
+                         record['outputs'])
+        self.assertTrue((out / 'mvs' / 'decimate_report.json').is_file())
+
+    def test_a_face_budget_alone_enables_it(self):
+        """No autoscale, no world units -- and a face budget is still a target,
+        which is the point of having two."""
+        self.run_recon(self.tmp / 'recon', '--decimate-max-faces', '2000000')
+        argv = self.argv_for('pgs-decimate')
+        self.assertEqual('2000000', flag(argv, '--max-faces'))
+        self.assertIsNone(flag(argv, '--max-error'))
+
+    def test_it_coarsens_the_reconstructed_mesh_when_refine_is_off(self):
+        out = self.tmp / 'recon'
+        self.run_recon(out, '--no-mvs-refine', '--decimate-max-error', '0.2')
+        self.assertEqual(str(out / 'mvs' / 'reconstruct_mesh.ply'),
+                         flag(self.argv_for('pgs-decimate'), '-i'))
+
+    def test_a_zero_budget_on_a_resume_drops_the_stage_and_reruns_texture(self):
+        """The documented way back from a budget that was wrong.
+
+        Omitting the flag would inherit the recorded budget, so ``0`` is the
+        off switch -- and dropping the stage costs one re-run, not a pipeline,
+        because texture's recorded mesh stops matching its binding.
+        """
+        out = self.tmp / 'recon'
+        self.run_recon(out, '--decimate-max-error', '0.2')
+        self.commands.clear()
+        meta = self.run_recon(out, '--decimate-max-error', '0')
+        self.assertEqual(['TextureMesh'], self.ran())
+        self.assertEqual('refine_mesh.ply',
+                         flag(self.argv_for('TextureMesh'), '-m'))
+        self.assertNotIn('decimate', meta['shape'])
+        # The orphaned record stays; nothing deletes the coarse mesh either.
+        self.assertEqual('complete', meta['stages']['decimate']['status'])
+        self.assertTrue((out / 'mvs' / 'decimate_mesh.ply').is_file())
+
+    def test_a_world_unit_budget_without_autoscale_warns(self):
+        """The binary cannot detect this -- it only ever sees a mesh -- so the
+        pipeline is the only place that knows the units are arbitrary."""
+        with self.assertLogs('pgs-recon', level='WARNING') as captured:
+            self.run_recon(self.tmp / 'recon', '--decimate-max-error', '0.2')
+        self.assertTrue(any('autoscale' in m for m in captured.output),
+                        captured.output)
+
+    def test_a_scaled_run_is_not_warned_at(self):
+        warnings = self.captured_warnings()
+        self.run_recon(self.tmp / 'recon', '--decimate-max-error', '0.2',
+                       '--mvg-autoscale', '0.47')
+        self.assertEqual([], [m for m in warnings if 'autoscale' in m])
+
+    def test_a_face_budget_is_not_warned_at(self):
+        """A face budget has no units to be meaningless in."""
+        warnings = self.captured_warnings()
+        self.run_recon(self.tmp / 'recon', '--decimate-max-faces', '2000000')
+        self.assertEqual([], [m for m in warnings if 'autoscale' in m])
+
+    def captured_warnings(self) -> list:
+        """Warnings the run logs, collected into a list that fills as it goes.
+
+        ``assertLogs`` cannot express "and nothing was warned about", which is
+        half of what this stage's warning has to get right.
+        """
+        collected = []
+
+        class Collect(logging.Handler):
+            def emit(self, record):
+                collected.append(record.getMessage())
+
+        logger = logging.getLogger('pgs-recon')
+        handler = Collect(level=logging.WARNING)
+        logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
+        return collected
+
+    def test_omitting_the_budget_on_a_resume_inherits_it(self):
+        """Which is why zero exists. The effective arguments are defaults on the
+        next run, so a bare resume keeps decimating."""
+        out = self.tmp / 'recon'
+        self.run_recon(out, '--decimate-max-error', '0.2')
+        self.commands.clear()
+        meta = self.run_recon(out)
+        self.assertEqual([], self.ran())
+        self.assertIn('decimate', meta['shape'])
+        self.assertEqual(0.2, meta['effective_args']['decimate_max_error'])
 
 
 class TestSfMEngineFlags(PipelineCase):
@@ -416,6 +564,34 @@ class TestReconstructCleanFlags(PipelineCase):
         self.assertEqual('0.0', flag(argv, '--remove-spurious'))
         self.assertEqual('0', flag(argv, '--remove-spikes'))
         self.assertEqual('0', flag(argv, '--close-holes'))
+
+
+class TestRefineDecimateIsNotTheDecimateStage(PipelineCase):
+    """``--decimation-factor`` is gone, and what replaced it is RefineMesh's.
+
+    Two flags whose names both say "decimate", one of them silently meaning
+    another stage's, is the confusion the rename exists to end -- so this pins
+    that each reaches its own binary.
+    """
+
+    def test_refine_decimate_reaches_refine_mesh(self):
+        self.run_recon(self.tmp / 'recon', '--refine-decimate', '1')
+        self.assertEqual('1.0', flag(self.argv_for('RefineMesh'), '--decimate'))
+
+    def test_the_old_spelling_is_refused(self):
+        # Deleted, not aliased: a script still passing it fails at parsing
+        # rather than silently decimating differently.
+        with self.assertRaises(SystemExit) as ctx, \
+                contextlib.redirect_stderr(io.StringIO()) as usage:
+            self.run_recon(self.tmp / 'recon', '--decimation-factor', '0.5')
+        self.assertEqual(2, ctx.exception.code)
+        self.assertIn('--decimation-factor', usage.getvalue())
+
+    def test_the_two_do_not_reach_each_other(self):
+        self.run_recon(self.tmp / 'recon', '--refine-decimate', '1',
+                       '--decimate-max-error', '0.2')
+        self.assertIsNone(flag(self.argv_for('pgs-decimate'), '--decimate'))
+        self.assertIsNone(flag(self.argv_for('RefineMesh'), '--max-error'))
 
 
 class TestStagedRunsMatchSingleShot(PipelineCase):

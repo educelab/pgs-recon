@@ -81,11 +81,11 @@ pgs-recon -i images/ -o recon/ --name my-object
 ```
 
 `--from`/`--to` (both inclusive) restrict a run to a contiguous window of the
-thirteen pipeline stages:
+fourteen pipeline stages:
 
 ```
 import  features  matches  filter  sfm  robust  autoscale  colorize
-convert  densify  reconstruct  refine  texture
+convert  densify  reconstruct  refine  decimate  texture
 ```
 
 This lets one reconstruction be split across several cluster jobs, each sized
@@ -153,7 +153,7 @@ verbosity. Across 84 cluster runs that pass took a median of 7 minutes, 28 minut
 at p90, and 8.6 hours at worst. Adding cores or memory does not help.
 
 Its cost does not track the size of the input mesh; it tracks how far the mesh is
-decimated, and by default OpenMVS chooses that for you. `--decimation-factor` is
+decimated, and by default OpenMVS chooses that for you. `--refine-decimate` is
 left unset, so OpenMVS's own default of `0` (auto) applies: it derives a target
 from the mesh's *projected* face area in your images and floors it at a tenth of
 the input — so unlucky geometry collapses 90% of the faces. Pinning the factor
@@ -161,12 +161,16 @@ bounds the pass:
 
 ```shell
 # Decimate to a fixed half rather than letting auto choose
-pgs-recon -o recon/ --from refine --decimation-factor 0.5
+pgs-recon -o recon/ --from refine --refine-decimate 0.5
 
 # Or skip decimation, which at the default --refine-ensure-edge-size
 # also skips the edge-size pass that follows it
-pgs-recon -o recon/ --from refine --decimation-factor 1
+pgs-recon -o recon/ --from refine --refine-decimate 1
 ```
+
+`--refine-decimate` is `RefineMesh`'s own face-fraction decimation and has
+nothing to do with the `decimate` stage below, which is ours and states a
+geometric bound. It was called `--decimation-factor` before 2.0.
 
 `--refine-ensure-edge-size 0` skips only that following edge-size and vertex-valence
 pass, which is the cheaper of the two. `--refine-max-face-area` is *not* a remedy
@@ -176,6 +180,56 @@ harder. It bounds subdivision, not decimation.
 All of these change the refined mesh, so they are options rather than defaults. If
 refine is not worth its cost on a given dataset, `--no-mvs-refine` drops it from the
 pipeline shape and textures the reconstructed mesh directly.
+
+### Coarsening the deliverable
+A finished mesh is millions of faces, which is more than the geometry justifies
+and more than MeshLab opens comfortably. The `decimate` stage coarsens it as far
+as a **deviation budget** allows — the largest distance any point of either
+surface may end up from the other — and *measures* what it achieved rather than
+predicting it, so the guarantee is a number you can check rather than a flag you
+trust. Sharp edges and ridges survive, which is the requirement for inscribed
+surfaces:
+
+```shell
+# No point may move more than 0.2 mm. The units are the solved scene's, so this
+# is millimetres only because --mvg-autoscale put it in them.
+pgs-recon -i images/ -o recon/ -n obj --mvg-autoscale 12.7 \
+          --decimate-max-error 0.2
+
+# A scan that was never scaled has no physical units, so budget faces instead
+pgs-recon -o recon/ --decimate-max-faces 2000000
+
+# Both: as coarse as 2M faces, but never worse than 0.5 units. They pull in
+# opposite directions, and --decimate-prefer decides; the default protects the
+# deviation budget.
+pgs-recon -o recon/ --decimate-max-error 0.5 --decimate-max-faces 2000000
+```
+
+Notes:
+
+* **Stating a budget is what enables the stage** — there is no `--mvs-decimate`.
+  A budget of `0` is how you turn it back *off* on a resumed run: every argument
+  is inherited from the manifest, so merely dropping the flag keeps the recorded
+  budget. A `0` turns the *stage* off, so it also drops the other budget if that
+  one was inherited — pass both if you meant to change targets rather than stop
+  decimating (`--decimate-max-error 0 --decimate-max-faces 2000000` keeps the
+  face budget). Turning it off re-runs `texture` against the un-decimated mesh
+  and nothing earlier. A negative budget is refused: `0` is the off switch, and
+  a negative distance or face count has no other reading.
+* The stage sits between `refine` and `texture`, so the deliverable is textured
+  at its final resolution rather than textured twice.
+* `mvs/decimate_report.json` records faces in and out, the measured max, mean
+  and RMS deviation in both directions, what was cleaned, whether the mesh is
+  non-manifold, and which bound stopped the search. The manifest records its
+  path under the `deviation` role.
+* A world-unit budget on a run with no `autoscale` stage is a number with no
+  physical meaning, and the run warns about it.
+* `pgs-decimate` is the same tool standalone, and works on any mesh, including
+  the deliverable of a run that finished months ago. A textured mesh loses its
+  UVs, with a warning — decimate first, then re-texture. `pgs-decimate --help`
+  lists the geometry, search and measurement options the stage leaves at their
+  defaults, and `--self-test` checks the measurement against a generated mesh
+  whose exact surface is known.
 
 ### Docker images
 We provide multi-architecture (x86, arm64) Docker images in the 

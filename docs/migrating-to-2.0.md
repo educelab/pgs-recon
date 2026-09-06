@@ -221,6 +221,36 @@ command line, or strip the `None` lines. A config written by 2.0 round-trips.
   `openMVG_main_ComputeMatches` actually builds: `HNSWL2`, `HNSWL1` and
   `HNSWHAMMING` were added, `ANNL2` removed. A script still passing it fails at
   argument parsing (exit 2) instead of inside the matches stage.
+* **`--decimation-factor` is now `--refine-decimate`.** Same flag, same
+  meaning — `RefineMesh`'s face-fraction decimation of the mesh on the way *in* —
+  renamed to match the rest of the `--refine-*` group. It is **deleted, not
+  aliased**, so a script still passing the old name fails at argument parsing
+  (exit 2). The rename exists because 2.0 also adds `--decimate-max-error`, an
+  unrelated *deviation budget* for the new `decimate` stage; two flags both
+  saying "decimate", one of them silently meaning another stage's, is the kind of
+  confusion that costs a cluster allocation. The library keyword is unchanged
+  (`mvs_refine(decimate=...)`, §7).
+* **`--decimate-max-error` / `--decimate-max-faces` / `--decimate-prefer` are
+  new**, and add a fourteenth stage, `decimate`, between `refine` and `texture`
+  ([ADR 0008](./adr/0008-error-bounded-decimation.md)). The stage merges
+  triangles to make the deliverable smaller — a finished mesh is millions of
+  faces, more than the geometry justifies and more than MeshLab opens
+  comfortably — and stops while the result is still within
+  `--decimate-max-error` of the mesh it started from: the largest distance any
+  point of either surface may end up from the other, in the solved scene's
+  units. Unlike the three OpenMVS decimations, which take a face fraction and
+  state no geometric bound, this one **measures** the deviation on each
+  candidate instead of predicting it, so sharp edges and ridges survive and the
+  guarantee is a number rather than a hope. It writes
+  `mvs/decimate_report.json` beside the mesh with the faces in and out, the
+  measured deviation, and which bound stopped it. `--decimate-max-faces` budgets
+  faces instead, for a scan that was never scaled to physical units, and
+  `--decimate-prefer` says which wins when both are given. The same tool is
+  available standalone as `pgs-decimate`, on any mesh. Stating a budget is what
+  enables the stage; a budget of `0` disables it on a resume, which is the only
+  way to, since arguments are inherited from the manifest — and because `0`
+  turns off the *stage*, it drops an inherited second budget with it. Nothing
+  changes for a run that states no budget.
 * **`--import-capture n` is new** (`pgs-import --capture/-C` is the same choice for
   the standalone importer). A PGS scan holds every capture position once per
   *capture*, each with its own lighting and camera set; 1.7 hardcoded capture 0
@@ -344,6 +374,12 @@ a regex private to each app.
       shared camera to be textured from unless `--camera-index` narrows it.
 - [ ] Pass `--import-capture n` if a run should solve from a capture other than 0
       (the default is unchanged).
+- [ ] Rename `--decimation-factor` to `--refine-decimate`; the old spelling is
+      gone and fails at argument parsing.
+- [ ] Expect `decimate` in `--from`/`--to`'s stage list, and in a manifest's
+      `stages` and `shape` whenever `--decimate-max-error`/`--decimate-max-faces`
+      was given. Its `deviation` output is `mvs/decimate_report.json`; read the
+      measured deviation there rather than from the log.
 - [ ] Stop calling ImageMagick inside our images, and expect Lab-derived textures
       and conversions to differ from 1.7's — they were miscolored.
 - [ ] Keep shape flags (`--mvs-densify`, `--mvg-robust`, `--mvg-autoscale`,

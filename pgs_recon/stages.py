@@ -1,6 +1,6 @@
 """Stage bookkeeping for staged, resumable ``pgs-recon`` runs.
 
-A reconstruction is thirteen stages, one per binary invocation. ``--from``/``--to``
+A reconstruction is fourteen stages, one per binary invocation. ``--from``/``--to``
 select a contiguous window of them so a single output directory can be filled in
 by several cluster jobs, each sized for the stages it runs. State lives in the
 run's manifest (:func:`layout.manifest`) under a ``stages`` key.
@@ -66,7 +66,8 @@ except ImportError:  # pragma: no cover
 # Stage order matches main()'s existing call order, one entry per binary.
 STAGES: Tuple[str, ...] = (
     'import', 'features', 'matches', 'filter', 'sfm', 'robust', 'autoscale',
-    'colorize', 'convert', 'densify', 'reconstruct', 'refine', 'texture',
+    'colorize', 'convert', 'densify', 'reconstruct', 'refine', 'decimate',
+    'texture',
 )
 
 
@@ -116,6 +117,7 @@ STAGE_IO: Dict[str, IO] = {
     'densify':     IO(('scene',),                               (),              ('scene', 'cloud')),
     'reconstruct': IO(('scene',),                               ('cloud',),      ('mesh',)),
     'refine':      IO(('scene', 'mesh'),                        (),              ('mesh',)),
+    'decimate':    IO(('mesh',),                                (),              ('mesh', 'deviation')),
     'texture':     IO(('scene', 'mesh'),                        (),              ('mesh',)),
 }
 
@@ -139,9 +141,11 @@ STAGE_ARGS: Dict[str, Tuple[str, ...]] = {
     'reconstruct': ('free_space_support', 'mvs_smooth',
                     'mvs_remove_spurious', 'mvs_remove_spikes',
                     'mvs_close_holes'),
-    'refine': ('mvs_refine', 'decimation_factor', 'refine_resolution_level',
+    'refine': ('mvs_refine', 'refine_decimate', 'refine_resolution_level',
                'refine_min_resolution', 'refine_scales', 'refine_scale_step',
                'refine_ensure_edge_size', 'refine_max_face_area'),
+    'decimate': ('decimate_max_error', 'decimate_max_faces',
+                 'decimate_prefer'),
     'texture': ('name', 'file_type', 'texture_resolution_level',
                 'texture_max_size'),
 }
@@ -240,6 +244,61 @@ def validate_arg_map(parser) -> None:
         raise StageError('BUG: ' + '; '.join(problems))
 
 
+# The decimate stage's targets, which are also its enable flag (ADR 0008 s6).
+# Named once: `pipeline_shape` reads them for the gate and
+# `clear_zeroed_budgets` for the disable path, and the two have to agree.
+DECIMATE_BUDGETS: Tuple[str, ...] = ('decimate_max_error', 'decimate_max_faces')
+
+
+def validate_budgets(args) -> None:
+    """Refuse a negative decimate budget, which no layer below reads as one.
+
+    ``pgs-decimate`` reads a non-positive target as *not given*, so a typo'd
+    ``-1`` does not tighten anything: on its own it reaches the binary as no
+    target at all and fails the run after densify, reconstruct and refine have
+    already been paid for; beside a face budget it silently vanishes and the
+    mesh is coarsened to a bound the caller never set. Zero is the documented
+    off switch and stays one; a negative number is a mistake with no reading.
+    """
+    for dest in DECIMATE_BUDGETS:
+        value = getattr(args, dest, None)
+        if value is not None and value < 0:
+            flag = '--' + dest.replace('_', '-')
+            raise StageError(f'{flag}={value} is negative. A budget is a '
+                             f'distance or a face count; pass 0 to turn the '
+                             f'decimate stage off, or a positive value to '
+                             f'bound it.')
+
+
+def clear_zeroed_budgets(args, explicit: set, logger) -> None:
+    """Let an explicit zero budget turn the stage off, not just its own target.
+
+    Zero is documented as the way to drop decimation from a resumed run, but the
+    stage is in the shape while *either* budget is truthy and ``apply_stored``
+    has already folded the recorded ones back in. Without this, a run recorded
+    with both budgets keeps decimating -- to the face target the caller was
+    trying to stop -- and the flag's own help is wrong.
+
+    An explicit zero therefore clears the pair. Unless the other budget is
+    explicit on this run too: naming both is a caller saying "not this bound,
+    that one", which is a target change and not a disable.
+    """
+    given = {d: getattr(args, d, None) for d in DECIMATE_BUDGETS
+             if d in explicit and hasattr(args, d)}
+    if not given or any(given.values()):
+        return
+    for dest in DECIMATE_BUDGETS:
+        inherited = getattr(args, dest, None)
+        if dest in given or not inherited:
+            continue
+        flag = '--' + dest.replace('_', '-')
+        logger.warning(f'{flag}={inherited} came from the manifest, and a zero '
+                       f'budget turns the whole decimate stage off, so it is '
+                       f'dropped too. Pass {flag} again alongside the zero to '
+                       f'keep decimating to it.')
+        setattr(args, dest, None)
+
+
 def pipeline_shape(args) -> Tuple[str, ...]:
     """The stages this reconstruction contains at all, in order.
 
@@ -257,6 +316,13 @@ def pipeline_shape(args) -> Tuple[str, ...]:
     shape.append('reconstruct')
     if args.mvs_refine:
         shape.append('refine')
+    # Truthiness, not ``is not None``: the target *is* the enable flag, so 0 is
+    # how a resumed run turns the stage off -- omitting it would inherit the
+    # recorded budget through ``apply_stored`` (ADR 0008 s6; issue #20). A zero
+    # given on the command line reaches here having already cleared the other
+    # budget, via ``clear_zeroed_budgets``.
+    if any(getattr(args, dest) for dest in DECIMATE_BUDGETS):
+        shape.append('decimate')
     shape.append('texture')
     return tuple(sorted(shape, key=stage_index))
 

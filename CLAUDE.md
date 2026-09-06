@@ -17,7 +17,10 @@ executables.
 The compiled binaries are NOT part of this repo. They are built from `dependencies/`
 via a CMake superbuild that compiles OpenMVG, OpenMVS, VCG, CGAL, OpenCV, Eigen,
 Ceres, libjpeg, plus the in-tree `pgs-recon-utilities` (C++ tools in
-`dependencies/utilities/`, which produce `pgs-global-scaler` and `pgs-generate-markers`).
+`dependencies/utilities/`, which produce `pgs-global-scaler`, `pgs-sfm-orient`,
+`pgs-generate-markers` and `pgs-decimate`). `pgs-decimate` is the one that needs
+VCG, whose headers the superbuild already installs for OpenMVS; `BuildPGSUtils.cmake`
+passes `-DVCG_ROOT` the way `BuildOpenMVS.cmake` does.
 
 ```shell
 # Build the C++ dependencies (slow; installs to dependencies/installed/ by default)
@@ -45,7 +48,10 @@ chokepoint (`test_toolchain.py`), the MVS and MVG wrappers' flag surfaces
 (`test_openmvs.py` and `test_openmvg.py`, whose `SURFACES` tables are what make
 ADR 0005's "every flag reachable" enforceable — the MVG one maps each keyword
 argument to its argv flag, because OpenMVG's spellings are per-binary and cannot
-be derived), `run_command`'s exit statuses
+be derived; the MVS one additionally checks itself against the installed
+binaries' generated `--help`, per binary, so a tool the published image does not
+carry yet skips rather than taking the others down), `run_command`'s exit
+statuses
 (`test_utility.py`), and `pgs-recon` end to end against a prefix of fake binaries
 plus its `--dry-run` (`test_pipeline.py`, `test_reconstruct.py`, which skip
 themselves when `configargparse`/`sfm_utils`/`exiftool` are missing). All
@@ -105,10 +111,17 @@ tracker:
    then **colorize** (`mvg_colorize_sfm`).
 5. **MVG→MVS conversion** (`mvg_to_mvs`).
 6. MVS stages in `pgs_recon/openmvs.py`: optional `mvs_densify` → `mvs_reconstruct`
-   → optional `mvs_refine` → `mvs_texture`. Final textured mesh lands at
-   `<output>/mvs/<name>.obj` (or `.ply`).
+   → optional `mvs_refine` → optional `mvs_decimate` → `mvs_texture`. Final
+   textured mesh lands at `<output>/mvs/<name>.obj` (or `.ply`).
 
 `--no-mvs` stops after the SfM/colorize stage.
+
+`mvs_decimate` is the one MVS-side wrapper that is not OpenMVS: it drives our
+`pgs-decimate`, which coarsens a mesh as far as a *measured* deviation budget
+allows and writes a JSON report of what that cost (ADR 0008). Stating a budget
+(`--decimate-max-error`/`--decimate-max-faces`) is what puts the stage in the
+shape — the gate is truthiness, so `0` removes it again on a resume — and it is
+the one stage whose enablement has no boolean flag of its own.
 
 ### How a stage gets its paths (ADR 0005, ADR 0006)
 
@@ -199,3 +212,20 @@ the wrappers stay a complete library surface over each binary's flags.
   than calling `subprocess` or `run_command` directly.
 - Args use `configargparse`; hidden/internal flags use `configargparse.SUPPRESS`.
 - The package version lives in `setup.cfg` (`version = ...`).
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as GitLab issues on `educelab/pgs-recon`, driven with the `glab` CLI.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical roles, unrenamed: `needs-triage`, `needs-info`,
+`ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See
+`docs/agents/domain.md`.
