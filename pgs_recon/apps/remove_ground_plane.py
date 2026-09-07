@@ -48,6 +48,17 @@ def main():
                              'ground. A scan bed is usually bowed by more than '
                              'the distance threshold, in which case a plane (0) '
                              'only removes the strip where the two coincide.')
+    parser.add_argument('--drop-below-ground', action='store_true',
+                        help='Also drop the connected components that lie '
+                             'entirely below the fitted ground surface. The '
+                             "scan bed's fiducial squares reconstruct as "
+                             'shallow recesses under the bed, which ground '
+                             'removal leaves behind because they are below '
+                             'its band rather than inside it. The 20-22 of '
+                             'them a scan delivers run 0.51-2.84 cm^2, the '
+                             'size of the fragments the area filter exists to '
+                             'keep, so only their being under the bed tells '
+                             'them apart -- and nothing real is under the bed.')
     filters = parser.add_mutually_exclusive_group()
     filters.add_argument('--filter-cc', default='largest', type=parse_filter_cc,
                          help="Filter the mesh's connected components after "
@@ -89,6 +100,12 @@ def main():
           f'vertices, warp {surface.warp:.4f}, fit rms {surface.rms:.5f} = '
           f'{surface.rms / args.distance_threshold:.2f} of the threshold)...')
     geom.remove_vertices_by_index(mesh, ground)
+
+    # Ahead of the area/size filters, not instead of them: the two catch
+    # different things, speckle and the bed's own fiducial recesses
+    if args.drop_below_ground:
+        print('Dropping components below the ground surface...')
+        print(geom.remove_connected_components_below_surface(mesh, surface))
 
     if args.filter_cc_area is not None:
         print(f'Filtering components by area '

@@ -279,6 +279,51 @@ capture lacks is warned about and skipped. Only an empty result is fatal. An
 existing artifact path is still overwritten, but now every one of them is listed
 in a warning first.
 
+### 5c. `pgs-remove-ground-plane`
+
+1.7 fitted a *plane* and always kept the single largest connected component.
+Neither holds in 2.0, so a script that relied on the defaults gets a different
+mesh out:
+
+* **The ground is a polynomial surface now, and the default
+  `--distance-threshold` is `0.02` rather than `0.1`.** A scan bed is bowed by
+  far more than the mesh's own noise, so a plane's inlier band only ever caught
+  the strip where the two happened to coincide and left most of the bed
+  standing. 2.0 fits a degree-`--surface-degree` (default 2) height field in
+  the plane's frame instead and refits it until the inlier set settles. The run
+  prints the bed's warp and the fit's rms as a fraction of the threshold, which
+  is how you judge whether a threshold suits a capture — a healthy fit lands
+  around a tenth to a quarter of it. `--surface-degree 0` asks for 1.7's plane
+  back, but a fit whose residuals *fill* the band rather than hugging it, which
+  is what a plane over a bowed bed does, is now **refused** (exit 1, nothing
+  written) rather than handed on half-removed.
+* **Component filtering is a choice.** `--filter-cc largest` is the default and
+  is 1.7's behaviour; `--filter-cc none` keeps everything, `--filter-cc N`
+  drops components under N faces, and `--filter-cc-area AREA` (mutually
+  exclusive with `--filter-cc`) drops those under AREA in the mesh's units
+  squared — cm² on an autoscaled reconstruction, and the one measure that
+  means the same thing from one scan to the next. An area of `0` reports the
+  component inventory without dropping anything, and every filter now prints
+  what it kept and dropped.
+* **`--drop-below-ground` is new**, and off unless asked for. The scan bed's
+  fiducial squares reconstruct as shallow recesses *under* the bed, which
+  ground removal cannot take — they are below its band, not inside it — so they
+  reach the delivered mesh as 27-29 components per scan. No area threshold
+  reaches them: 20-22 of those measured 0.51-2.84 cm², overlapping the real
+  fragments the 0.5 cm² floor exists to keep, and only the remainder was
+  speckle an area filter would have caught anyway. The flag drops any component
+  whose *highest* vertex is below the fitted surface, which separates them
+  completely — on three measured captures every island topped out at -0.02
+  while the artifact reached +2.5 to +3.0 — and adds no threshold of its own,
+  because ground removal has already taken everything within the distance
+  threshold of the surface. It composes with the `--filter-cc*` filters rather
+  than replacing them; speckle and sub-bed islands are different things. It is
+  worth more than tidiness downstream: on one capture the islands inflated the
+  kept geometry's bounding box by 1.45x in area, and an orthographic sampling
+  frame derived from that bbox spends the difference on empty bed.
+* **`--seed` is new** (default 0), so the RANSAC that orients the fit is
+  reproducible from one run to the next.
+
 ## 6. CIELab captures decode differently, and ImageMagick is gone
 
 `pgs-convert`, `pgs-calibrate` and `pgs-retexture` now read pixels through one
@@ -344,6 +389,17 @@ Flags now mirror the binary's own names: `mask_value` → `ignore_mask_label`,
 `pgs_recon.layout`, whose functions take the output root and nothing else.
 `mvs_reconstruct`/`mvs_refine` no longer return their pass-through scene.
 
+`pgs_recon.utils.geometry` carries the ground work behind
+`pgs-remove-ground-plane` (§5c). `segment_plane` is still there, but
+`segment_ground_surface` is what the app calls, returning a `GroundSurface` and
+its inlier vertex indices; `remove_connected_components_below_surface` and
+`remove_connected_components_by_area` are the new filters, and every filter
+returns a `ComponentInventory` of what it kept and dropped rather than nothing.
+A `GroundSurface`'s frame is **oriented**: `signed_distance` is height above the
+ground, positive away from it. If you wrote against a 2.0 alpha, that sign used
+to fall out of the SVD unconstrained and came out inverted on roughly half of
+the captures measured — code that took `abs()` of it to compensate should stop.
+
 Two smaller surfaces moved with the capture work: `pgs_data.import_pgs_scan` and
 `pgs_data.init_sfm_pgs` take a `capture` keyword (default 0, the capture 1.7
 hardcoded), and the PGS filename convention is parsed by
@@ -380,6 +436,10 @@ a regex private to each app.
       `stages` and `shape` whenever `--decimate-max-error`/`--decimate-max-faces`
       was given. Its `deviation` output is `mvs/decimate_report.json`; read the
       measured deviation there rather than from the log.
+- [ ] Expect a polynomial ground fit and a `0.02` default `--distance-threshold`
+      from `pgs-remove-ground-plane`, and pass `--drop-below-ground` to clear
+      the bed's fiducial islands. It is opt-in: without it a run delivers what
+      it did before, islands included.
 - [ ] Stop calling ImageMagick inside our images, and expect Lab-derived textures
       and conversions to differ from 1.7's — they were miscolored.
 - [ ] Keep shape flags (`--mvs-densify`, `--mvg-robust`, `--mvg-autoscale`,

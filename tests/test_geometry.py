@@ -8,8 +8,10 @@ plane's frame instead; the cases below are that difference, plus the
 least-squares refit ``segment_plane`` silently skipped.
 
 The component filters follow: what ``cluster_connected_components`` counts as
-one component, and the area threshold ``pgs-remove-ground-plane`` and
-``pgs-filter-small-components`` expose as ``--filter-cc-area``.
+one component, the area threshold ``pgs-remove-ground-plane`` and
+``pgs-filter-small-components`` expose as ``--filter-cc-area``, and the height
+one behind ``--drop-below-ground``, for the components no area threshold
+reaches.
 
 Skips when numpy or scipy is absent (``geometry`` imports both at module load).
 """
@@ -103,6 +105,25 @@ class TestSegmentGroundSurface(unittest.TestCase):
         dist = surface.signed_distance(self.vertices)
         self.assertLess(np.abs(dist[:len(self.ground)]).max(), 5 * NOISE)
         self.assertGreater(np.abs(dist[len(self.ground):]).min(), 1.)
+
+    def test_signed_distance_is_height_above_the_ground(self):
+        """Which side of the bed a vertex is on has to mean one thing.
+
+        The frame's normal comes from an SVD, which takes its sign from the
+        vertex data: unoriented, the same object reads positive on one capture
+        and negative on the next, and did -- of the three scans the sub-bed
+        island filter was measured on, one came out opposite to the other two.
+        A caller asking whether a component sits *under* the bed
+        (``--drop-below-ground``) needs the sign fixed, not merely consistent
+        within one run.
+        """
+        import numpy as np
+        surface, _ = self.segment()
+        dist = surface.signed_distance(self.vertices)
+        self.assertGreater(dist[len(self.ground):].min(), 1.)
+        self.assertLess(np.abs(dist[:len(self.ground)]).max(), 5 * NOISE)
+        # The normal it reports is the side it measures height towards
+        self.assertGreater(float(surface.normal @ [0., 0., 1.]), 0.99)
 
     def test_rejects_a_negative_degree(self):
         with self.assertRaises(ValueError):
@@ -343,6 +364,219 @@ class TestFilterBySizeAndLargest(unittest.TestCase):
         self.assertEqual(areas(inventory.kept), [4.])
         self.assertEqual(areas(inventory.dropped), [0.0001, 1.])
         self.assertEqual(mesh.faces.shape[0], 2)
+
+
+def flat_ground():
+    """A ``GroundSurface`` at z = 0, so a vertex's height is just its z"""
+    import numpy as np
+    from pgs_recon.utils import geometry as geom
+    return geom.GroundSurface(origin=np.zeros(3), basis=np.eye(3), scale=1.,
+                              coefficients=np.zeros(1), degree=0, warp=0.,
+                              rms=0.)
+
+
+@unittest.skipIf(MISSING, f'requires {", ".join(MISSING)}')
+class TestFilterBelowSurface(unittest.TestCase):
+    """``--drop-below-ground``: components with no vertex above the bed.
+
+    The scan bed's fiducial squares reconstruct as shallow recesses under it,
+    which survive ground removal because they are not ground -- they sit a few
+    tenths below it. Height tells them from real geometry; area, as the last
+    case here shows, cannot.
+    """
+
+    def filter(self, heights, squares=SQUARES):
+        """Lay ``squares`` out at the given heights, then filter"""
+        from pgs_recon.utils import geometry as geom
+        mesh = build_mesh(squares)
+        for i, z in enumerate(heights):
+            mesh.vertices[4 * i:4 * (i + 1), 2] = z
+        return mesh, geom.remove_connected_components_below_surface(
+            mesh, flat_ground())
+
+    def test_drops_a_component_entirely_below_the_surface(self):
+        mesh, inventory = self.filter([1., -1., 1.])
+        self.assertEqual(areas(inventory.dropped), [1.])
+        self.assertEqual(areas(inventory.kept), [0.0001, 4.])
+        self.assertEqual(mesh.faces.shape[0], 4)
+        self.assertEqual(mesh.vertices.shape[0], 8)
+
+    def test_keeps_a_component_that_reaches_above_the_surface(self):
+        """The criterion is the top vertex, not the typical one.
+
+        A real island is a topological disc: a flat centre with a rim draping
+        down into the cut. Anything whose *highest* vertex clears the bed is
+        geometry that rises out of it, however much of it hangs below.
+        """
+        from pgs_recon.utils import geometry as geom
+        mesh = build_mesh([(0., 0., 1.)])
+        mesh.vertices[:, 2] = [-1., -1., -1., 0.5]
+        inventory = geom.remove_connected_components_below_surface(
+            mesh, flat_ground())
+        self.assertEqual(inventory.dropped.size, 0)
+        self.assertEqual(mesh.faces.shape[0], 2)
+
+    def test_drops_a_component_lying_on_the_surface(self):
+        """Nothing real sits at exactly 0: ground removal took that band.
+
+        A component that survived removal while touching the fitted surface
+        can only be on the far side of it, which is why ``> 0`` needs no
+        tolerance of its own -- its top vertex is a full distance threshold
+        below the bed already.
+        """
+        _, inventory = self.filter([1., 0., 1.])
+        self.assertEqual(areas(inventory.dropped), [1.])
+
+    def test_follows_the_surface_rather_than_a_height(self):
+        """The bed is bowed, so 'below' is below the fit, not below a z."""
+        import numpy as np
+        from pgs_recon.utils import geometry as geom
+        # A surface sagging to -1 at the origin and rising to 0 at x = +/-1
+        surface = geom.GroundSurface(
+            origin=np.zeros(3), basis=np.eye(3), scale=1.,
+            coefficients=np.array([-1., 0., 0., 1., 0., 0.]), degree=2,
+            warp=1., rms=0.)
+        mesh = build_mesh([(-0.5, 0., 1.), (10., 0., 1.)])
+        # Both patches sit at the same z: over the sag it is above the bed,
+        # out on the flat it is far below
+        mesh.vertices[:, 2] = -0.5
+        inventory = geom.remove_connected_components_below_surface(mesh,
+                                                                  surface)
+        self.assertEqual(inventory.kept.size, 1)
+        self.assertEqual(inventory.dropped.size, 1)
+        self.assertLess(mesh.vertices[:, 0].max(), 1.)
+
+    def test_handles_a_mesh_with_no_faces(self):
+        from pgs_recon.utils import geometry as geom
+        mesh = build_mesh(SQUARES)
+        geom.keep_triangles_by_mask(mesh, [])
+        inventory = geom.remove_connected_components_below_surface(
+            mesh, flat_ground())
+        self.assertEqual((inventory.kept.size, inventory.dropped.size), (0, 0))
+
+    def test_area_cannot_do_this_job(self):
+        """Why this is not just a bigger ``--filter-cc-area``.
+
+        The measured islands run 0.5-2.8 cm^2 and the fragments the 0.5 cm^2
+        floor exists to keep start around 1 cm^2, so the two ranges overlap
+        and no threshold separates them. Two components of identical area, on
+        opposite sides of the bed, are the whole argument.
+        """
+        from pgs_recon.utils import geometry as geom
+        squares = [(0., 0., 1.), (10., 0., 1.)]
+        heights = [1., -0.2]
+
+        mesh = build_mesh(squares)
+        for i, z in enumerate(heights):
+            mesh.vertices[4 * i:4 * (i + 1), 2] = z
+        self.assertEqual(
+            areas(geom.remove_connected_components_by_area(mesh, 0.5).kept),
+            [1., 1.])
+
+        _, inventory = self.filter(heights, squares)
+        self.assertEqual(areas(inventory.kept), [1.])
+        self.assertEqual(areas(inventory.dropped), [1.])
+
+
+def grid_patch(x0, x1, y0, y1, n, height):
+    """A triangulated ``n`` x ``n`` patch, z from ``height(x, y)``"""
+    import numpy as np
+    gx, gy = np.meshgrid(np.linspace(x0, x1, n), np.linspace(y0, y1, n))
+    vertices = np.stack([gx.ravel(), gy.ravel(), height(gx, gy).ravel()],
+                        axis=-1)
+    i = np.arange(n * n).reshape(n, n)
+    quad = np.stack([i[:-1, :-1], i[1:, :-1], i[1:, 1:], i[:-1, 1:]],
+                    axis=-1).reshape(-1, 4)
+    faces = np.concatenate([quad[:, [0, 1, 2]], quad[:, [0, 2, 3]]])
+    return vertices, faces
+
+
+def build_bed_mesh(island_depth=0.1, island_side=1.2):
+    """``build_scene``'s bowed bed with faces, plus a sub-bed island.
+
+    Three components: the bed, an object standing 3 above it, and an island
+    recessed ``island_depth`` under it -- a fiducial square's footprint, the
+    size of the larger ones measured on the real captures. The patches share
+    no vertices with the bed, which is the shape a real one has by the time
+    ground removal has taken the bed's own faces away.
+    """
+    import numpy as np
+    from pgs_recon.utils import geometry as geom
+    rng = np.random.default_rng(4)
+
+    def bed(x, y):
+        return SAG * (x ** 2 + y ** 2) / (2 * EXTENT ** 2)
+
+    parts = [
+        grid_patch(-EXTENT, EXTENT, -EXTENT, EXTENT, 160,
+                   lambda x, y: bed(x, y) + rng.normal(0., NOISE, x.shape)),
+        grid_patch(-2., 2., -2., 2., 40, lambda x, y: bed(x, y) + 3.),
+        grid_patch(6., 6. + island_side, 0., island_side, 8,
+                   lambda x, y: bed(x, y) - island_depth),
+    ]
+    vertices = np.concatenate([v for v, _ in parts])
+    faces, offset = [], 0
+    for v, f in parts:
+        faces.append(f + offset)
+        offset += v.shape[0]
+    faces = np.concatenate(faces)
+
+    mesh = geom.Mesh()
+    mesh.vertices = vertices
+    mesh.faces = np.full((faces.shape[0], 3, 3), None, dtype='O')
+    mesh.faces[..., 0] = faces
+    mesh.normals = np.zeros((0, 3))
+    mesh.uv_coords = np.zeros((0, 2))
+    mesh.mtl_ids = np.zeros((0,), dtype=int)
+    return mesh
+
+
+@unittest.skipIf(MISSING, f'requires {", ".join(MISSING)}')
+class TestSubBedIslands(unittest.TestCase):
+    """The fix end to end, on the shape the real captures have.
+
+    Every finished scan this was measured on shipped one real component plus
+    27-29 sub-bed ones, of which 20-22 were too large for the area filter to
+    drop: the bed's fiducial squares, which reconstruct as recesses 0.02-0.4
+    below the fitted bed and so survive removal. This is that, at fixture
+    scale.
+    """
+
+    def remove_ground(self):
+        """``pgs-remove-ground-plane`` up to the point it filters"""
+        from pgs_recon.utils import geometry as geom
+        mesh = build_bed_mesh()
+        surface, ground = geom.segment_ground_surface(
+            mesh, dist_threshold=5 * NOISE, degree=2, seed=0)
+        geom.remove_vertices_by_index(mesh, ground)
+        return mesh, surface
+
+    def test_ground_removal_leaves_the_island_behind(self):
+        """The bug: the island is not ground, so removal cannot take it."""
+        from pgs_recon.utils import geometry as geom
+        mesh, _ = self.remove_ground()
+        _, component_areas, _ = geom.cluster_connected_components(mesh)
+        self.assertEqual(component_areas.size, 2)
+
+    def test_the_area_filter_keeps_the_island(self):
+        """1.44 units^2 is above the 0.5 the pipeline sends."""
+        from pgs_recon.utils import geometry as geom
+        mesh, _ = self.remove_ground()
+        inventory = geom.remove_connected_components_by_area(mesh, 0.5)
+        self.assertEqual(inventory.kept.size, 2)
+
+    def test_the_height_filter_takes_the_island_and_nothing_else(self):
+        import numpy as np
+        from pgs_recon.utils import geometry as geom
+        mesh, surface = self.remove_ground()
+        inventory = geom.remove_connected_components_below_surface(mesh,
+                                                                   surface)
+        self.assertEqual(inventory.kept.size, 1)
+        self.assertEqual(inventory.dropped.size, 1)
+        # What survives is the object: 4 x 4 of it, and all above the bed
+        self.assertAlmostEqual(float(inventory.kept.sum()), 16., delta=0.1)
+        self.assertGreater(surface.signed_distance(mesh.vertices).min(), 1.)
+        self.assertLess(np.abs(mesh.vertices[:, 0]).max(), 2.5)
 
 
 if __name__ == '__main__':
