@@ -287,16 +287,31 @@ def segment_ground_surface(mesh, dist_threshold=0.02, degree=2,
     # The SVD picks its normal's sign off the vertex data, so the same bed
     # reads +z on one capture and -z on the next -- a caller asking which side
     # of the bed something is on cannot use that. Point the normal away from
-    # the ground instead, which makes signed_distance a height above it. What
-    # the fit excluded is what stands proud of the bed, and its median is what
-    # decides, because the artifact is nearly all of it: a recess cut into the
-    # bed is off-ground too, but never much of it. Only basis[2] and
-    # coefficients reach signed_distance, so negating both is exact -- nothing
-    # needs refitting. The in-plane axes stay as they were fitted, which can
-    # leave the frame left-handed; nothing reads it as a rotation.
-    off_ground = np.invert(mask)
-    if off_ground.any() and np.median(residual[off_ground]) < 0.:
-        logger.debug('flipping the ground normal: the fit came out inverted')
+    # the ground instead, which makes signed_distance a height above it.
+    #
+    # Which side is up is a question of how far the fit's outliers reach, not
+    # how many of them there are. An artifact standing on the bed clears it by
+    # centimetres, while nothing reconstructs far beneath an opaque bed: the
+    # recesses cut into it bottom out a few millimetres down. Counting instead
+    # inverts on a small fragment ringed by the bed's fiducial recesses, which
+    # outnumber its vertices while reaching a thirtieth as far -- and an
+    # inverted frame is worse than an unoriented one, because
+    # remove_connected_components_below_surface would then deliver the
+    # recesses and drop the fragment. Compare a high quantile of each side
+    # rather than its extreme, so that one stray vertex under the bed cannot
+    # decide it either.
+    #
+    # Only basis[2] and coefficients reach signed_distance, so negating both
+    # is exact -- nothing needs refitting. The in-plane axes stay as they were
+    # fitted, which can leave the frame left-handed; nothing reads it as a
+    # rotation.
+    def _reach(side):
+        return float(np.percentile(side, 99)) if side.size else 0.
+    up = _reach(residual[residual >= dist_threshold])
+    down = _reach(-residual[residual <= -dist_threshold])
+    if down > up:
+        logger.debug(f'flipping the ground normal: the fit came out inverted '
+                     f'(outliers reach {up:.4f} one way, {down:.4f} the other)')
         basis[2] = -basis[2]
         coefficients = -coefficients
 

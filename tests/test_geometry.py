@@ -13,12 +13,14 @@ one component, the area threshold ``pgs-remove-ground-plane`` and
 one behind ``--drop-below-ground``, for the components no area threshold
 reaches.
 
-Skips when numpy or scipy is absent (``geometry`` imports both at module load).
+Skips when numpy or scipy is absent, and when ``cv2``/``vtkmodules`` are:
+``geometry`` imports the first two itself and reaches the other two through
+``utils.wavefront``, so without any of them the module cannot import at all.
 """
 import importlib.util
 import unittest
 
-MISSING = [d for d in ('numpy', 'scipy')
+MISSING = [d for d in ('numpy', 'scipy', 'cv2', 'vtkmodules')
            if importlib.util.find_spec(d) is None]
 
 # A bowed ground: a paraboloid sagging 0.5 over a 20x20 bed, plus a small
@@ -491,13 +493,20 @@ def grid_patch(x0, x1, y0, y1, n, height):
     return vertices, faces
 
 
-def build_bed_mesh(island_depth=0.1, island_side=1.2):
-    """``build_scene``'s bowed bed with faces, plus a sub-bed island.
+# Where the islands go: a frame around the artifact, as the bed's fiducial
+# markers are laid out on a real capture
+ISLAND_RING = [(-7.5, -7.5), (0., -7.5), (7.5, -7.5), (-7.5, 0.), (7.5, 0.),
+               (-7.5, 7.5), (0., 7.5), (7.5, 7.5)]
 
-    Three components: the bed, an object standing 3 above it, and an island
-    recessed ``island_depth`` under it -- a fiducial square's footprint, the
-    size of the larger ones measured on the real captures. The patches share
-    no vertices with the bed, which is the shape a real one has by the time
+
+def build_bed_mesh(islands=1, object_side=2., object_n=40, island_depth=0.1,
+                   island_side=1.2):
+    """``build_scene``'s bowed bed with faces, plus sub-bed islands.
+
+    The bed, an object standing 3 above it, and ``islands`` recesses
+    ``island_depth`` under it, each a fiducial square's footprint -- the size
+    of the larger ones measured on the real captures. The patches share no
+    vertices with the bed, which is the shape a real one has by the time
     ground removal has taken the bed's own faces away.
     """
     import numpy as np
@@ -510,10 +519,14 @@ def build_bed_mesh(island_depth=0.1, island_side=1.2):
     parts = [
         grid_patch(-EXTENT, EXTENT, -EXTENT, EXTENT, 160,
                    lambda x, y: bed(x, y) + rng.normal(0., NOISE, x.shape)),
-        grid_patch(-2., 2., -2., 2., 40, lambda x, y: bed(x, y) + 3.),
-        grid_patch(6., 6. + island_side, 0., island_side, 8,
-                   lambda x, y: bed(x, y) - island_depth),
+        grid_patch(-object_side, object_side, -object_side, object_side,
+                   object_n, lambda x, y: bed(x, y) + 3.),
     ]
+    for k in range(islands):
+        x0, y0 = ISLAND_RING[k % len(ISLAND_RING)]
+        x0 += 1.4 * (k // len(ISLAND_RING))
+        parts.append(grid_patch(x0, x0 + island_side, y0, y0 + island_side, 8,
+                                lambda x, y: bed(x, y) - island_depth))
     vertices = np.concatenate([v for v, _ in parts])
     faces, offset = [], 0
     for v, f in parts:
@@ -577,6 +590,48 @@ class TestSubBedIslands(unittest.TestCase):
         self.assertAlmostEqual(float(inventory.kept.sum()), 16., delta=0.1)
         self.assertGreater(surface.signed_distance(mesh.vertices).min(), 1.)
         self.assertLess(np.abs(mesh.vertices[:, 0]).max(), 2.5)
+
+
+@unittest.skipIf(MISSING, f'requires {", ".join(MISSING)}')
+class TestSubBedIslandsOutnumberingTheObject(unittest.TestCase):
+    """A small fragment on a bed whose fiducial recesses outnumber it.
+
+    The eight recesses here hold more vertices between them than the fragment
+    does, so orienting the fit by *counting* what it excluded comes out upside
+    down -- and an inverted frame is worse than an unoriented one, because the
+    filter then keeps the recesses and drops the fragment, which
+    ``--filter-cc largest`` would go on to deliver as the scan. Reach is what
+    separates the two sides: the fragment stands 3 above the bed while the
+    recesses bottom out 0.1 under it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from pgs_recon.utils import geometry as geom
+        cls.mesh = build_bed_mesh(islands=8, object_side=0.6, object_n=12)
+        cls.surface, ground = geom.segment_ground_surface(
+            cls.mesh, dist_threshold=5 * NOISE, degree=2, seed=0)
+        geom.remove_vertices_by_index(cls.mesh, ground)
+
+    def test_the_islands_outnumber_the_object(self):
+        """The premise: a headcount of what the fit excluded gets this wrong."""
+        import numpy as np
+        height = self.surface.signed_distance(self.mesh.vertices)
+        self.assertGreater(np.count_nonzero(height < 0.),
+                           np.count_nonzero(height > 0.))
+
+    def test_the_fit_is_still_oriented(self):
+        self.assertGreater(float(self.surface.normal @ [0., 0., 1.]), 0.99)
+
+    def test_the_object_survives_and_every_island_goes(self):
+        import copy
+        from pgs_recon.utils import geometry as geom
+        inventory = geom.remove_connected_components_below_surface(
+            copy.deepcopy(self.mesh), self.surface)
+        self.assertEqual(inventory.dropped.size, 8)
+        # 1.2 x 1.2 of fragment, and nothing else
+        self.assertEqual(inventory.kept.size, 1)
+        self.assertAlmostEqual(float(inventory.kept.sum()), 1.44, delta=0.02)
 
 
 if __name__ == '__main__':
