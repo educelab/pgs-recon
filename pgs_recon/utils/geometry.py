@@ -187,6 +187,10 @@ class GroundSurface:
     tightly the ground hugs the fitted surface, and is the number to compare
     against the distance threshold when judging whether that threshold suits a
     capture: a healthy fit lands around a tenth to a quarter of it.
+
+    The frame is oriented: ``normal`` points away from the ground and
+    ``signed_distance`` is height above it, positive for anything standing on
+    the bed and negative for anything cut into it.
     """
 
     def __init__(self, origin, basis, scale, coefficients, degree, warp, rms):
@@ -210,6 +214,7 @@ class GroundSurface:
                 p @ self.basis[2])
 
     def signed_distance(self, points: np.ndarray):
+        """Height above the ground surface, positive away from the ground"""
         x, y, h = self.project(points)
         return h - _eval_poly(x, y, self.coefficients, self.degree)
 
@@ -279,6 +284,37 @@ def segment_ground_surface(mesh, dist_threshold=0.02, degree=2,
             f'mesh) -- the threshold is below the mesh noise, or wide enough '
             f'to reach the object')
 
+    # The SVD picks its normal's sign off the vertex data, so the same bed
+    # reads +z on one capture and -z on the next -- a caller asking which side
+    # of the bed something is on cannot use that. Point the normal away from
+    # the ground instead, which makes signed_distance a height above it.
+    #
+    # Which side is up is a question of how far the fit's outliers reach, not
+    # how many of them there are. An artifact standing on the bed clears it by
+    # centimetres, while nothing reconstructs far beneath an opaque bed: the
+    # recesses cut into it bottom out a few millimetres down. Counting instead
+    # inverts on a small fragment ringed by the bed's fiducial recesses, which
+    # outnumber its vertices while reaching a thirtieth as far -- and an
+    # inverted frame is worse than an unoriented one, because
+    # remove_connected_components_below_surface would then deliver the
+    # recesses and drop the fragment. Compare a high quantile of each side
+    # rather than its extreme, so that one stray vertex under the bed cannot
+    # decide it either.
+    #
+    # Only basis[2] and coefficients reach signed_distance, so negating both
+    # is exact -- nothing needs refitting. The in-plane axes stay as they were
+    # fitted, which can leave the frame left-handed; nothing reads it as a
+    # rotation.
+    def _reach(side):
+        return float(np.percentile(side, 99)) if side.size else 0.
+    up = _reach(residual[residual >= dist_threshold])
+    down = _reach(-residual[residual <= -dist_threshold])
+    if down > up:
+        logger.debug(f'flipping the ground normal: the fit came out inverted '
+                     f'(outliers reach {up:.4f} one way, {down:.4f} the other)')
+        basis[2] = -basis[2]
+        coefficients = -coefficients
+
     # Warp is what a plane could not have absorbed: the height field over the
     # ground, less its own best-fit plane
     gx, gy = x[mask], y[mask]
@@ -307,8 +343,10 @@ def keep_vertices_by_mask(mesh: Mesh, mask):
     keep_triangles_by_mask(mesh, tri_mask)
 
     # LUT for (vid + None,) -> new_vid
-    # Unlike other mesh properties, vid's should never be None
-    lut = np.full((len_v,), -1.)
+    # Unlike other mesh properties, vid's should never be None.
+    # Int, because take's out= below is the mesh's own index column: gathering
+    # floats into it casts across dtype kinds, which numpy 2.5 deprecates
+    lut = np.full((len_v,), -1, dtype=int)
     new_idx = np.arange(mask.nonzero()[0].shape[0], dtype=int)
     lut[mask] = new_idx
     v_map = mesh.faces[..., 0].astype(int)
@@ -501,6 +539,39 @@ def remove_connected_components_by_area(mesh: Mesh, min_area: float,
     face_cluster, areas, _ = cluster_connected_components(mesh)
     return filter_connected_components(mesh, face_cluster, areas >= min_area,
                                        areas, filter_vertices)
+
+
+def remove_connected_components_below_surface(mesh: Mesh,
+                                             surface: GroundSurface,
+                                             filter_vertices=True):
+    """Keep only the components that reach above ``surface``.
+
+    The scan bed's fiducial squares reconstruct as shallow recesses *below*
+    the bed, which ground removal cannot take: they are not inside its band,
+    they are a few tenths under it. Three measured captures each delivered one
+    real component and 27-29 of these, and no area threshold gets them: 20-22
+    per scan measured 0.51-2.84 cm^2, overlapping the real fragments the
+    0.5 cm^2 floor exists to keep, and only the remainder was speckle an area
+    filter would have caught anyway. Which side of the bed they are on
+    separates them completely: every island topped out at -0.02 while the
+    artifact reached +2.5 to +3.0, with not one of its vertices below +0.02.
+
+    The test is a component's *highest* vertex, so geometry that hangs below
+    the bed survives as long as some of it stands above, and an island's rim
+    draping down into the cut is not what condemns it. The test needs no
+    tolerance of its own: ground removal already took everything within the
+    distance threshold of the surface, so a component that survived that and
+    is still below sits a full threshold down.
+    """
+    face_cluster, areas, _ = cluster_connected_components(mesh)
+    height = surface.signed_distance(mesh.vertices)
+    # Per component, the highest vertex any of its faces reaches. Faces rather
+    # than vertices because a vertex two components share belongs to both
+    top = np.full(areas.shape, -np.inf)
+    np.maximum.at(top, face_cluster,
+                  height[mesh.faces[..., 0].astype(np.int64)].max(axis=-1))
+    return filter_connected_components(mesh, face_cluster, top > 0., areas,
+                                       filter_vertices)
 
 
 def remove_degenerate_faces(mesh: Mesh):
