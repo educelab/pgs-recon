@@ -1,32 +1,33 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <iterator>
 #include <optional>
 #include <random>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include <educelab/core/utils/Math.hpp>
 
 namespace ransac {
 template <class Value, class T> struct RANSACResult {
-  T error{educelab::INF<T>};
   T fitness{0.};
   std::vector<Value> inliers;
   T inlier_rmse{educelab::INF<T>};
-  bool success{false};
 };
 
-template <class Xs, class FitFunc, class EvalFunc, typename T = float>
+template <class Xs, class FitFunc, class EvalFunc>
 auto RANSAC(const Xs &x, const FitFunc &fit, const EvalFunc &eval,
-            std::size_t nSamples, std::size_t nIters = 1000,
+            double threshold, std::size_t nSamples, std::size_t nIters = 1000,
             const std::optional<std::mt19937::result_type> seed = std::nullopt,
-            T probability = 0.99999999) {
+            double probability = 0.99999999) {
   using ValueType = typename Xs::value_type;
   using Model = typename std::invoke_result_t<FitFunc, const Xs &>::second_type;
-  using EvalResult = std::invoke_result_t<EvalFunc, const Xs &, const Model &>;
+  using Result = RANSACResult<ValueType, double>;
 
-  EvalResult bestResult;
+  Result bestResult;
   Model bestModel;
 
   // Set up rng
@@ -35,14 +36,10 @@ auto RANSAC(const Xs &x, const FitFunc &fit, const EvalFunc &eval,
     rng.seed(seed.value());
   }
 
-  // Iterate
+  // Iterate. nIters is a hard bound; breakIter is the adaptive early exit and
+  // is never allowed to exceed it.
   std::size_t breakIter{nIters};
-  for (std::size_t i = 0; i < nIters; ++i) {
-    // Break early based on fitness/rmse
-    if (i > breakIter) {
-      break;
-    }
-
+  for (std::size_t i = 0; i < nIters and i < breakIter; ++i) {
     // Randomly sample
     Xs samples;
     std::sample(std::begin(x), std::end(x), std::back_inserter(samples),
@@ -53,9 +50,22 @@ auto RANSAC(const Xs &x, const FitFunc &fit, const EvalFunc &eval,
     if (not success) {
       continue;
     }
-    auto result = eval(x, model);
-    if (not result.success) {
-      continue;
+
+    Result result;
+    double sum_error = 0.0;
+    for (const auto &ro : x) {
+      auto err = eval(ro, model);
+      if (err < threshold) {
+        sum_error += err * err;
+        result.inliers.push_back(ro);
+      }
+    }
+
+    if (!result.inliers.empty()) {
+      result.fitness = static_cast<double>(result.inliers.size()) /
+                       static_cast<double>(x.size());
+      result.inlier_rmse =
+          std::sqrt(sum_error / static_cast<double>(result.inliers.size()));
     }
 
     // Update our best models
@@ -66,28 +76,40 @@ auto RANSAC(const Xs &x, const FitFunc &fit, const EvalFunc &eval,
       bestResult = result;
       bestModel = model;
       if (result.fitness < 1.) {
-        breakIter =
-            std::min(static_cast<double>(nIters),
-                     std::log(1. - probability) /
-                         std::log(1. - std::pow(result.fitness, nSamples)));
+        // Break early based on fitness/rmse: stop once the chance of not yet
+        // having drawn an all-inlier sample has fallen below 1 - probability.
+        // The denominator underflows to zero for a small fitness and a large
+        // nSamples (fitness^nSamples < 2^-53), which makes the quotient -inf
+        // and its conversion to breakIter undefined, so test it before
+        // dividing and fall back to the hard bound when it is unusable.
+        const auto denom = std::log(1. - std::pow(result.fitness, nSamples));
+        if (std::isfinite(denom) and denom < 0.) {
+          breakIter = static_cast<std::size_t>(
+              std::min(static_cast<double>(nIters),
+                       std::log(1. - probability) / denom));
+        } else {
+          breakIter = nIters;
+        }
       } else {
         break;
       }
     } // if improved
   } // for nIters
 
-  // If we never found a usable model, report failure rather than refitting on
-  // an empty inlier set with an uninitialized model (which is undefined
-  // behavior in the fit function).
-  if (not bestResult.success or bestResult.inliers.empty()) {
-    bestResult.success = false;
-    return std::make_pair(bestModel, bestResult);
+  if (bestResult.inliers.empty()) {
+    // If we never found a usable model, report failure rather than refitting on
+    // an empty inlier set with an uninitialized model (which is undefined
+    // behavior in the fit function).
+    return std::make_pair(false, bestModel);
   }
 
-  // Finalize the best result and model
-  bestResult = eval(x, bestModel);
-  std::tie(bestResult.success, bestModel) = fit(bestResult.inliers);
-
-  return std::make_pair(bestModel, bestResult);
+  // Finalize the best model by refitting it on the whole consensus set. A refit
+  // that fails does not invalidate the consensus we already have, so keep the
+  // model the consensus set was found with rather than failing the call.
+  auto [refit, refitModel] = fit(bestResult.inliers);
+  if (refit) {
+    return std::make_pair(true, refitModel);
+  }
+  return std::make_pair(true, bestModel);
 }
 } // namespace ransac
