@@ -26,29 +26,17 @@ using namespace ransac;
 
 namespace {
 
-auto EvalTriangulate(const std::vector<pgs::RansacObservation> &x, const Vec3 &X)
-    -> RANSACResult<pgs::RansacObservation, double>
-{
-    using Result = RANSACResult<pgs::RansacObservation, double>;
-    Result result;
-    result.error = 0.;
-    constexpr double threshold = pgs::kReprojThresholdPx;
-    for (const auto &ro : x) {
-        if (ro.pt.dot(ro.pose(X)) <= 0.0) return Result{};
-        const auto err = ro.cam->residual(ro.pose(X), ro.obs).norm();
-        if (err < threshold) {
-            result.error += err * err;
-            result.inliers.push_back(ro);
-        }
-    }
-    if (!result.inliers.empty()) {
-        result.fitness = static_cast<double>(result.inliers.size()) /
-                         static_cast<double>(x.size());
-        result.inlier_rmse = std::sqrt(result.error /
-                             static_cast<double>(result.inliers.size()));
-    }
-    result.success = true;
-    return result;
+auto EvalTriangulate(const pgs::RansacObservation &ro, const Vec3 &X)
+    -> double {
+  const auto pose = ro.pose(X);
+
+  if (ro.pt.dot(pose) <= 0.0) {
+    return educelab::INF<double>;
+  }
+
+  const auto err = ro.cam->residual(pose, ro.obs).norm();
+
+  return err;
 }
 
 } // namespace
@@ -79,11 +67,12 @@ std::pair<bool, Vec3> Triangulate(const std::vector<RansacObservation> &x)
 
 std::pair<bool, Vec3> TriangulateRansac(const std::vector<RansacObservation> &x)
 {
-    constexpr std::size_t nIters = 1000;
-    constexpr std::size_t nSamples = 2;
-    constexpr std::uint_fast32_t seed = 0;
-    const auto [X, res] = RANSAC(x, Triangulate, EvalTriangulate, nSamples, nIters, seed);
-    return {res.success, X};
+  constexpr double threshold = pgs::kReprojThresholdPx;
+  constexpr std::size_t nSamples = 2;
+  constexpr std::size_t nIters = 1000;
+  constexpr std::uint_fast32_t seed = 0;
+  return RANSAC(x, Triangulate, EvalTriangulate, threshold, nSamples, nIters,
+                seed);
 }
 
 DetectionResult DetectMarkers(const cv::Mat &image,
