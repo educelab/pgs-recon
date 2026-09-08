@@ -105,7 +105,19 @@ def main():
     # different things, speckle and the bed's own fiducial recesses
     if args.drop_below_ground:
         print('Dropping components below the ground surface...')
-        print(geom.remove_connected_components_below_surface(mesh, surface))
+        # Those filters run their own vertex cleanup, a Python set over every
+        # face's indices, so leave it to them when one of them will follow
+        follows = args.filter_cc_area is not None or args.filter_cc != 0
+        inventory = geom.remove_connected_components_below_surface(
+            mesh, surface, filter_vertices=not follows)
+        print(inventory)
+        if inventory.dropped.size and not inventory.kept.size:
+            # Something has to stand above the bed. Nothing does only if the
+            # fit is upside down or was never a bed's, and unlike the filters
+            # below there is no threshold here to have stated wrongly -- so
+            # this is the fit failing, and the same policy applies to it
+            sys.exit(f'{args.input_file}: every component is below the fitted '
+                     f'ground surface')
 
     if args.filter_cc_area is not None:
         print(f'Filtering components by area '

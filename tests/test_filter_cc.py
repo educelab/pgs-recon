@@ -30,10 +30,10 @@ APPS = ('pgs_recon.apps.filter_small_components',
         'pgs_recon.apps.remove_ground_plane')
 
 
-def drive(name, argv):
+def drive(name, argv, geom=None):
     """Run an app's ``main()`` over stubs; return the geometry calls it made"""
     module = importlib.import_module(name)
-    geom = mock.MagicMock()
+    geom = mock.MagicMock() if geom is None else geom
     # remove_ground_plane prints the fit before it filters
     geom.segment_ground_surface.return_value = (mock.MagicMock(warp=0., rms=0.),
                                                 [0])
@@ -162,6 +162,46 @@ class TestDropBelowGround(unittest.TestCase):
                 drive('pgs_recon.apps.filter_small_components',
                       ['--drop-below-ground'])
         self.assertEqual(e.exception.code, 2)
+
+    def test_it_leaves_the_vertex_cleanup_to_the_filter_that_follows(self):
+        """That cleanup is a Python set over every face index; once is enough.
+
+        It has to happen, though: ground removal strands the vertices whose
+        faces went with the ground. So the flag delegates it only when one of
+        the ``--filter-cc*`` filters will run after it, and does it itself
+        when none will.
+        """
+        for argv, cleanup in ((['--drop-below-ground'], False),
+                              (['--drop-below-ground',
+                                '--filter-cc-area', '0.5'], False),
+                              (['--drop-below-ground',
+                                '--filter-cc', 'none'], True)):
+            with self.subTest(argv=argv):
+                geom = drive(GROUND_PLANE, argv)
+                self.assertEqual(
+                    geom.remove_connected_components_below_surface
+                    .call_args.kwargs, {'filter_vertices': cleanup})
+
+    def test_it_refuses_to_write_a_mesh_with_nothing_above_the_bed(self):
+        """Something has to stand above the bed.
+
+        Nothing does only if the fit came out upside down or was never a
+        bed's, and unlike the area filter there is no threshold here to have
+        stated wrongly -- so this is the fit failing, and the app already
+        refuses to hand on a mesh in that case rather than exit 0 with a
+        mangled one.
+        """
+        geom = mock.MagicMock()
+        geom.remove_connected_components_below_surface.return_value = \
+            mock.MagicMock(kept=mock.MagicMock(size=0),
+                           dropped=mock.MagicMock(size=27))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as e:
+                drive(GROUND_PLANE, ['--drop-below-ground'], geom)
+        self.assertIn('below the fitted ground surface', str(e.exception))
+        # And it stops there: no filtering, and nothing written
+        geom.keep_largest_connected_component.assert_not_called()
+        geom.mesh_to_wavefront.assert_not_called()
 
 
 if __name__ == '__main__':
