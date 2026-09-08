@@ -343,8 +343,10 @@ def keep_vertices_by_mask(mesh: Mesh, mask):
     keep_triangles_by_mask(mesh, tri_mask)
 
     # LUT for (vid + None,) -> new_vid
-    # Unlike other mesh properties, vid's should never be None
-    lut = np.full((len_v,), -1.)
+    # Unlike other mesh properties, vid's should never be None.
+    # Int, because take's out= below is the mesh's own index column: gathering
+    # floats into it casts across dtype kinds, which numpy 2.5 deprecates
+    lut = np.full((len_v,), -1, dtype=int)
     new_idx = np.arange(mask.nonzero()[0].shape[0], dtype=int)
     lut[mask] = new_idx
     v_map = mesh.faces[..., 0].astype(int)

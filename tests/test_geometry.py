@@ -634,5 +634,40 @@ class TestSubBedIslandsOutnumberingTheObject(unittest.TestCase):
         self.assertAlmostEqual(float(inventory.kept.sum()), 1.44, delta=0.02)
 
 
+@unittest.skipIf(MISSING, f'requires {", ".join(MISSING)}')
+class TestVertexRemap(unittest.TestCase):
+    """``keep_vertices_by_mask``'s old-vid -> new-vid lookup table.
+
+    Every ``pgs-remove-ground-plane`` run goes through here twice, once to
+    drop the ground and once to clear the vertices that leaves stranded.
+    """
+
+    def remap(self):
+        """Drop the first square, renumbering what the other two reference"""
+        from pgs_recon.utils import geometry as geom
+        mesh = build_mesh(SQUARES)
+        geom.remove_vertices_by_index(mesh, [0, 1, 2, 3])
+        return mesh
+
+    def test_it_renumbers_the_surviving_faces(self):
+        mesh = self.remap()
+        self.assertEqual(mesh.faces[..., 0].astype(int).tolist(),
+                         [[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]])
+        self.assertEqual(mesh.vertices.shape[0], 8)
+
+    def test_it_does_not_cast_across_dtype_kinds(self):
+        """The lookup table is an int one, and has to stay one.
+
+        ``take``'s ``out=`` is the mesh's int index column, so a float table
+        gathers into it across dtype kinds: exact for indices this side of
+        2**53, but deprecated in numpy 2.5 and refused by some later one --
+        which would stop ground removal outright rather than warn.
+        """
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', DeprecationWarning)
+            self.remap()
+
+
 if __name__ == '__main__':
     unittest.main()
