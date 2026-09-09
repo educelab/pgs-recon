@@ -19,16 +19,19 @@ from pgs_recon.openmvg import (compute_features, compute_matches,
 from pgs_recon.openmvs import (mvs_decimate, mvs_densify, mvs_reconstruct,
                                mvs_refine, mvs_texture)
 from pgs_recon.pgs_data import init_sfm_pgs, get_tag_option
-from pgs_recon.stages import (CONTROL_ARGS, NO_PERSIST, STAGES, StageError,
-                              StageTracker, apply_stored,
-                              clear_zeroed_budgets, drifted_stages,
-                              explicit_dests, find_manifest, load_manifest,
-                              pipeline_shape, resolve_range,
-                              revert_out_of_range, utc_now, validate_arg_map,
-                              validate_budgets, validate_search, write_manifest)
+from pgs_recon.stages import (COARSEN_FACE_TOLERANCE, COARSEN_RATIO,
+                              CONTROL_ARGS, NO_PERSIST, STAGES, StageError,
+                              StageTracker, apply_stored, clear_zeroed_budgets,
+                              coarsen_target, drifted_stages, explicit_dests,
+                              find_manifest, load_manifest, pipeline_shape,
+                              refine_flags, resolve_range, revert_out_of_range,
+                              utc_now, validate_arg_map, validate_budgets,
+                              validate_coarsen, validate_search,
+                              warn_refine_decimation, write_manifest)
 from pgs_recon.toolchain import Recorder
 from pgs_recon.utility import ToolFailed
 from pgs_recon.utils.apps import setup_logging
+from pgs_recon.utils.ply import NotAPlyHeader, face_count
 
 
 def init_sfm_generic2(scan_dir: Path, sfm_file: Path, camdb_path: Path,
@@ -296,6 +299,12 @@ def build_parser() -> configargparse.ArgumentParser:
     opts_mvs.add_argument('--mvs-refine', default=True,
                           action=argparse.BooleanOptionalAction,
                           help='Enable MVS mesh refinement step')
+    opts_mvs.add_argument('--mvs-coarsen', default=True,
+                          action=argparse.BooleanOptionalAction,
+                          help='Cut the mesh to a face budget ourselves '
+                               'before refinement, instead of letting '
+                               'RefineMesh do it. Ignored without '
+                               '--mvs-refine. See the coarsen options below.')
     opts_mvs.add_argument('--mvs-smooth', type=int, default=2,
                           help='Number of smoothing iterations after initial '
                                'surface reconstruction. 0 is disabled.')
@@ -330,7 +339,10 @@ def build_parser() -> configargparse.ArgumentParser:
     opts_mvs.add_argument('--refine-ensure-edge-size', default=None, type=int,
                           help='improve edge sizes and vertex valence before '
                                'refinement (0 - disabled, 1 - auto, 2 - force). '
-                               'Pass 0 if refine stalls in preparation.')
+                               'Left unset with the coarsen stage in the '
+                               'pipeline this is 2, because RefineMesh guards '
+                               'this pass on its own decimation and would '
+                               'skip both.')
     opts_mvs.add_argument('--refine-max-face-area', default=None, type=int,
                           help='maximum projected face area left unsubdivided '
                                'before refinement (0 - disabled)')
@@ -344,7 +356,10 @@ def build_parser() -> configargparse.ArgumentParser:
                                'applied to the input surface before mesh '
                                'refinement (0 - auto, 1 - disabled). This is '
                                'RefineMesh\'s own face-fraction decimation, '
-                               'not the decimate stage\'s deviation budget.')
+                               'not the decimate stage\'s deviation budget. '
+                               'Left unset with the coarsen stage in the '
+                               'pipeline this is 1, that stage having already '
+                               'done the reduction.')
     opts_mvs.add_argument('--mask-value', type=int, default=0,
                           help='Label value in the image mask to ignore during '
                                'mesh densification. Set to a value < 0 to '
@@ -353,6 +368,35 @@ def build_parser() -> configargparse.ArgumentParser:
                           help='Limits the maximum size (edge length) of the'
                                'output texture image. If set to 0 (default), '
                                'the edge length is unbounded.')
+
+    opts_coarsen = parser.add_argument_group(
+        'coarsen options',
+        'Cut the mesh to a face count before refinement, which is preparation '
+        'RefineMesh would otherwise do itself by a single-threaded CGAL pass '
+        'whose cost at a fixed target varies 135x between meshes and has '
+        'killed refine jobs on the wall clock. Coarsening is a face budget, '
+        'not a deviation budget: the target is a count and there is nothing '
+        'to search for, which is what makes it cheap. It is not the decimate '
+        'stage -- that one states a geometric bound and shrinks the '
+        'deliverable; this one only feeds refine, whose edge-size pass '
+        're-reduces the result by a further 3.6-4.1x before iteration zero.')
+    opts_coarsen.add_argument('--coarsen-ratio', type=float,
+                              default=COARSEN_RATIO, metavar='f',
+                              help='Fraction of the input mesh\'s faces to '
+                                   'keep. The default reproduces the target '
+                                   'RefineMesh computed for itself on every '
+                                   'run it was measured against -- 6 x the '
+                                   'median projected face area (1.0 px2, '
+                                   'densify reconstructing at one face per '
+                                   'pixel) over --refine-max-face-area\'s '
+                                   'default of 16. Change it if the rig or '
+                                   '--densify-resolution-level changed '
+                                   '(default: %(default)s)')
+    opts_coarsen.add_argument('--coarsen-max-faces', type=int, default=None,
+                              metavar='n',
+                              help='Face target as an absolute count, '
+                                   'overriding --coarsen-ratio. For matching '
+                                   'a previous run\'s refine input exactly.')
 
     opts_decimate = parser.add_argument_group(
         'decimate options',
@@ -519,6 +563,7 @@ def _main():
     # below can act on, and it should cost an exit rather than a reconstruction.
     validate_budgets(args)
     validate_search(args)
+    validate_coarsen(args)
 
     # Enable flags declare the pipeline shape; --from/--to select a window of it
     shape = pipeline_shape(args)
@@ -544,6 +589,22 @@ def _main():
             f'scene\'s units, and this reconstruction has no autoscale stage, '
             f'so those units are arbitrary. Add --mvg-autoscale to work in '
             f'physical units, or use --decimate-max-faces instead.')
+
+    # Both ways refine's mesh preparation goes wrong without a word in its
+    # own log: the CGAL pass left on over an already-coarsened mesh, and
+    # --decimate 1 taking the edge-size pass down with it.
+    warn_refine_decimation(args, shape, logger)
+
+    # Only when it was asked for: coarsening is on by default, so warning on
+    # the default would fire at everyone who legitimately runs --no-mvs-refine
+    # about a flag they never touched.
+    if ('mvs_coarsen' in explicit and args.mvs_coarsen
+            and not args.mvs_refine):
+        logger.warning('--mvs-coarsen has no effect without --mvs-refine: '
+                       'coarsening only prepares a mesh for refinement. To '
+                       'shrink the deliverable, state a budget for the '
+                       'decimate stage (--decimate-max-error / '
+                       '--decimate-max-faces).')
 
     # Only the PGS importer reads capture indices. Warn rather than fail, so a
     # shared config carrying PGS settings still drives a generic run.
@@ -861,18 +922,99 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
                     inputs={'scene': scene_in, 'cloud': cloud_in},
                     outputs={'mesh': mesh})
 
+    # RefineMesh's own mesh preparation, done here instead (ADR 0009). A face
+    # budget and no deviation budget on purpose: the target is a count, so the
+    # search collapses to one round -- which is what makes this affordable
+    # against the CGAL pass it replaces. Measurement cannot be turned off in
+    # `pgs-decimate`, so it is turned down to its floor; nothing consumes a
+    # deviation here, refine reworking this surface anyway.
+    if tracker.begin('coarsen'):
+        logger.info('Coarsening mesh for refinement')
+        mesh_in = tracker.require('mesh')
+        coarse = layout.coarsen_mesh(output)
+        try:
+            input_faces = face_count(mesh_in)
+        except (OSError, NotAPlyHeader) as e:
+            raise StageError(
+                f'cannot read a face count out of {mesh_in}, so there is no '
+                f'input size to take --coarsen-ratio of. '
+                f'{str(e).rstrip(".")}. Give --coarsen-max-faces to state the '
+                f'target outright, or --no-mvs-coarsen to leave the reduction '
+                f'to RefineMesh.') from e
+        if input_faces < 1:
+            # A header that says `element face 0` is a point cloud, not a mesh.
+            # Nothing downstream can use it, and every ratio of it is zero.
+            raise StageError(
+                f'{mesh_in} declares no faces, so there is no surface to '
+                f'coarsen and nothing for refine to work on. The stage '
+                f'that produced it did not write a mesh; re-run it before '
+                f'this one.')
+        target = coarsen_target(input_faces, args)
+        logger.info(f'Coarsening {input_faces} faces to {target} '
+                    f'({target / input_faces:.4f} of the input)')
+        # A target at or above the input is met before the first collapse, so
+        # the mesh is written through unchanged -- and refine is still told to
+        # skip its own preparation, leaving nothing to reduce it at all.
+        # `--coarsen-ratio` cannot reach here, but a face count can, and the
+        # drift check below cannot see it: achieved == target, so the miss is 0.
+        if target >= input_faces:
+            logger.warning(
+                f'coarsen was asked for {target} faces from an input of '
+                f'{input_faces}, so pgs-decimate will write the mesh through '
+                f'unchanged. Refine skips its own preparation either way, so '
+                f'nothing will reduce this mesh -- lower --coarsen-max-faces, '
+                f'or pass --no-mvs-coarsen to leave the reduction to '
+                f'RefineMesh.')
+        mvs_decimate(mesh_in, output=coarse, max_faces=target, max_error=0,
+                     samples_per_face=1, curvature_samples=False)
+        # The drift canary. `Decimated faces N (100%, ...)` in RefineMesh's log
+        # was the only place this ratio was ever observable, and disabling
+        # that pass removes it -- so the numbers go in the stage record, where
+        # a rig change or a --densify-resolution-level change shows up as the
+        # achieved ratio moving off COARSEN_RATIO instead of passing unnoticed.
+        facts = {'input_faces': input_faces, 'target_faces': target}
+        try:
+            achieved = face_count(coarse)
+        except (OSError, NotAPlyHeader) as e:
+            # The mesh is written and refine can use it; only the canary is
+            # lost, so this is a warning rather than a failed stage.
+            logger.warning(f'coarsen wrote {coarse} but its face count could '
+                           f'not be read back, so the run records no achieved '
+                           f'count: {e}')
+        else:
+            facts['achieved_faces'] = achieved
+            facts['achieved_ratio'] = round(achieved / input_faces, 6)
+            if abs(achieved - target) > COARSEN_FACE_TOLERANCE * target:
+                logger.warning(
+                    f'coarsen asked for {target} faces and got '
+                    f'{achieved}, off by more than '
+                    f'{COARSEN_FACE_TOLERANCE:.0%}. A face budget usually '
+                    f'lands within a fraction of a percent, so the '
+                    f'collapse stalled -- non-manifold geometry under '
+                    f'--preserve-topology is the likely reason -- and refine '
+                    f'gets a mesh that is not the size --coarsen-ratio asked '
+                    f'for.')
+        tracker.end('coarsen', inputs={'mesh': mesh_in},
+                    outputs={'mesh': coarse}, facts=facts)
+
     if tracker.begin('refine'):
         logger.info('Refining mesh')
         scene_in = tracker.require('scene')
         mesh_in = tracker.require('mesh')
         refined = layout.refine_mesh(output)
+        # Coupled to the shape, not to the caller: with coarsen in the pipeline
+        # RefineMesh must be told to skip its own decimation *and* to force the
+        # edge-size pass, one without the other being a silent 3.9x regression
+        # in refine input. Explicit --refine-decimate/--refine-ensure-edge-size
+        # still win.
+        prep = refine_flags(args, tracker.shape)
         mvs_refine(scene_in, mesh=mesh_in, output=refined,
-                   decimate=args.refine_decimate,
+                   decimate=prep['refine_decimate'],
                    resolution_level=args.refine_resolution_level,
                    min_resolution=args.refine_min_resolution,
                    scales=args.refine_scales,
                    scale_step=args.refine_scale_step,
-                   ensure_edge_size=args.refine_ensure_edge_size,
+                   ensure_edge_size=prep['refine_ensure_edge_size'],
                    max_face_area=args.refine_max_face_area)
         tracker.end('refine', inputs={'scene': scene_in, 'mesh': mesh_in},
                     outputs={'mesh': refined})

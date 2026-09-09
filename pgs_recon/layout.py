@@ -220,6 +220,18 @@ def reconstruct_mesh(output: Path) -> Path:
     return mvs_dir(output) / 'reconstruct_mesh.ply'
 
 
+def coarsen_mesh(output: Path) -> Path:
+    """The mesh cut to a face budget before refinement.
+
+    ``RefineMesh``'s own pre-refinement pass by another name: we do that
+    reduction with ``pgs-decimate`` and tell the binary to skip its CGAL one,
+    because CGAL's cost at a fixed target varies 135x across meshes and has
+    killed refine jobs on the wall clock (`ADR 0009
+    <../docs/adr/0009-coarsen-before-refine.md>`_).
+    """
+    return mvs_dir(output) / 'coarsen_mesh.ply'
+
+
 def refine_mesh(output: Path) -> Path:
     """The refined mesh.
 

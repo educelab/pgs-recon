@@ -51,6 +51,7 @@ recon/
     undistorted_images/
     densify.mvs  densify.ply      # --mvs-densify: scene + the dense cloud
     reconstruct_mesh.ply
+    coarsen_mesh.ply              # --mvs-coarsen (on by default): refine's input
     refine_mesh.ply               # --mvs-refine (on by default)
     my-object.obj                 # the deliverable, + .mtl and texture image
 ```
@@ -81,11 +82,11 @@ pgs-recon -i images/ -o recon/ --name my-object
 ```
 
 `--from`/`--to` (both inclusive) restrict a run to a contiguous window of the
-fourteen pipeline stages:
+fifteen pipeline stages:
 
 ```
 import  features  matches  filter  sfm  robust  autoscale  colorize
-convert  densify  reconstruct  refine  decimate  texture
+convert  densify  reconstruct  coarsen  refine  decimate  texture
 ```
 
 This lets one reconstruction be split across several cluster jobs, each sized
@@ -95,7 +96,7 @@ wastes a large allocation on hours of cheap SfM:
 
 ```shell
 J1=$(sbatch --mem=32G  --parsable job1.sh)   # pgs-recon -i $IMGS -o $OUT -n obj --to reconstruct
-J2=$(sbatch --mem=256G --parsable --dependency=afterok:$J1 job2.sh)  # pgs-recon -o $OUT --from refine --to refine
+J2=$(sbatch --mem=256G --parsable --dependency=afterok:$J1 job2.sh)  # pgs-recon -o $OUT --from coarsen --to refine
         sbatch --mem=64G           --dependency=afterok:$J2 job3.sh  # pgs-recon -o $OUT --from texture
 ```
 
@@ -140,50 +141,84 @@ mesh/refine/texture to a high-memory node, chained with `afterok`. Notes:
 * `--no-mvs` is deprecated: use `--to colorize` for an SfM-only run. The old flag
   still works (it sets `--to colorize` and warns) but will be removed.
 
-### When mesh refinement takes too long
-`refine` is the pipeline's slowest and hungriest stage, and it can run out of two
-different resources. Out of **memory** is the familiar one, and resuming the same
-command picks up where the kill happened.
+### Preparing the mesh for refinement
+`refine` is the pipeline's slowest and hungriest stage, and it used to run out of
+two different resources. Out of **memory** is the familiar one, and resuming the
+same command picks up where the kill happened.
 
-Out of **wall clock** looks different: no progress in the log, one core pinned at
-100%, and memory flat. That is mesh *preparation* rather than the optimization.
-Before refining anything, `RefineMesh` decimates the input mesh by CGAL
-Garland-Heckbert edge collapse, which is single-threaded and silent at the default
-verbosity. Across 84 cluster runs that pass took a median of 7 minutes, 28 minutes
-at p90, and 8.6 hours at worst. Adding cores or memory does not help.
+Out of **wall clock** looked different: no progress in the log, one core pinned
+at 100%, and memory flat. That was mesh *preparation* rather than the
+optimization. Before refining anything, `RefineMesh` decimates its input by CGAL
+Garland-Heckbert edge collapse, single-threaded and silent — and at an identical
+decimation target its cost varies **135x** between meshes, having killed
+seventeen refine jobs on the wall clock. Adding cores or memory does not help,
+and input size does not predict it: the largest mesh in the measured corpus
+finished in a fifth of the time the worst one took, at 79% of its size.
 
-Its cost does not track the size of the input mesh; it tracks how far the mesh is
-decimated, and by default OpenMVS chooses that for you. `--refine-decimate` is
-left unset, so OpenMVS's own default of `0` (auto) applies: it derives a target
-from the mesh's *projected* face area in your images and floors it at a tenth of
-the input — so unlucky geometry collapses 90% of the faces. Pinning the factor
-bounds the pass:
+**The `coarsen` stage does that reduction instead**, driving our `pgs-decimate`
+to the same face target with a 1.7x spread, and tells `RefineMesh` to skip both
+of its own preparation passes. It is on by default whenever `refine` is, and it
+is where the wall clock went: on one measured fragment, 37m07s of preparation
+became 7m40s. See [ADR 0009](docs/adr/0009-coarsen-before-refine.md) for the
+measurements.
+
+The target is `--coarsen-ratio` of the input mesh's face count, defaulting to
+`0.375` — which is the target `RefineMesh` computed for itself on every one of
+119 measured runs, being `6 x` the median projected face area (1.0 px², densify
+reconstructing at one face per pixel) over `--refine-max-face-area`'s default of
+16. It is a property of the rig and of `--densify-resolution-level`, not of the
+fragment, which is why it never varied. Change it if either of those changed:
 
 ```shell
-# Decimate to a fixed half rather than letting auto choose
-pgs-recon -o recon/ --from refine --refine-decimate 0.5
+# Coarsen harder, at the cost of a coarser refine input
+pgs-recon -o recon/ --from coarsen --coarsen-ratio 0.2
 
-# Or skip decimation, which at the default --refine-ensure-edge-size
-# also skips the edge-size pass that follows it
-pgs-recon -o recon/ --from refine --refine-decimate 1
+# Or state the count outright, to match a previous run's refine input exactly
+pgs-recon -o recon/ --from coarsen --coarsen-max-faces 9761507
+
+# Or hand the reduction back to RefineMesh
+pgs-recon -o recon/ --from reconstruct --no-mvs-coarsen
 ```
 
-`--refine-decimate` is `RefineMesh`'s own face-fraction decimation and has
-nothing to do with the `decimate` stage below, which is ours and states a
-geometric bound. It was called `--decimation-factor` before 2.0.
+Refinement never sees the coarsened mesh as such: `RefineMesh`'s `EnsureEdgeSize`
+pass immediately re-reduces it by a further 3.6–4.1x, and *that* is what
+iteration zero starts from. So the stage states a face budget rather than a
+deviation budget — a geometric guarantee about a surface refinement is about to
+move guarantees nothing about what comes out. The guarantee belongs on the
+deliverable, which is the `decimate` stage below.
 
-`--refine-ensure-edge-size 0` skips only that following edge-size and vertex-valence
-pass, which is the cheaper of the two. `--refine-max-face-area` is *not* a remedy
-here: it is the denominator auto-decimation divides by, so raising it decimates
-harder. It bounds subdivision, not decimation.
+The stage's record carries the face counts, because `RefineMesh`'s
+`Decimated faces N (100%, …)` line was the only place that 0.375 ratio was ever
+observable and disabling the pass removes it:
 
-All of these change the refined mesh, so they are options rather than defaults. If
-refine is not worth its cost on a given dataset, `--no-mvs-refine` drops it from the
-pipeline shape and textures the reconstructed mesh directly.
+```shell
+jq '.stages.coarsen | {input_faces, target_faces, achieved_faces, achieved_ratio}' \
+   recon/pgs-recon.json
+```
 
-### Coarsening the deliverable
+`--refine-decimate` and `--refine-ensure-edge-size` are `RefineMesh`'s own
+preparation flags and stay available as explicit overrides. Left unset with
+`coarsen` in the pipeline they are `1` and `2` — *both*, and not by coincidence:
+the binary guards the edge-size pass on its own decimation
+(`SceneRefine.cpp:556`), so `--decimate 1` alone skips that pass too and refine
+subdivides the mesh as given, measured at 3.9x the intended refine input with
+nothing in its log to say so. Both flags follow the stage rather than the
+caller for exactly that reason, and overriding one warns rather than silently
+changing what the other means.
+
+`--refine-decimate` is a face *fraction* and has nothing to do with the
+`decimate` stage below, which states a geometric bound. It was called
+`--decimation-factor` before 2.0. `--refine-max-face-area` is *not* a remedy for
+a slow refine: it is the denominator auto-decimation divides by, so raising it
+decimates harder, and it bounds subdivision rather than this.
+
+If refine is not worth its cost on a given dataset, `--no-mvs-refine` drops it
+from the pipeline shape — and `coarsen` with it, that stage only ever preparing a
+mesh for refinement — and textures the reconstructed mesh directly.
+
+### Decimating the deliverable
 A finished mesh is millions of faces, which is more than the geometry justifies
-and more than MeshLab opens comfortably. The `decimate` stage coarsens it as far
+and more than MeshLab opens comfortably. The `decimate` stage reduces it as far
 as a **deviation budget** allows — the largest distance any point of either
 surface may end up from the other — and *measures* what it achieved rather than
 predicting it, so the guarantee is a number you can check rather than a flag you

@@ -129,11 +129,13 @@ Reducing a mesh's face count by edge collapse, *ours*: the `decimate` stage and
 allows. Error-bounded, not count-bounded, which is what distinguishes it from
 the three incidental decimations OpenMVS performs on its own
 (`ReconstructMesh --decimate`/`--target-face-num`, `RefineMesh --decimate`, whose
-CGAL edge collapse this exists as an alternative to, and
+CGAL edge collapse the **coarsen** stage replaces, and
 `TextureMesh --decimate`) — all of which take a face fraction or a face count and
 state no geometric bound. Say which one is meant; unqualified, "decimation" is
-ours ([ADR 0008](./docs/adr/0008-error-bounded-decimation.md)).
-_Avoid_: simplification, reduction, coarsening, LOD
+ours ([ADR 0008](./docs/adr/0008-error-bounded-decimation.md)). Distinct from
+**coarsening**, which is also ours and also drives `pgs-decimate`, but states a
+face count rather than a bound.
+_Avoid_: simplification, reduction, LOD
 
 **Deviation budget**:
 The geometric error a **decimation** guarantees: the largest distance, in
@@ -147,8 +149,22 @@ which is exposed only as an escape hatch. In physical units only when
 **autoscale** ran.
 _Avoid_: error threshold, tolerance, epsilon, quadric error
 
+**Coarsening**:
+Cutting a mesh to a **face count** before refinement: the `coarsen` stage, which
+drives `pgs-decimate` to a target count with no deviation budget, so the search
+collapses to a single round. It is `RefineMesh`'s own pre-refinement CGAL pass
+moved out of the binary, that pass's cost at a fixed target varying 135× between
+meshes and having killed seventeen refine jobs on the wall clock
+([ADR 0009](./docs/adr/0009-coarsen-before-refine.md)). Distinct from
+**decimation**, which states a **deviation budget** and shrinks the
+*deliverable*: coarsening only feeds refine, whose `EnsureEdgeSize` pass
+re-reduces the result by a further 3.6–4.1× before iteration zero, so no
+geometric guarantee about it would survive. Says nothing about what refinement
+then does to the surface.
+_Avoid_: predecimation, pre-decimation, simplification
+
 **Stage**:
-One of the fourteen steps of a reconstruction, each exactly one binary
+One of the fifteen steps of a reconstruction, each exactly one binary
 invocation, named for what it does rather than for the binary (`densify`,
 `refine`, `texture`). A stage is the unit a run can start and stop at, and the
 unit whose completion is recorded.

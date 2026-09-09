@@ -7,7 +7,12 @@ path -- neither OpenMVS nor ``pgs-decimate`` ever chooses a name the caller did
 not give it.
 
 Four of the five wrap an OpenMVS binary; :func:`mvs_decimate` wraps our own
-``pgs-decimate``, sitting beside the stage it serves as ``mvg_autoscale`` does.
+``pgs-decimate``, sitting beside the stages it serves as ``mvg_autoscale``
+does. Two stages reach it: ``coarsen`` drives it to a face count on the way into
+refine (`ADR 0009 <../docs/adr/0009-coarsen-before-refine.md>`_) and
+``decimate`` to a measured deviation budget on the way out (`ADR 0008
+<../docs/adr/0008-error-bounded-decimation.md>`_). Which target is which is
+``run_pipeline``'s business, not the wrapper's.
 Everything below about ``-w`` and the archive type is the OpenMVS four's.
 
 Each function mirrors its binary's **own** options group in the binary's own
@@ -214,10 +219,15 @@ def mvs_refine(scene: Path, mesh: Path, output: Path,
 
     The memory hog of the pipeline, and the reason a run can be split into jobs
     (`ADR 0004 <../docs/adr/0004-staged-resumable-runs.md>`_). At the pinned
-    revision it is also the wall-clock hog, in mesh *preparation* rather than in
-    the optimization: before refining, it decimates by CGAL Garland-Heckbert edge
-    collapse, single-threaded and silent (``Mesh.cpp:925-945``, called from
-    ``SceneRefine.cpp:508-535``).
+    revision it was also the wall-clock hog, in mesh *preparation* rather
+    than in the optimization: before refining, it decimates by CGAL
+    Garland-Heckbert edge collapse, single-threaded and silent
+    (``Mesh.cpp:925-945``, called from ``SceneRefine.cpp:508-535``), at a cost
+    that varies 135x between meshes at an identical target. The ``coarsen``
+    stage does that reduction with ``pgs-decimate`` instead and turns this pass
+    off (`ADR 0009 <../docs/adr/0009-coarsen-before-refine.md>`_), which is why
+    ``run_pipeline`` passes ``decimate=1`` and ``ensure_edge_size=2`` whenever
+    that stage is in the shape.
 
     That pass costs by how far it decimates, not by input size. ``decimate=None``
     leaves OpenMVS at ``0`` (auto), whose target is the mesh's median *projected*
@@ -225,8 +235,10 @@ def mvs_refine(scene: Path, mesh: Path, output: Path,
     ``max_face_area`` is the denominator: raising it decimates harder, and it
     bounds subdivision rather than this. ``decimate=1`` skips decimation, and with
     ``ensure_edge_size=1`` skips the edge-size pass after it too, via the same
-    guard (``SceneRefine.cpp:556``); ``ensure_edge_size=0`` skips only that pass.
-    None of these are defaults here, because each changes the mesh that comes out.
+    guard (``SceneRefine.cpp:556``) -- which is why the two travel together;
+    ``ensure_edge_size=0`` skips only that pass. None of these are defaults
+    here, because each changes the mesh that comes out: the coupling is
+    ``run_pipeline``'s, being an invariant of ours rather than the binary's.
     """
     work = work_dir(scene, mesh, output)
     command = [
@@ -273,8 +285,15 @@ def mvs_decimate(mesh: Path, output: Path, report: Path = None,
     At least one of ``max_error``, ``max_faces`` and ``quadric_error`` is
     required; ``prefer`` decides when the first two disagree. ``quadric_error``
     is vcglib's unitless threshold and turns the search off -- an escape hatch.
-    ``quadric_seed`` is the same unitless threshold but only *starts* the
-    search, so the measured guarantee survives it.
+    So does a ``max_faces`` given alone, there being nothing to search for
+    when the target is a count: that is the ``coarsen`` stage's call, which is
+    why it is affordable where the CGAL pass it replaces was not. The
+    measurement runs on every round regardless of the target, so it cannot be
+    switched off, only turned down (``samples_per_face``,
+    ``curvature_samples``).
+
+    ``quadric_seed`` is the same unitless threshold as ``quadric_error`` but
+    only *starts* the search, so the measured guarantee survives it.
 
     ``min_gain`` prices what is left to win: a round costs ten samples per face
     of the candidate, so a bracket that can still remove only a few percent of

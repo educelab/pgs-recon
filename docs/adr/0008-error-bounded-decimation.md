@@ -35,7 +35,9 @@ ours:
 - `ReconstructMesh --decimate` / `--target-face-num`,
 - `RefineMesh --decimate`, which is a CGAL Garland–Heckbert edge-collapse pass on
   the way *in* (`Mesh.cpp:925-945`, from `SceneRefine.cpp:508-535`), single
-  threaded and silent, and the pipeline's wall-clock hog at the pinned revision,
+  threaded and silent, and the pipeline's wall-clock hog at the pinned revision
+  — since taken over by the `coarsen` stage, which drives `pgs-decimate` to a
+  face count instead ([ADR 0009](./0009-coarsen-before-refine.md)),
 - `TextureMesh --decimate`.
 
 All three are face-fraction or face-count targets. None of them states a

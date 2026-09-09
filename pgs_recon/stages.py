@@ -1,8 +1,9 @@
 """Stage bookkeeping for staged, resumable ``pgs-recon`` runs.
 
-A reconstruction is fourteen stages, one per binary invocation. ``--from``/``--to``
-select a contiguous window of them so a single output directory can be filled in
-by several cluster jobs, each sized for the stages it runs. State lives in the
+A reconstruction is fifteen stages, one per binary invocation.
+``--from``/``--to`` select a contiguous window of them so a single output
+directory can be filled in by several cluster jobs, each sized for the stages it
+runs. State lives in the
 run's manifest (:func:`layout.manifest`) under a ``stages`` key.
 
 The motivation is ``RefineMesh``: it is a memory hog with no reliable a-priori
@@ -66,8 +67,8 @@ except ImportError:  # pragma: no cover
 # Stage order matches main()'s existing call order, one entry per binary.
 STAGES: Tuple[str, ...] = (
     'import', 'features', 'matches', 'filter', 'sfm', 'robust', 'autoscale',
-    'colorize', 'convert', 'densify', 'reconstruct', 'refine', 'decimate',
-    'texture',
+    'colorize', 'convert', 'densify', 'reconstruct', 'coarsen', 'refine',
+    'decimate', 'texture',
 )
 
 
@@ -116,6 +117,7 @@ STAGE_IO: Dict[str, IO] = {
     'convert':     IO(('sfm',),                                 (),              ('scene',)),
     'densify':     IO(('scene',),                               (),              ('scene', 'cloud')),
     'reconstruct': IO(('scene',),                               ('cloud',),      ('mesh',)),
+    'coarsen':     IO(('mesh',),                                (),              ('mesh',)),
     'refine':      IO(('scene', 'mesh'),                        (),              ('mesh',)),
     'decimate':    IO(('mesh',),                                (),              ('mesh', 'deviation')),
     'texture':     IO(('scene', 'mesh'),                        (),              ('mesh',)),
@@ -141,6 +143,7 @@ STAGE_ARGS: Dict[str, Tuple[str, ...]] = {
     'reconstruct': ('free_space_support', 'mvs_smooth',
                     'mvs_remove_spurious', 'mvs_remove_spikes',
                     'mvs_close_holes'),
+    'coarsen': ('mvs_coarsen', 'coarsen_ratio', 'coarsen_max_faces'),
     'refine': ('mvs_refine', 'refine_decimate', 'refine_resolution_level',
                'refine_min_resolution', 'refine_scales', 'refine_scale_step',
                'refine_ensure_edge_size', 'refine_max_face_area'),
@@ -245,6 +248,150 @@ def validate_arg_map(parser) -> None:
         raise StageError('BUG: ' + '; '.join(problems))
 
 
+#: The face fraction ``coarsen`` cuts its input mesh to, and the number
+#: ``RefineMesh``'s own pre-refinement decimation resolved to on every one of
+#: the 119 runs the stage was measured against. OpenMVS computes that target as
+#: ``MAXF(0.1, fMedianArea / fMaxArea)``, which is
+#: ``6 x <median projected face area> / --max-face-area``; densify reconstructs
+#: at one face per pixel, so the median area is 1.0 px^2 and the default
+#: ``--max-face-area`` is 16 -- hence ``6 * 1.0 / 16``. It is a property of the
+#: rig and of ``densify_resolution_level``, not of the fragment, which is why
+#: it was invariant. ``--coarsen-ratio`` overrides it per run; a rig or
+#: resolution change is what would call for that (ADR 0009).
+COARSEN_RATIO = 6.0 * 1.0 / 16.0
+
+#: How far the achieved face count may sit from the target before ``coarsen``
+#: says so. A face budget with no deviation budget collapses to one round and
+#: lands within a fraction of a percent; a miss this size means the collapse
+#: stalled -- non-manifold geometry under ``--preserve-topology``, most likely --
+#: and the mesh handed to refine is not the size the ratio asked for.
+COARSEN_FACE_TOLERANCE = 0.05
+
+#: What ``coarsen`` in the shape means for ``RefineMesh``: skip the CGAL
+#: decimation (``--decimate 1``) and *force* the edge-size pass
+#: (``--ensure-edge-size 2``). Both, or neither -- ``SceneRefine.cpp:556`` guards
+#: the edge-size pass with ``(nEnsureEdgeSize == 1 && !bNoDecimation) ||
+#: nEnsureEdgeSize > 1``, so ``--decimate 1`` at the default ``1`` skips that
+#: pass too and refine subdivides straight from the coarsened mesh -- measured at
+#: 3.9x the intended refine input, with no log line to flag it.
+REFINE_WITH_COARSEN = {'refine_decimate': 1.0, 'refine_ensure_edge_size': 2}
+
+
+def coarsen_target(input_faces: int, args) -> int:
+    """The face count ``coarsen`` asks ``pgs-decimate`` for.
+
+    ``--coarsen-max-faces`` if given, else :data:`COARSEN_RATIO` (or
+    ``--coarsen-ratio``) times the input mesh's face count. Floored at one face,
+    because a target of zero reaches ``pgs-decimate`` as *no target given* and
+    the stage would write its input through unchanged -- which is the one
+    outcome that silently reinstates the cost this stage exists to remove.
+    """
+    if getattr(args, 'coarsen_max_faces', None):
+        return int(args.coarsen_max_faces)
+    ratio = getattr(args, 'coarsen_ratio', None)
+    if ratio is None:
+        ratio = COARSEN_RATIO
+    return max(1, round(input_faces * ratio))
+
+
+def validate_coarsen(args) -> None:
+    """Refuse a coarsen target that has no reading, before anything is paid for.
+
+    The same move :func:`validate_budgets` makes for the decimate stage, and for
+    the same reason: ``pgs-decimate`` reads a non-positive ``--max-faces`` as
+    *not given*, so a mistyped target does not reach the binary as one. Here it
+    would instead be silently floored to a single face by
+    :func:`coarsen_target`, and the stage would hand refine a mesh with no
+    surface left -- after densify and reconstruct have already run.
+
+    A ratio of 1 or more is refused for the opposite reason: it asks for at
+    least as many faces as the input has, which ``pgs-decimate`` satisfies by
+    writing the input through unchanged. Refine is still told to skip its own
+    preparation, so *nothing* reduces the mesh -- strictly worse than
+    ``--no-mvs-coarsen``, which at least leaves the CGAL pass on. A count above
+    the input's is the same no-op and is caught in ``run_pipeline``, the face
+    count not being knowable until the mesh exists.
+
+    ``--coarsen-max-faces 0`` is not a mistake and not an off switch -- the
+    stage has ``--no-mvs-coarsen`` for that -- it is the documented way to say
+    "no count, use the ratio", which is what an unset flag means anyway.
+    """
+    ratio = getattr(args, 'coarsen_ratio', None)
+    if ratio is not None and not 0 < ratio < 1:
+        raise StageError(f'--coarsen-ratio={ratio} is not a fraction of the '
+                         f'input mesh to keep. It must be greater than 0 and '
+                         f'less than 1; at 1 the stage reduces nothing and '
+                         f'refine still skips its own preparation, so pass '
+                         f'--no-mvs-coarsen to leave the reduction to '
+                         f'RefineMesh instead.')
+    faces = getattr(args, 'coarsen_max_faces', None)
+    if faces is not None and faces < 0:
+        raise StageError(f'--coarsen-max-faces={faces} is negative. A face '
+                         f'budget is a count; pass 0 (or omit it) to let '
+                         f'--coarsen-ratio set the target, or --no-mvs-coarsen '
+                         f'to drop the stage.')
+
+
+def refine_flags(args, shape: Sequence[str]) -> Dict[str, object]:
+    """``mvs_refine``'s decimation flags, coupled to the shape.
+
+    With ``coarsen`` in the shape the pair in :data:`REFINE_WITH_COARSEN` is what
+    refine must run, so it follows from the stage being present rather than from
+    an operator remembering two flags. An explicitly given ``--refine-decimate``
+    or ``--refine-ensure-edge-size`` still wins -- both default to ``None``,
+    which is already this module's "not given", so no separate record of
+    explicitness is needed.
+
+    Derived here rather than folded into ``args`` because these are a function
+    of the shape, and a shape can change between the jobs sharing an output
+    directory: persisted, a ``1`` recorded by a run *with* ``coarsen`` would be
+    inherited by a later ``--no-mvs-coarsen`` run and skip both passes. Refine's
+    own dirtiness needs no help from the recorded flags either way -- coarsen
+    entering or leaving the shape rebinds refine's ``mesh`` input, which is
+    already an "inputs changed".
+    """
+    flags = {d: getattr(args, d, None) for d in REFINE_WITH_COARSEN}
+    if 'coarsen' not in shape:
+        return flags
+    return {d: REFINE_WITH_COARSEN[d] if v is None else v
+            for d, v in flags.items()}
+
+
+def warn_refine_decimation(args, shape: Sequence[str], logger) -> None:
+    """Warn on the two ways refine's mesh preparation goes silently wrong.
+
+    Both are silent in ``RefineMesh``'s own log, which is why they are checked
+    here: one costs the wall clock this stage exists to bound, the other hands
+    refine a mesh 3.9x the intended size and says nothing.
+    """
+    if 'refine' not in shape:
+        return
+    flags = refine_flags(args, shape)
+    decimate = flags['refine_decimate']
+    edge_size = flags['refine_ensure_edge_size']
+    if 'coarsen' in shape and decimate != REFINE_WITH_COARSEN['refine_decimate']:
+        logger.warning(
+            f'--refine-decimate={decimate} leaves RefineMesh\'s own CGAL '
+            f'decimation on, and the coarsen stage has already cut this mesh '
+            f'to a face budget. That pass is what coarsen exists to replace: '
+            f'it is single-threaded, silent, and its cost at a fixed target '
+            f'varies 135x between meshes. Pass --refine-decimate 1, or drop '
+            f'the coarsen stage with --no-mvs-coarsen.')
+    # The guard in SceneRefine.cpp:556: `--decimate 1` sets bNoDecimation, so
+    # only `nEnsureEdgeSize > 1` still runs the pass -- the default 1 skips it,
+    # and so does an explicit 0. That 0 is the reachable one: it is what the
+    # pre-coarsen README recommended for a stalling refine, it persists in the
+    # manifest, and `apply_stored` feeds it back into a later run that never
+    # asked for it.
+    if decimate == 1 and (edge_size is None or edge_size <= 1):
+        logger.warning(
+            '--refine-decimate=1 disables RefineMesh\'s edge-size pass too, '
+            'not only its decimation, because the binary guards the one on the '
+            'other. Refine will subdivide the mesh as given -- measured at '
+            '3.9x the intended refine input, with nothing in its log to say '
+            'so. Pass --refine-ensure-edge-size 2 to force that pass.')
+
+
 # The decimate stage's targets, which are also its enable flag (ADR 0008 s6).
 # Named once: `pipeline_shape` reads them for the gate and
 # `clear_zeroed_budgets` for the disable path, and the two have to agree.
@@ -341,6 +488,13 @@ def pipeline_shape(args) -> Tuple[str, ...]:
         shape.append('densify')
     shape.append('reconstruct')
     if args.mvs_refine:
+        # Only ever before a refine: cutting the mesh to a face budget is
+        # ``RefineMesh``'s own mesh preparation moved out of the binary, so with
+        # no refine in the shape there is nothing to prepare for and ``decimate``
+        # -- which states a geometric bound rather than a count -- is the stage
+        # that coarsens a deliverable.
+        if args.mvs_coarsen:
+            shape.append('coarsen')
         shape.append('refine')
     # Truthiness, not ``is not None``: the target *is* the enable flag, so 0 is
     # how a resumed run turns the stage off -- omitting it would inherit the
@@ -864,15 +1018,25 @@ class StageTracker:
         return True
 
     def end(self, stage: str, inputs: Dict[str, Path] = None,
-            outputs: Dict[str, Path] = None) -> None:
+            outputs: Dict[str, Path] = None,
+            facts: Dict[str, object] = None) -> None:
         """Mark ``stage`` complete and bind its outputs.
 
         ``inputs`` is what the planner compares against next time, so record
         every role the stage actually consumed, under the same role names
         ``STAGE_IO`` uses. ``outputs`` must list only roles the stage really
         produced -- not one it passed through untouched.
+
+        ``facts`` are numbers about what the stage did, merged into its record
+        for a later reader. Nothing in the planner looks at them: they are not
+        arguments, so changing one cannot make a stage dirty, and they are not
+        paths, so they bind nothing. ``coarsen`` is what they exist for -- the
+        face target it chose and the count it achieved were only ever observable
+        in ``RefineMesh``'s log, which disabling that pass removes (ADR 0009).
         """
         record = self.stages.setdefault(stage, {})
+        if facts:
+            record.update(facts)
         record['status'] = 'complete'
         record['finished'] = utc_now()
         record['elapsed_s'] = round(time.monotonic() - self._t0, 1)

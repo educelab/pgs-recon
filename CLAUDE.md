@@ -111,10 +111,23 @@ tracker:
    then **colorize** (`mvg_colorize_sfm`).
 5. **MVG→MVS conversion** (`mvg_to_mvs`).
 6. MVS stages in `pgs_recon/openmvs.py`: optional `mvs_densify` → `mvs_reconstruct`
-   → optional `mvs_refine` → optional `mvs_decimate` → `mvs_texture`. Final
-   textured mesh lands at `<output>/mvs/<name>.obj` (or `.ply`).
+   → optional `coarsen` → optional `mvs_refine` → optional `mvs_decimate` →
+   `mvs_texture`. Final textured mesh lands at `<output>/mvs/<name>.obj` (or
+   `.ply`).
 
 `--no-mvs` stops after the SfM/colorize stage.
+
+The `coarsen` stage drives `mvs_decimate` too, to a *face count* rather than a
+deviation budget, replacing `RefineMesh`'s own single-threaded CGAL
+pre-refinement pass — whose cost at a fixed target varies 135x between meshes
+(ADR 0009). It is on by default whenever `refine` is, and being in the shape is
+what makes `refine` run `--decimate 1 --ensure-edge-size 2`: the binary guards
+the edge-size pass on its own decimation, so one flag without the other is a
+silent 3.9x regression in refine input. That coupling is derived in
+`stages.refine_flags` rather than folded into `args`, so it cannot be inherited
+across a shape change. `stages.COARSEN_RATIO` is the target fraction (0.375,
+derived as `6 * 1.0 px^2 / 16`) and `utils.ply.face_count` reads the input's
+count out of its PLY header — the only place the pipeline reads a mesh file.
 
 `mvs_decimate` is the one MVS-side wrapper that is not OpenMVS: it drives our
 `pgs-decimate`, which coarsens a mesh as far as a *measured* deviation budget
@@ -144,7 +157,9 @@ them and no `metadata` argument:
   `atexit` hook writes the manifest to `<output>/pgs-recon.json`; the effective
   config goes to `<output>/*_recon_config.txt`. `stages.find_manifest()` is what
   reads it, falling back to a pre-2.0 `metadata.json` (ADR 0007) — the one
-  filesystem check in `stages.py`.
+  filesystem check in `stages.py`. `tracker.end(facts=...)` records numbers
+  about what a stage did (`coarsen`'s face counts) beside its paths; nothing in
+  the planner reads them, so a fact cannot make a stage dirty.
 
 When adding a stage: add a `layout` function for its output, add the wrapper as a
 pure argv builder ending in `run()`, and wire it in `run_pipeline` between
@@ -184,6 +199,8 @@ the wrappers stay a complete library surface over each binary's flags.
 - `pgs_recon/utils/` — shared helpers: `apps.py` (logging setup), `geometry.py`,
   `quality.py`, `charuco.py`, `wavefront.py`, `educelab.py` (ChArUco/board detection),
   `recon_dir.py` (locate a finished run's SfM/mesh from its manifest),
+  `ply.py` (one function: the face count in a PLY header, which is how `coarsen`
+  sizes its target),
   `sfm_json.py` (OpenMVG SfM_Data JSON surgery: cereal polymorphic registration,
   extrinsic frame transforms), `images.py` (`read_srgb`, the **single** reader
   behind `pgs-convert`, `pgs-calibrate` and `pgs-retexture`). OpenMVG reads
