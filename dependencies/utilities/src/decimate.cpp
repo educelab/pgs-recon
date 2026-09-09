@@ -172,6 +172,14 @@ void writeReport(const fs::path& path, const dec::Report& report)
     << "  },\n"
     << "  \"search\": {\n"
     << "    \"rounds\": " << report.attempts.size() << ",\n"
+    << "    \"max_rounds\": " << report.search.maxRounds << ",\n"
+    << "    \"quadric_seed\": " << numberOrNull(report.search.quadricSeed)
+    << ",\n"
+    << "    \"min_gain\": " << number(report.search.minGain) << ",\n"
+    // Null for the single-round modes, which have no search to end.
+    << "    \"stop\": "
+    << (report.stop.empty() ? std::string{"null"} : quote(report.stop))
+    << ",\n"
     << "    \"quadric_error\": " << number(report.quadricError) << ",\n"
     << "    \"bound\": " << quote(dec::to_string(report.bound)) << ",\n"
     << "    \"attempts\": [\n";
@@ -216,6 +224,9 @@ void printSummary(const dec::Report& report)
   std::cout << "Bound: " << dec::to_string(report.bound) << " after "
             << report.attempts.size() << " round(s); quadric error "
             << report.quadricError << "\n";
+  if (not report.stop.empty()) {
+    std::cout << "Search ended: " << report.stop << "\n";
+  }
   std::cout << report.reason << "\n";
 }
 
@@ -251,6 +262,8 @@ auto main(int argc, char* argv[]) -> int
   po::options_description search("search and measurement options");
   search.add_options()
     ("max-rounds", po::value<int>()->default_value(10), "cap on decimate-and-measure rounds")
+    ("quadric-seed", po::value<double>()->default_value(0.0), "first quadric threshold the deviation search probes. UNITLESS, like --quadric-error, but unlike it this only starts the search rather than replacing it, so the measured guarantee still holds. 0 derives a seed from the budget and the mesh. Worth setting only when you already know the regime: the derived seed is a guess and can be orders high, though the first round is also the cheapest one")
+    ("min-gain", po::value<double>()->default_value(0.10, "0.1"), "stop once the search can still remove less than this share of the current result's faces. The deviation is a staircase in the threshold, so a budget falling between two steps can never be approached to within a few percent and only the face count is left to improve; this prices that. In [0, 1); 0 searches to --max-rounds")
     ("samples-per-face", po::value<int>()->default_value(10), "uniform samples per face of the coarser mesh, per direction, floored at a million. The measurement is most of the wall clock; lower it to trade sharpness for time")
     ("curvature-samples", po::value<bool>()->default_value(true), "add a curvature-weighted pass at half the uniform count, biasing samples toward where deviation is largest. Counts toward the max only")
     ("report", po::value<std::string>(), "write a JSON report of what was done to this path")
@@ -343,9 +356,25 @@ auto main(int argc, char* argv[]) -> int
     return BAD_ARG;
   }
 
-  const auto maxRounds = args["max-rounds"].as<int>();
-  if (maxRounds < 1) {
+  dec::Search searchOpts;
+  searchOpts.maxRounds = args["max-rounds"].as<int>();
+  searchOpts.quadricSeed = args["quadric-seed"].as<double>();
+  searchOpts.minGain = args["min-gain"].as<double>();
+  if (searchOpts.maxRounds < 1) {
     std::cerr << "ERROR: --max-rounds must be at least 1\n";
+    return BAD_ARG;
+  }
+  if (searchOpts.quadricSeed < 0.0) {
+    std::cerr << "ERROR: --quadric-seed cannot be negative; pass 0 to derive "
+                 "one from the budget and the mesh\n";
+    return BAD_ARG;
+  }
+  // One would stop before the first round could win anything, which is not a
+  // setting anybody means; zero is the documented way to search to the cap.
+  if (searchOpts.minGain < 0.0 or searchOpts.minGain >= 1.0) {
+    std::cerr << "ERROR: --min-gain must be in [0, 1); it is the share of the "
+                 "result's faces still worth another full measurement, and 0 "
+                 "searches to --max-rounds\n";
     return BAD_ARG;
   }
 
@@ -354,6 +383,7 @@ auto main(int argc, char* argv[]) -> int
   report.output = fs::absolute(args["output-mesh"].as<std::string>());
   report.targets = wanted;
   report.geometry = geo;
+  report.search = searchOpts;
 
   const auto started = std::chrono::steady_clock::now();
 
@@ -399,7 +429,7 @@ auto main(int argc, char* argv[]) -> int
     bar = std::make_unique<ProgressBar>(
         option::BarWidth{50}, option::Start{" ["},
         option::ForegroundColor{Color::unspecified},
-        option::MaxProgress{static_cast<std::size_t>(maxRounds)});
+        option::MaxProgress{static_cast<std::size_t>(searchOpts.maxRounds)});
   }
   const auto onRound = [&bar](const dec::Attempt& round) {
     if (bar) {
@@ -414,7 +444,7 @@ auto main(int argc, char* argv[]) -> int
   };
 
   try {
-    dec::coarsen(mesh, report.output, wanted, geo, measurement, maxRounds,
+    dec::coarsen(mesh, report.output, wanted, geo, measurement, searchOpts,
                  report, onRound);
   } catch (const std::exception& e) {
     std::cerr << "ERROR: " << e.what() << "\n";

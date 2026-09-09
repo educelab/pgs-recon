@@ -258,6 +258,7 @@ def mvs_decimate(mesh: Path, output: Path, report: Path = None,
                  preserve_topology: bool = None, normal_check: bool = None,
                  optimal_placement: bool = None,
                  quality_threshold: float = None, max_rounds: int = None,
+                 quadric_seed: float = None, min_gain: float = None,
                  samples_per_face: int = None,
                  curvature_samples: bool = None,
                  progress: bool = None) -> None:
@@ -272,6 +273,12 @@ def mvs_decimate(mesh: Path, output: Path, report: Path = None,
     At least one of ``max_error``, ``max_faces`` and ``quadric_error`` is
     required; ``prefer`` decides when the first two disagree. ``quadric_error``
     is vcglib's unitless threshold and turns the search off -- an escape hatch.
+    ``quadric_seed`` is the same unitless threshold but only *starts* the
+    search, so the measured guarantee survives it.
+
+    ``min_gain`` prices what is left to win: a round costs ten samples per face
+    of the candidate, so a bracket that can still remove only a few percent of
+    them is not worth another one.
 
     Paths go absolute and no working directory is derived. The output still
     belongs in ``mvs/``, but that is ``run_pipeline``'s business, because
@@ -289,6 +296,7 @@ def mvs_decimate(mesh: Path, output: Path, report: Path = None,
         preserve_topology=preserve_topology, normal_check=normal_check,
         optimal_placement=optimal_placement,
         quality_threshold=quality_threshold, max_rounds=max_rounds,
+        quadric_seed=quadric_seed, min_gain=min_gain,
         samples_per_face=samples_per_face,
         curvature_samples=curvature_samples, progress=progress,
     )

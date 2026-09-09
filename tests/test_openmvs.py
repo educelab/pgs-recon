@@ -88,7 +88,8 @@ SURFACES = {
         'report', 'max_error', 'max_faces', 'quadric_error', 'prefer',
         'preserve_boundary', 'preserve_topology', 'normal_check',
         'optimal_placement', 'quality_threshold', 'max_rounds',
-        'samples_per_face', 'curvature_samples', 'progress',
+        'quadric_seed', 'min_gain', 'samples_per_face',
+        'curvature_samples', 'progress',
     ),
 }
 

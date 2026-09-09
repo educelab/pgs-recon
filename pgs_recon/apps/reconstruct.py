@@ -23,9 +23,9 @@ from pgs_recon.stages import (CONTROL_ARGS, NO_PERSIST, STAGES, StageError,
                               StageTracker, apply_stored,
                               clear_zeroed_budgets, drifted_stages,
                               explicit_dests, find_manifest, load_manifest,
-                              pipeline_shape, resolve_range, validate_budgets,
+                              pipeline_shape, resolve_range,
                               revert_out_of_range, utc_now, validate_arg_map,
-                              write_manifest)
+                              validate_budgets, validate_search, write_manifest)
 from pgs_recon.toolchain import Recorder
 from pgs_recon.utility import ToolFailed
 from pgs_recon.utils.apps import setup_logging
@@ -384,6 +384,43 @@ def build_parser() -> configargparse.ArgumentParser:
                                help='Face budget, for a scan that was never '
                                     'scaled to physical units. Turns the stage '
                                     'on and off exactly as above.')
+    opts_decimate.add_argument('--decimate-quadric-seed', type=float,
+                               default=None, metavar='q',
+                               help='First threshold the search probes, in '
+                                    'vcglib\'s unitless quadric error. Only '
+                                    'seeds the search -- unlike the binary\'s '
+                                    '--quadric-error it does not replace it, '
+                                    'so the deviation is still measured and '
+                                    'still bounds the result. The derived seed '
+                                    'is a guess and is routinely orders of '
+                                    'magnitude high, which costs the rounds '
+                                    'spent descending from it. Where to get a '
+                                    'good one: the "quadric_error" under '
+                                    '"search" in this same object\'s previous '
+                                    'decimate_report.json. That is the '
+                                    'threshold the last run converged at, and '
+                                    'the object\'s own history is the only '
+                                    'predictor there is -- the right threshold '
+                                    'varies a couple of hundredfold between '
+                                    'objects but only a few fold between reruns '
+                                    'of one, so do not carry a seed from a '
+                                    'different object. Does not turn the stage '
+                                    'on by itself.')
+    opts_decimate.add_argument('--decimate-min-gain', type=float, default=None,
+                               metavar='share',
+                               help='Stop the search once it can still remove '
+                                    'less than this share of the current '
+                                    'result\'s faces. Measured deviation is a '
+                                    'staircase in the threshold, so a budget '
+                                    'landing between two steps can never be '
+                                    'approached to within a few percent and '
+                                    'only the face count is left to improve; '
+                                    'each further round then pays a full '
+                                    'measurement of a multi-million-face mesh '
+                                    'for a few percent of it. In [0, 1); 0 '
+                                    'searches to the round cap. Coarseness is '
+                                    'all this can cost you -- never the '
+                                    'deviation bound (default: 0.1)')
     opts_decimate.add_argument('--decimate-prefer', choices=['error', 'faces'],
                                default='error', type=str.lower,
                                help='Which budget wins when the two disagree. '
@@ -481,6 +518,7 @@ def _main():
     # Before the shape is read off them: a negative budget is a mistake no layer
     # below can act on, and it should cost an exit rather than a reconstruction.
     validate_budgets(args)
+    validate_search(args)
 
     # Enable flags declare the pipeline shape; --from/--to select a window of it
     shape = pipeline_shape(args)
@@ -850,6 +888,8 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
         mvs_decimate(mesh_in, output=decimated, report=report,
                      max_error=args.decimate_max_error,
                      max_faces=args.decimate_max_faces,
+                     quadric_seed=args.decimate_quadric_seed,
+                     min_gain=args.decimate_min_gain,
                      prefer=args.decimate_prefer)
         tracker.end('decimate', inputs={'mesh': mesh_in},
                     outputs={'mesh': decimated, 'deviation': report})

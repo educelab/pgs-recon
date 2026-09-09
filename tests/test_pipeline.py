@@ -301,6 +301,28 @@ class TestDecimateStage(PipelineCase):
         # No face budget was given, so the binary's own default governs.
         self.assertIsNone(flag(argv, '--max-faces'))
 
+    def test_the_search_levers_reach_argv(self):
+        self.run_recon(self.tmp / 'recon', '--decimate-max-error', '0.2',
+                       '--decimate-quadric-seed', '1e-7',
+                       '--decimate-min-gain', '0.2')
+        argv = self.argv_for('pgs-decimate')
+        self.assertEqual('1e-07', flag(argv, '--quadric-seed'))
+        self.assertEqual('0.2', flag(argv, '--min-gain'))
+
+    def test_the_search_levers_are_absent_unasked(self):
+        """A run that says nothing about the search gets the binary's own
+        defaults, not a spelling of them from here."""
+        self.run_recon(self.tmp / 'recon', '--decimate-max-error', '0.2')
+        argv = self.argv_for('pgs-decimate')
+        self.assertIsNone(flag(argv, '--quadric-seed'))
+        self.assertIsNone(flag(argv, '--min-gain'))
+
+    def test_a_seed_alone_does_not_turn_the_stage_on(self):
+        """It tunes the search; the budgets are still the only enable flag
+        (ADR 0008 s6), and a seed with nothing to search for is a no-op."""
+        self.run_recon(self.tmp / 'recon', '--decimate-quadric-seed', '1e-7')
+        self.assertNotIn('pgs-decimate', self.ran())
+
     def test_texture_is_handed_the_coarse_mesh(self):
         """The deliverable is born coarse: texturing faces that are about to be
         thrown away is the thing this ordering exists to avoid."""

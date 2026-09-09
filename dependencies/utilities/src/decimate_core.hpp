@@ -125,6 +125,24 @@ struct Measurement {
 /// ask for only a handful of samples is still measured against something.
 constexpr std::size_t kMinSamples = 1000000;
 
+/**
+ * @brief How the deviation search is run: where it starts, how long it may go,
+ *        and when what is left to win stops being worth a round.
+ *
+ * A round is priced by its *candidate's* face count -- the measurement samples
+ * the coarser of the two meshes -- so a probe that barely collapses anything is
+ * the most expensive one available. Both levers here exist because of that.
+ */
+struct Search {
+  int maxRounds{10};
+  /// First threshold to probe. Zero derives one from the budget and the mesh;
+  /// a value only *seeds* the search, unlike `Targets::quadricError`.
+  double quadricSeed{0.0};
+  /// Stop once the bracket can still remove less than this share of the best
+  /// feasible result's faces. Zero searches to the round cap.
+  double minGain{0.10};
+};
+
 /// The targets, as given. Zero or negative means "not given".
 struct Targets {
   double maxError{0.0};
@@ -186,6 +204,7 @@ struct Report {
   std::filesystem::path output;
   Targets targets;
   Geometry geometry;
+  Search search;
 
   std::size_t inputVertices{0};
   std::size_t inputFaces{0};
@@ -210,6 +229,8 @@ struct Report {
   /// True when the input carried texture coordinates, which were dropped.
   bool uvsDropped{false};
 
+  /// Why the search loop ended, for a caller reading the round bill.
+  std::string stop;
   std::string reason;
   double elapsedSeconds{0.0};
 };
@@ -280,8 +301,8 @@ using RoundCallback = std::function<void(const Attempt&)>;
  */
 void coarsen(Mesh& mesh, const std::filesystem::path& output,
              const Targets& targets, const Geometry& geometry,
-             const Measurement& measurement, int maxRounds, Report& report,
-             const RoundCallback& onRound = nullptr);
+             const Measurement& measurement, const Search& search,
+             Report& report, const RoundCallback& onRound = nullptr);
 
 /**
  * @brief Decimate a generated sphere and check the measurement against the

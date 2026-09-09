@@ -43,9 +43,46 @@ constexpr double kMaxExponent = 2.0;
 /// the floor above can otherwise ask for twenty orders of magnitude.
 constexpr double kMaxStep = 1e6;
 
-/// How far past its fitted baseline an extrapolation may reach, in log space,
-/// so the trust region grows with the strides taken and never outruns them.
-constexpr double kBaselineReach = 1.0;
+/// Prior slope of *face count* against threshold in log-log space, and the
+/// bounds a measured one is held inside. Unlike the deviation, this curve does
+/// not step: every threshold collapses a slightly different set of edges, so
+/// two rounds fit it usefully even when they measured the same deviation. That
+/// is what makes it the right thing to steer an unbracketed descent by.
+constexpr double kAssumedFaceExponent = 0.4;
+constexpr double kMinFaceExponent = 0.1;
+constexpr double kMaxFaceExponent = 2.0;
+
+/// Widest factor by which one unbracketed probe may grow the candidate, and so
+/// the round's price: a round costs ten samples per face of the *coarser* mesh,
+/// which is always the candidate. Growing geometrically bounds the whole
+/// descent at `g/(g-1)` of its last round and the overshoot past the answer at
+/// `g`, while still crossing decades of threshold in a handful of rounds.
+constexpr double kCostGrowth = 2.5;
+
+/// Two rounds whose measured deviations differ by less than this, in log space,
+/// are on one tread of the staircase. The fit cannot see the riser from there:
+/// it reads the flat as "nearly arrived" and asks for inches, which land on the
+/// same tread and ask for inches again. A repeated deviation is therefore not a
+/// datum but the absence of one, and the stride has to come from elsewhere.
+constexpr double kPlateauTol = 0.01;
+
+/// Largest share of the input a probe may be predicted to leave standing. A
+/// candidate that is the input in all but name is the most expensive round on
+/// offer and the least informative: it brackets, which a probe a decade coarser
+/// would also have done for a fraction of the price.
+///
+/// This is a bias against a first-choice probe and emphatically **not** a wall.
+/// A descent that reaches it asymptotes into it, buying a full measurement per
+/// round to move a percent, which is the very failure the trust region it
+/// replaced was retired for. `kMinUsefulGrowth` is what stops that.
+constexpr double kMaxCandidateShare = 0.9;
+
+/// Least growth that makes an unbracketed probe worth buying. Below it the cost
+/// model can only offer a re-measurement of the round just finished, and the
+/// question left -- whether anything below is feasible at all -- is settled by
+/// one probe at the bottom of the range instead. That probe is at most the whole
+/// input, which by then is barely more than the crawling one would have cost.
+constexpr double kMinUsefulGrowth = 1.25;
 
 /// How far a bracketed probe is held off the bracket's ends, a probe landing on
 /// one being a re-measurement. A fixed factor: a share of a log-width that can
@@ -330,7 +367,7 @@ auto measure(Mesh& original, Mesh& decimated, const Measurement& measurement)
 
 void coarsen(Mesh& mesh, const fs::path& output, const Targets& targets,
              const Geometry& geometry, const Measurement& measurement,
-             int maxRounds, Report& report, const RoundCallback& onRound)
+             const Search& search, Report& report, const RoundCallback& onRound)
 {
   vcg::tri::UpdateBounding<Mesh>::Box(mesh);
   report.inputVertices = static_cast<std::size_t>(mesh.vn);
@@ -410,32 +447,46 @@ void coarsen(Mesh& mesh, const fs::path& output, const Targets& targets,
     // The deviation budget is the target and the threshold is the search
     // variable: seed, then let each measurement aim the next probe.
     searched = true;
-    const double area = meanFaceArea(mesh);
-    double seed = kSeedScale * targets.maxError * targets.maxError * area;
+    double seed = search.quadricSeed;
     if (not(seed > 0.0)) {
-      // Every face zero-area: the bounding box is the only scale left.
-      const double diag = mesh.bbox.Diag();
-      seed = kSeedScale * targets.maxError * targets.maxError * diag * diag;
+      const double area = meanFaceArea(mesh);
+      seed = kSeedScale * targets.maxError * targets.maxError * area;
+      if (not(seed > 0.0)) {
+        // Every face zero-area: the bounding box is the only scale left.
+        const double diag = mesh.bbox.Diag();
+        seed = kSeedScale * targets.maxError * targets.maxError * diag * diag;
+      }
     }
 
     double feasibleAt = 0.0;    // largest threshold known to be within budget
     double infeasibleAt = 0.0;  // smallest threshold known to be over it
-    // The last two rounds, which are the two points the fit below runs through.
+    // The candidate at that infeasible end. Faces fall as the threshold rises
+    // and the answer is inside the bracket, so this is a hard floor on the
+    // coarsest feasible mesh any further round can find.
+    std::size_t infeasibleFaces = 0;
+    // The last two rounds, which are the two points the fits below run through.
     double lastThr = 0.0;
     double lastDev = 0.0;
+    double lastFaces = 0.0;
     double prevThr = 0.0;
     double prevDev = 0.0;
+    double prevFaces = 0.0;
+    // Which way the descent is pointing: over budget means go cheaper still.
+    bool lastFeasible = false;
 
     auto record = [&](double thr, const Attempt& r) {
       prevThr = lastThr;
       prevDev = lastDev;
+      prevFaces = lastFaces;
       lastThr = thr;
       lastDev = r.deviation;
+      lastFaces = static_cast<double>(r.faces);
+      lastFeasible = r.feasible;
       if (r.feasible) {
         feasibleAt = std::max(feasibleAt, thr);
-      } else {
-        infeasibleAt =
-            (infeasibleAt == 0.0) ? thr : std::min(infeasibleAt, thr);
+      } else if (infeasibleAt == 0.0 or thr < infeasibleAt) {
+        infeasibleAt = thr;
+        infeasibleFaces = r.faces;
       }
     };
 
@@ -455,34 +506,119 @@ void coarsen(Mesh& mesh, const fs::path& output, const Targets& targets,
       return std::clamp(p, kMinExponent, kMaxExponent);
     };
 
+    /// The same slope for the face count, as a positive number: faces fall as
+    /// the threshold rises. This curve is the one that stays informative on the
+    /// staircase -- two rounds that measured one deviation still collapsed
+    /// different numbers of edges -- which is why the descent is steered by it.
+    auto faceExponent = [&]() {
+      if (not(prevThr > 0.0) or not(prevFaces > 0.0) or not(lastFaces > 0.0)
+          or prevThr == lastThr) {
+        return kAssumedFaceExponent;
+      }
+      const double k =
+          -std::log(lastFaces / prevFaces) / std::log(lastThr / prevThr);
+      if (not std::isfinite(k) or not(k > 0.0)) {
+        return kAssumedFaceExponent;
+      }
+      return std::clamp(k, kMinFaceExponent, kMaxFaceExponent);
+    };
+
+    /// The coarsest candidate an unbracketed probe may buy, in faces: it may
+    /// not grow the last one by more than `kCostGrowth`, nor leave more than
+    /// `kMaxCandidateShare` of the input standing.
+    auto affordableFaces = [&](bool capGrowth) {
+      double cap = kMaxCandidateShare * static_cast<double>(report.inputFaces);
+      if (capGrowth) {
+        cap = std::min(cap, kCostGrowth * lastFaces);
+      }
+      return cap;
+    };
+
+    /// The threshold the face-count fit puts a given candidate size at.
+    auto thresholdFor = [&](double faces) {
+      return lastThr * std::pow(lastFaces / faces, 1.0 / faceExponent());
+    };
+
     /// The threshold the fitted curve puts a deviation of `aim` at: a secant
-    /// step along the power law, confined to the bracket once there is one
-    /// (regula falsi), bisecting when the fit points at an end and would stall.
-    auto nextProbe = [&](double aim) {
+    /// step along the power law, held off the candidates it cannot afford while
+    /// the answer is unbracketed, and confined to the bracket -- regula falsi,
+    /// bisecting when the fit points at an end -- once one exists.
+    auto nextProbe = [&](double aim, bool costAware) {
+      // Two rounds that measured one deviation are on one tread of the
+      // staircase, which means the last stride moved nothing and the fit is
+      // reading a flat. It is the absence of a datum, not a datum, and both
+      // branches below need to know: bracketed or not, the stride has to come
+      // from somewhere other than the fit.
+      const bool plateau =
+          prevDev > 0.0 and lastDev > 0.0
+          and std::abs(std::log(lastDev / prevDev)) < kPlateauTol;
       double next = lastThr;
       if (not(lastDev > 0.0)) {
         // No deviation at all: nothing was collapsed, so there is no curve
         // through it. Grow.
         next = lastThr * kMaxStep;
       } else {
-        double step = std::pow(aim / lastDev, 1.0 / exponent());
+        const double step = std::pow(aim / lastDev, 1.0 / exponent());
         if (std::isfinite(step) and step > 0.0) {
-          if (prevThr > 0.0 and prevThr != lastThr) {
-            // Hold the step inside the trust region the two fitted rounds
-            // earned; a degenerate fit otherwise walks off the bottom.
-            const double reach = std::pow(
-                std::max(prevThr / lastThr, lastThr / prevThr), kBaselineReach);
-            step = std::clamp(step, 1.0 / reach, reach);
-          }
           next = lastThr * std::clamp(step, 1.0 / kMaxStep, kMaxStep);
         }
       }
       if (feasibleAt > 0.0 and infeasibleAt > 0.0) {
-        // A fit pointing at an end has nothing left to interpolate, so bisect.
+        // Bracketed: both ends are measured, so the bracket already bounds
+        // both the answer and the price, and a trust region on top of it is
+        // redundant.
+        //
+        // Bisect when the fit has nothing to offer. That is the case a fit
+        // pointing outside the bracket makes obvious -- there is nothing left
+        // to interpolate -- but the *plateau* is the same case wearing a
+        // disguise, and it is the one that costs runs. A flat fit points
+        // comfortably **inside** the bracket, a few percent along, so regula
+        // falsi accepts it and re-measures the same tread; on `PHerc0006Cr05`
+        // that read 0.101311 three rounds running, crawled the threshold by
+        // 0.903 a round, and was still crawling when the scheduler killed it.
+        // Regula falsi degenerating into a crawl is the classic failure of the
+        // method and bisection is the classic answer: it closes the bracket
+        // geometrically whatever the fit believes.
         const double lo = std::min(feasibleAt, infeasibleAt) * kEndpointMargin;
         const double hi = std::max(feasibleAt, infeasibleAt) / kEndpointMargin;
-        if (not(lo < hi) or not(next > lo) or not(next < hi)) {
+        if (plateau or not(lo < hi) or not(next > lo) or not(next < hi)) {
           next = std::sqrt(feasibleAt * infeasibleAt);
+        }
+      } else {
+        // Unbracketed, and the deviation fit is all there is. What the descent
+        // is held to is therefore price rather than log-distance: the candidate
+        // at the bottom of an over-long step is a pass-through, the most
+        // expensive mesh there is to measure and the least informative, and a
+        // probe that lands over budget brackets just as well for a fraction of
+        // it. Unlike a trust region built from two thresholds, a bound on price
+        // does not shrink to nothing as the probes converge.
+        const double cap = affordableFaces(costAware);
+        if (not lastFeasible and lastFaces > 0.0
+            and cap < kMinUsefulGrowth * lastFaces) {
+          // The share is in reach and every probe the cost model would still
+          // allow is a re-measurement of the round just finished. Whether
+          // *anything* below is feasible is the only question left, and one
+          // probe at the bottom answers it: either it collapses nothing and is
+          // still over budget, which ends the search with the right reason, or
+          // it is feasible and there is a bracket to interpolate inside.
+          next = lastThr / kMaxStep;
+        } else if (lastFaces > 0.0 and cap > lastFaces) {
+          const double floorThr = thresholdFor(cap);
+          if (plateau and not lastFeasible) {
+            // Descending on one tread. The fit is measuring the flat and will
+            // creep along it a few percent at a time -- rounds that each buy a
+            // full measurement and re-read the same number -- so take the whole
+            // stride the cost model can afford instead of the fit's inches.
+            next = floorThr;
+          } else {
+            next = std::max(next, floorThr);
+          }
+        }
+        if (plateau and lastFeasible and prevThr > 0.0) {
+          // Climbing back toward the budget on one tread, where going coarser
+          // only makes the next round cheaper. Nothing to price, so double the
+          // stride that just failed to move the deviation.
+          next = std::max(next, lastThr * std::pow(lastThr / prevThr, 2.0));
         }
       }
       return next;
@@ -512,22 +648,64 @@ void coarsen(Mesh& mesh, const fs::path& output, const Targets& targets,
       return not(lo < hi);
     };
 
+    /// What another round could still win, as a share of the best feasible
+    /// result's faces -- and an upper bound on it, not an estimate, because the
+    /// candidate at the infeasible end is coarser than any feasible mesh left
+    /// to find. One is returned while there is no bracket, since nothing is
+    /// then known to be forgone.
+    auto remainingGain = [&]() {
+      if (not haveBest or infeasibleFaces == 0 or best.faces == 0) {
+        return 1.0;
+      }
+      if (infeasibleFaces >= best.faces) {
+        return 0.0;
+      }
+      return static_cast<double>(best.faces - infeasibleFaces)
+             / static_cast<double>(best.faces);
+    };
+
     double probe = seed;
     auto round = attempt(probe, true);
     record(probe, round);
     hitFloor = atFloor(round);
 
-    while (rounds < maxRounds and not hitFloor and not exhausted()) {
+    while (rounds < search.maxRounds and not hitFloor and not exhausted()) {
       if (haveBest and best.deviation >= kCloseEnough * targets.maxError) {
+        report.stop = "the result came within a few percent of the budget";
+        break;
+      }
+      // The deviation cannot always get there. It is a staircase in the
+      // threshold, so a budget landing in a gap between two steps leaves the
+      // test above unreachable by construction, and the search then pays full
+      // price per round for whatever face count is left to win. What is left is
+      // bounded by the bracket, so price *that* instead: below --min-gain, a
+      // further measurement of a multi-million-face mesh buys a few percent of
+      // it. Stopping here forgoes coarseness, never the bound.
+      if (search.minGain > 0.0 and remainingGain() < search.minGain) {
+        report.stop =
+            "the bracket had less than --min-gain of the faces left to win";
         break;
       }
       // Last round with nothing feasible yet: aim inside the budget, since
-      // landing just over delivers nothing at all.
-      const bool lastChance = rounds == maxRounds - 1 and feasibleAt == 0.0;
-      probe = nextProbe(targets.maxError * (lastChance ? kSafetyAim : 1.0));
+      // landing just over delivers nothing at all. The cost model stands aside
+      // for it -- a mesh is worth more than the round that bought it -- bar the
+      // guard against buying a pass-through, which would deliver nothing either.
+      const bool lastChance =
+          rounds == search.maxRounds - 1 and feasibleAt == 0.0;
+      probe = nextProbe(targets.maxError * (lastChance ? kSafetyAim : 1.0),
+                        not lastChance);
       round = attempt(probe, true);
       record(probe, round);
       hitFloor = atFloor(round);
+    }
+    if (report.stop.empty()) {
+      if (hitFloor) {
+        report.stop = "no threshold collapses anything inside the budget";
+      } else if (exhausted()) {
+        report.stop = "the bracket closed on a single threshold";
+      } else {
+        report.stop = "the round cap was reached";
+      }
     }
     // Which target the result is up against: the face cap only if the collapse
     // stopped there rather than at the budget.
