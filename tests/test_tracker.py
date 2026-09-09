@@ -103,6 +103,13 @@ def fake_run(tracker, args) -> None:
         tracker.end('reconstruct', inputs={'scene': scene_in, 'cloud': cloud},
                     outputs={'mesh': layout.reconstruct_mesh(root)})
 
+    if tracker.begin('coarsen'):
+        mesh_in = tracker.require('mesh')
+        tracker.end('coarsen', inputs={'mesh': mesh_in},
+                    outputs={'mesh': layout.coarsen_mesh(root)},
+                    facts={'input_faces': 400, 'target_faces': 150,
+                           'achieved_faces': 150, 'achieved_ratio': 0.375})
+
     if tracker.begin('refine'):
         scene_in, mesh_in = tracker.require('scene'), tracker.require('mesh')
         tracker.end('refine', inputs={'scene': scene_in, 'mesh': mesh_in},
@@ -457,8 +464,8 @@ class TestStagedJobs(TrackerCase):
                           'colorize', 'convert'], list(self.records()))
 
         job2 = self.tracker(args)
-        self.assertEqual(['densify', 'reconstruct', 'refine', 'texture'],
-                         self.runs(job2))
+        self.assertEqual(['densify', 'reconstruct', 'coarsen', 'refine',
+                          'texture'], self.runs(job2))
         self.assertEqual('skip', job2.status_of('convert'))
         fake_run(job2, args)
 
@@ -483,7 +490,7 @@ class TestStagedJobs(TrackerCase):
     def test_a_job_before_its_prerequisites_refuses_to_run(self):
         tracker = self.tracker(make_args(from_stage='refine'))
         self.assertEqual(['import', 'features', 'matches', 'filter', 'sfm',
-                          'colorize', 'convert', 'reconstruct'],
+                          'colorize', 'convert', 'reconstruct', 'coarsen'],
                          [e.split(':')[0] for e in tracker.prereq_errors()])
         self.assertFalse(self.manifest.exists())
 
@@ -504,7 +511,7 @@ class TestStagedJobs(TrackerCase):
 
         plain = make_args(mvs_densify=False)
         tracker = self.tracker(plain, explicit={'mvs_densify'})
-        self.assertEqual(['reconstruct', 'refine', 'texture'],
+        self.assertEqual(['reconstruct', 'coarsen', 'refine', 'texture'],
                          self.runs(tracker))
         self.assertEqual('inputs changed: scene', tracker.dirty['reconstruct'])
         fake_run(tracker, plain)

@@ -19,11 +19,13 @@ from argparse import Namespace
 from pathlib import Path
 
 from pgs_recon import layout
-from pgs_recon.stages import (STAGE_ARGS, STAGE_IO, STAGES, StageError,
-                              StageTracker, clear_zeroed_budgets,
-                              drifted_stages, pipeline_shape, resolve_range,
-                              revert_out_of_range, validate_budgets,
-                              validate_search)
+from pgs_recon.stages import (COARSEN_RATIO, REFINE_WITH_COARSEN, STAGE_ARGS,
+                              STAGE_IO, STAGES, StageError, StageTracker,
+                              clear_zeroed_budgets, coarsen_target,
+                              drifted_stages, pipeline_shape, refine_flags,
+                              resolve_range, revert_out_of_range,
+                              validate_budgets, validate_coarsen,
+                              validate_search, warn_refine_decimation)
 
 ROOT = Path('/recon')
 
@@ -45,8 +47,10 @@ DEFAULTS = dict(
     # mvs
     mvs_densify=False, densify_resolution_level=None, mask_value=0,
     free_space_support=False, mvs_smooth=2,
+    mvs_coarsen=True, coarsen_ratio=COARSEN_RATIO, coarsen_max_faces=None,
     mvs_refine=True, refine_decimate=None, refine_resolution_level=None,
     refine_min_resolution=None, refine_scales=3, refine_scale_step=None,
+    refine_ensure_edge_size=None,
     decimate_max_error=None, decimate_max_faces=None,
     decimate_quadric_seed=None, decimate_min_gain=None,
     decimate_prefer='error',
@@ -133,6 +137,10 @@ def build_records(args, shape=None, status='complete') -> dict:
     # reconstruct and refine hand the scene back untouched, so neither records
     # it as an output -- see STAGE_IO on pass-through roles.
     rec('reconstruct', {'scene': scene, 'cloud': cloud}, {'mesh': mesh})
+    if 'coarsen' in shape:
+        coarse = layout.coarsen_mesh(ROOT)
+        rec('coarsen', {'mesh': mesh}, {'mesh': coarse})
+        mesh = coarse
     if 'refine' in shape:
         refined = layout.refine_mesh(ROOT)
         rec('refine', {'scene': scene, 'mesh': mesh}, {'mesh': refined})
@@ -158,6 +166,9 @@ def legacy_records(args, shape=None, status='complete') -> dict:
     """
     records = build_records(args, shape, status)
     sfm, rename = 'mvg/recon_dir/sfm_data', {}
+    # coarsen postdates ADR 0006 as well as the chained names, so no pre-2.0
+    # directory has a record for it and it keeps the name it was born with.
+    rename[rel(layout.coarsen_mesh(ROOT))] = rel(layout.coarsen_mesh(ROOT))
     if 'robust' in records:
         sfm += '_structured'
         rename[rel(layout.robust_sfm(ROOT))] = sfm + '.bin'
@@ -259,6 +270,25 @@ class TestTables(unittest.TestCase):
         # new dirtiness path, not a free addition (ADR 0008).
         for stage, io in STAGE_IO.items():
             self.assertNotIn('deviation', io.needs + io.may, stage)
+
+    def test_coarsen_consumes_only_the_mesh(self):
+        # Refine's own preparation, moved out of the binary: it reads the mesh
+        # and nothing else -- no scene, no images -- so a coarsen job is the
+        # cheapest stage in the shape to size.
+        self.assertEqual(('mesh',), STAGE_IO['coarsen'].needs)
+        self.assertEqual((), STAGE_IO['coarsen'].may)
+        self.assertEqual(('mesh',), STAGE_IO['coarsen'].makes)
+
+    def test_coarsen_produces_no_deviation(self):
+        # It states a face budget, not a geometric bound, so there is no
+        # measured deviation to record -- which is the one way its IO differs
+        # from the decimate stage's (ADR 0009).
+        self.assertNotIn('deviation', STAGE_IO['coarsen'].makes)
+
+    def test_coarsen_sits_between_reconstruct_and_refine(self):
+        self.assertEqual(('reconstruct', 'coarsen', 'refine'),
+                         STAGES[STAGES.index('reconstruct'):
+                                STAGES.index('refine') + 1])
 
     def test_pass_through_roles_are_not_declared_as_produced(self):
         # mvs_reconstruct/mvs_refine return their input scene unchanged;
@@ -397,7 +427,8 @@ class TestPlanning(unittest.TestCase):
     def test_rerun_forces_the_range_only(self):
         args = make_args(from_stage='reconstruct', rerun=True)
         tracker = make_tracker(args, build_records(args))
-        self.assertEqual(['reconstruct', 'refine', 'texture'], runs(tracker))
+        self.assertEqual(['reconstruct', 'coarsen', 'refine', 'texture'],
+                         runs(tracker))
         self.assertEqual('--rerun', tracker.dirty['reconstruct'])
         self.assertEqual('done', tracker.status_of('convert'))
 
@@ -408,9 +439,13 @@ class TestPlanning(unittest.TestCase):
         del records['convert']
         tracker = make_tracker(args, records)
         errors = tracker.prereq_errors()
-        self.assertEqual(2, len(errors))
+        # convert, the failed reconstruct, and coarsen -- which is dirty only
+        # because reconstruct rebuilds the mesh it consumes.
+        self.assertEqual(3, len(errors))
         self.assertTrue(any(e.startswith('convert: never run') for e in errors))
         self.assertTrue(any("reconstruct: recorded as 'failed'" in e
+                            for e in errors))
+        self.assertTrue(any('coarsen: inputs rebuilt by reconstruct' in e
                             for e in errors))
         self.assertEqual('blocked', tracker.status_of('convert'))
 
@@ -429,7 +464,7 @@ class TestPlanning(unittest.TestCase):
         args.mvg_recon_method = 'stellar'
         tracker = make_tracker(args, records, explicit={'mvg_recon_method'})
         self.assertEqual(['sfm', 'robust', 'colorize', 'convert', 'reconstruct',
-                          'refine', 'texture'], runs(tracker))
+                          'coarsen', 'refine', 'texture'], runs(tracker))
         self.assertEqual(records['robust']['inputs']['sfm'],
                          records['sfm']['outputs']['sfm'])
         self.assertIn('inputs rebuilt by sfm', tracker.dirty['robust'])
@@ -454,7 +489,8 @@ class TestPlanning(unittest.TestCase):
         args = make_args(from_stage='refine')
         tracker = make_tracker(args, build_records(args))
         self.assertEqual(ROOT / 'mvs/convert_scene.mvs', tracker.path('scene'))
-        self.assertEqual(ROOT / 'mvs/reconstruct_mesh.ply', tracker.path('mesh'))
+        # coarsen, not reconstruct, is what last rebound the mesh.
+        self.assertEqual(ROOT / 'mvs/coarsen_mesh.ply', tracker.path('mesh'))
         self.assertFalse(tracker.has('cloud'))
 
     def test_view_pairs_rehydrate_into_a_later_job(self):
@@ -483,7 +519,8 @@ class TestShapeChanges(unittest.TestCase):
                          records['reconstruct']['inputs']['scene'])
         args = make_args(mvs_densify=False)
         tracker = make_tracker(args, records, explicit={'mvs_densify'})
-        self.assertEqual(['reconstruct', 'refine', 'texture'], runs(tracker))
+        self.assertEqual(['reconstruct', 'coarsen', 'refine', 'texture'],
+                         runs(tracker))
         self.assertEqual('inputs changed: scene',
                          tracker.dirty['reconstruct'])
         self.assertEqual('skip', tracker.status_of('convert'))
@@ -494,8 +531,8 @@ class TestShapeChanges(unittest.TestCase):
         args = make_args(mvs_densify=True)
         records = build_records(make_args(mvs_densify=False))
         tracker = make_tracker(args, records, explicit={'mvs_densify'})
-        self.assertEqual(['densify', 'reconstruct', 'refine', 'texture'],
-                         runs(tracker))
+        self.assertEqual(['densify', 'reconstruct', 'coarsen', 'refine',
+                          'texture'], runs(tracker))
         self.assertEqual('never run', tracker.dirty['densify'])
         self.assertEqual('skip', tracker.status_of('convert'))
 
@@ -507,7 +544,8 @@ class TestShapeChanges(unittest.TestCase):
                                logger=log)
         tracker.log_plan()
         self.assertEqual(['densify', 'reconstruct'], runs(tracker))
-        self.assertEqual(['refine', 'texture'], tracker.stale_after_range())
+        self.assertEqual(['coarsen', 'refine', 'texture'],
+                         tracker.stale_after_range())
         self.assertEqual([], tracker.prereq_errors())
         self.assertIn('left stale', handler.text())
 
@@ -520,7 +558,8 @@ class TestShapeChanges(unittest.TestCase):
         records['colorize']['status'] = 'failed'
         tracker = make_tracker(args, records)
         self.assertEqual(['colorize'], runs(tracker))
-        for stage in ('convert', 'reconstruct', 'refine', 'texture'):
+        for stage in ('convert', 'reconstruct', 'coarsen', 'refine',
+                      'texture'):
             self.assertEqual('skip', tracker.status_of(stage))
 
     def test_a_budget_puts_decimate_in_the_shape(self):
@@ -535,8 +574,8 @@ class TestShapeChanges(unittest.TestCase):
 
     def test_decimate_sits_between_refine_and_texture(self):
         shape = pipeline_shape(make_args(decimate_max_error=0.2))
-        self.assertEqual(('reconstruct', 'refine', 'decimate', 'texture'),
-                         shape[-4:])
+        self.assertEqual(('reconstruct', 'coarsen', 'refine', 'decimate',
+                          'texture'), shape[-5:])
 
     def test_a_zero_budget_leaves_decimate_out(self):
         # The documented way to turn the stage off on a resume: apply_stored
@@ -664,6 +703,186 @@ class TestShapeChanges(unittest.TestCase):
         self.assertEqual('off', tracker.status_of('refine'))
 
 
+class TestCoarsen(unittest.TestCase):
+    """The stage that replaces ``RefineMesh``'s own preparation (ADR 0009)."""
+
+    def test_a_default_shape_has_it(self):
+        # Not opt-in: the CGAL pass it replaces has killed refine jobs on the
+        # wall clock, so the fix is what a run gets unless it says otherwise.
+        self.assertIn('coarsen', pipeline_shape(make_args()))
+
+    def test_no_mvs_coarsen_drops_it(self):
+        self.assertNotIn('coarsen', pipeline_shape(make_args(mvs_coarsen=False)))
+
+    def test_no_refine_drops_it_too(self):
+        # It only ever prepares a mesh for refinement; with no refine there is
+        # nothing to prepare for, and `decimate` is the stage that coarsens a
+        # deliverable.
+        shape = pipeline_shape(make_args(mvs_refine=False))
+        self.assertNotIn('coarsen', shape)
+        self.assertNotIn('refine', shape)
+
+    def test_it_sits_before_refine_in_the_shape(self):
+        shape = pipeline_shape(make_args())
+        self.assertLess(shape.index('coarsen'), shape.index('refine'))
+        self.assertLess(shape.index('reconstruct'), shape.index('coarsen'))
+
+    def test_the_ratio_is_the_target_openmvs_computed_for_itself(self):
+        # 6 x the median projected face area (1.0 px2, densify reconstructing at
+        # one face per pixel) over --max-face-area's default of 16. The number
+        # 119 measured runs all resolved to.
+        self.assertAlmostEqual(0.375, COARSEN_RATIO)
+
+    def test_the_target_is_the_ratio_of_the_input(self):
+        self.assertEqual(9751233, coarsen_target(26003288, make_args()))
+
+    def test_an_explicit_ratio_wins_over_the_default(self):
+        self.assertEqual(2600329,
+                         coarsen_target(26003288, make_args(coarsen_ratio=0.1)))
+
+    def test_a_face_count_wins_over_any_ratio(self):
+        args = make_args(coarsen_ratio=0.1, coarsen_max_faces=9761507)
+        self.assertEqual(9761507, coarsen_target(26003288, args))
+
+    def test_the_target_never_reaches_the_binary_as_zero(self):
+        # `pgs-decimate` reads a non-positive target as *not given*, so a ratio
+        # small enough to round to nothing would write the input through
+        # unchanged -- silently reinstating the cost this stage removes.
+        self.assertEqual(1, coarsen_target(10, make_args(coarsen_ratio=1e-9)))
+        self.assertEqual(1, coarsen_target(0, make_args()))
+
+    def test_a_ratio_outside_zero_to_one_is_refused(self):
+        # Floored to a single face, a mistyped ratio would hand refine a mesh
+        # with no surface left -- after densify and reconstruct were paid for.
+        for bad in (-0.5, 0, 1.5):
+            with self.subTest(ratio=bad):
+                with self.assertRaises(StageError) as ctx:
+                    validate_coarsen(make_args(coarsen_ratio=bad))
+                self.assertIn('--coarsen-ratio', str(ctx.exception))
+
+    def test_a_ratio_of_exactly_one_is_refused(self):
+        # It reduces nothing, and refine is still told to skip its own
+        # preparation -- so no pass reduces the mesh at all, which is worse
+        # than dropping the stage. --no-mvs-coarsen is how to bisect that.
+        with self.assertRaises(StageError) as ctx:
+            validate_coarsen(make_args(coarsen_ratio=1))
+        self.assertIn('--no-mvs-coarsen', str(ctx.exception))
+
+    def test_a_negative_face_count_is_refused(self):
+        with self.assertRaises(StageError) as ctx:
+            validate_coarsen(make_args(coarsen_max_faces=-1))
+        self.assertIn('--coarsen-max-faces', str(ctx.exception))
+
+    def test_a_zero_face_count_defers_to_the_ratio(self):
+        # Not an off switch -- --no-mvs-coarsen is -- so it means what an unset
+        # flag means, and the ratio governs.
+        args = make_args(coarsen_max_faces=0)
+        validate_coarsen(args)
+        self.assertEqual(9751233, coarsen_target(26003288, args))
+
+    def test_changing_the_ratio_reruns_coarsen_and_what_follows(self):
+        args = make_args()
+        records = build_records(args)
+        args.coarsen_ratio = 0.2
+        tracker = make_tracker(args, records, explicit={'coarsen_ratio'})
+        self.assertEqual(['coarsen', 'refine', 'texture'], runs(tracker))
+        self.assertIn('--coarsen-ratio', tracker.dirty['coarsen'])
+
+    def test_dropping_it_reruns_refine_because_its_mesh_moves(self):
+        # No recorded flag says refine ran with --decimate 1: the coupling is
+        # derived from the shape, so what makes refine dirty is its `mesh` input
+        # rebinding from coarsen's artifact back to reconstruct's.
+        args = make_args(mvs_coarsen=False)
+        records = build_records(make_args())
+        tracker = make_tracker(args, records, explicit={'mvs_coarsen'})
+        self.assertEqual(['refine', 'texture'], runs(tracker))
+        self.assertEqual('inputs changed: mesh', tracker.dirty['refine'])
+        self.assertEqual('off', tracker.status_of('coarsen'))
+
+    def test_adding_it_reruns_refine_and_nothing_earlier(self):
+        args = make_args()
+        records = build_records(make_args(mvs_coarsen=False))
+        tracker = make_tracker(args, records, explicit={'mvs_coarsen'})
+        self.assertEqual(['coarsen', 'refine', 'texture'], runs(tracker))
+        self.assertEqual('skip', tracker.status_of('reconstruct'))
+
+
+class TestRefineCoupling(unittest.TestCase):
+    """``coarsen`` in the shape is what sets refine's two preparation flags.
+
+    Both, or neither: ``--decimate 1`` at the default ``--ensure-edge-size 1``
+    skips the edge-size pass as well, which is a 3.9x regression in refine input
+    that nothing in ``RefineMesh``'s log reports (ADR 0009).
+    """
+
+    def test_both_flags_follow_the_stage(self):
+        args = make_args()
+        self.assertEqual({'refine_decimate': 1.0,
+                          'refine_ensure_edge_size': 2},
+                         refine_flags(args, pipeline_shape(args)))
+
+    def test_neither_is_set_without_the_stage(self):
+        args = make_args(mvs_coarsen=False)
+        self.assertEqual({'refine_decimate': None,
+                          'refine_ensure_edge_size': None},
+                         refine_flags(args, pipeline_shape(args)))
+
+    def test_an_explicit_value_wins(self):
+        args = make_args(refine_decimate=0.5, refine_ensure_edge_size=0)
+        flags = refine_flags(args, pipeline_shape(args))
+        self.assertEqual(0.5, flags['refine_decimate'])
+        self.assertEqual(0, flags['refine_ensure_edge_size'])
+
+    def test_one_explicit_flag_does_not_suppress_the_other(self):
+        # The pair is coupled to the stage, not to each other: overriding the
+        # decimation must not quietly take the edge-size pass with it.
+        args = make_args(refine_decimate=0.5)
+        flags = refine_flags(args, pipeline_shape(args))
+        self.assertEqual(0.5, flags['refine_decimate'])
+        self.assertEqual(2, flags['refine_ensure_edge_size'])
+
+    def test_the_pair_is_named_once(self):
+        self.assertEqual({'refine_decimate', 'refine_ensure_edge_size'},
+                         set(REFINE_WITH_COARSEN))
+
+    def test_leaving_the_cgal_pass_on_over_a_coarsened_mesh_warns(self):
+        args = make_args(refine_decimate=0)
+        log, handler = capturing_logger()
+        warn_refine_decimation(args, pipeline_shape(args), log)
+        self.assertIn('--refine-decimate', handler.text())
+        self.assertIn('135x', handler.text())
+
+    def test_decimate_one_without_the_edge_size_pass_warns(self):
+        # The historical footgun, reachable only with coarsen off: --decimate 1
+        # alone, which the binary reads as "skip both".
+        args = make_args(mvs_coarsen=False, refine_decimate=1)
+        log, handler = capturing_logger()
+        warn_refine_decimation(args, pipeline_shape(args), log)
+        self.assertIn('3.9x', handler.text())
+
+    def test_an_explicit_zero_edge_size_over_a_coarsened_mesh_warns(self):
+        # The resume hazard: the pre-coarsen README recommended
+        # `--refine-ensure-edge-size 0` for a stalling refine, and it persists.
+        # Fed back into a coarsen run it means "skip both passes" just as the
+        # default 1 does, so it has to warn for the same reason.
+        args = make_args(refine_ensure_edge_size=0)
+        log, handler = capturing_logger()
+        warn_refine_decimation(args, pipeline_shape(args), log)
+        self.assertIn('3.9x', handler.text())
+
+    def test_the_coupled_pair_is_not_warned_at(self):
+        args = make_args()
+        log, handler = capturing_logger()
+        warn_refine_decimation(args, pipeline_shape(args), log)
+        self.assertEqual('', handler.text())
+
+    def test_nothing_is_warned_at_without_refine(self):
+        args = make_args(mvs_refine=False, refine_decimate=1)
+        log, handler = capturing_logger()
+        warn_refine_decimation(args, pipeline_shape(args), log)
+        self.assertEqual('', handler.text())
+
+
 class TestLegacyManifests(unittest.TestCase):
     """Directories built before ADR 0006, carrying the chained names.
 
@@ -699,8 +918,11 @@ class TestLegacyManifests(unittest.TestCase):
         records = legacy_records(args)
         records['reconstruct']['status'] = 'failed'
         tracker = make_tracker(args, records)
-        self.assertEqual(['reconstruct', 'refine', 'texture'], runs(tracker))
-        self.assertEqual('inputs rebuilt by reconstruct', tracker.dirty['refine'])
+        self.assertEqual(['reconstruct', 'coarsen', 'refine', 'texture'],
+                         runs(tracker))
+        self.assertEqual('inputs rebuilt by reconstruct',
+                         tracker.dirty['coarsen'])
+        self.assertEqual('inputs rebuilt by coarsen', tracker.dirty['refine'])
         # Everything upstream is untouched, and reconstruct re-runs against the
         # legacy scene rather than looking for one under the new name.
         self.assertEqual('skip', tracker.status_of('convert'))

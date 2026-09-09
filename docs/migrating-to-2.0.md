@@ -231,7 +231,7 @@ command line, or strip the `None` lines. A config written by 2.0 round-trips.
   confusion that costs a cluster allocation. The library keyword is unchanged
   (`mvs_refine(decimate=...)`, §7).
 * **`--decimate-max-error` / `--decimate-max-faces` / `--decimate-prefer` are
-  new**, and add a fourteenth stage, `decimate`, between `refine` and `texture`
+  new**, and add a stage, `decimate`, between `refine` and `texture`
   ([ADR 0008](./adr/0008-error-bounded-decimation.md)). The stage merges
   triangles to make the deliverable smaller — a finished mesh is millions of
   faces, more than the geometry justifies and more than MeshLab opens
@@ -254,6 +254,28 @@ command line, or strip the `None` lines. A config written by 2.0 round-trips.
   `--decimate-quadric-seed` and `--decimate-min-gain`, tune what the search
   spends getting there and never what it guarantees; both are optional and
   neither enables the stage.
+* **`--mvs-coarsen` is new, and on by default**, adding a `coarsen` stage
+  between `reconstruct` and `refine` ([ADR
+  0009](./adr/0009-coarsen-before-refine.md)). Before refining anything,
+  `RefineMesh` decimates its input by a single-threaded, silent CGAL pass whose
+  cost at an identical target varies **135x** between meshes; it killed
+  seventeen refine jobs on the wall clock. `coarsen` does that reduction with
+  `pgs-decimate` instead — a 1.7x spread — and being in the shape is what makes
+  `refine` run `--decimate 1 --ensure-edge-size 2`, since the binary guards the
+  edge-size pass on its own decimation and one flag without the other is a
+  silent 3.9x regression in refine input.
+
+  **Every existing refine run changes.** The refine input lands ~7% larger from
+  an edge target 3.4% finer, so refinement costs ~7% more and resolves
+  marginally finer; on one measured fragment, 37m07s of preparation became
+  7m40s. `--coarsen-ratio` (default `0.375`, the target `RefineMesh` computed
+  for itself on all 119 measured runs) and `--coarsen-max-faces` set the target,
+  and `--no-mvs-coarsen` restores the old path. It leaves the shape with
+  `--no-mvs-refine`, only ever preparing a mesh for refinement. This is a face
+  budget, not a **deviation budget**: refine's `EnsureEdgeSize` pass re-reduces
+  the result by a further 3.6-4.1x before iteration zero, so nothing geometric
+  about it would survive — the guarantee belongs on the deliverable, which is
+  `decimate`'s job.
 * **`--import-capture n` is new** (`pgs-import --capture/-C` is the same choice for
   the standalone importer). A PGS scan holds every capture position once per
   *capture*, each with its own lighting and camera set; 1.7 hardcoded capture 0
@@ -439,6 +461,14 @@ a regex private to each app.
       `stages` and `shape` whenever `--decimate-max-error`/`--decimate-max-faces`
       was given. Its `deviation` output is `mvs/decimate_report.json`; read the
       measured deviation there rather than from the log.
+- [ ] Expect `coarsen` in that stage list too, and in every shape that has
+      `refine`. A staged run whose refine job started at `--from refine` now
+      starts at `--from coarsen`; a resumed 1.7 directory gains the stage it
+      never ran, which re-runs refine and texture. Read its face counts from
+      `jq '.stages.coarsen' pgs-recon.json` — `RefineMesh`'s
+      `Decimated faces N (100%, ...)` line is gone with the pass. Pass
+      `--no-mvs-coarsen` to keep the 1.7 mesh preparation and the refined mesh
+      it produced.
 - [ ] Expect a polynomial ground fit and a `0.02` default `--distance-threshold`
       from `pgs-remove-ground-plane`, and pass `--drop-below-ground` to clear
       the bed's fiducial islands. It is opt-in: without it a run delivers what

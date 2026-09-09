@@ -5,7 +5,7 @@
 #
 #   job 1  import..convert          all OpenMVG stages     CPU, many cores
 #   job 2  densify                  DensifyPointCloud      GPU
-#   job 3  reconstruct..texture     mesh + refine + texture  CPU, high memory
+#   job 3  reconstruct..texture     mesh + coarsen + refine + texture  CPU, high memory
 #   job 4  post-process + deliver   reorder/center/copy out  CPU, small
 #
 # The point of the split is memory: RefineMesh needs far more than anything else
@@ -113,8 +113,9 @@ sbatch_common=(
 # input still does -- from convert_scene.mvs to densify.mvs -- so adding it on a
 # later job would invalidate stages that job is not sized to rebuild. pgs-recon
 # would notice and warn rather than silently skip them, but the mesh stages
-# would still need a re-run to catch up. (--mvs-refine is on by default, so
-# refine is already in the shape.)
+# would still need a re-run to catch up. (--mvs-refine and --mvs-coarsen are
+# both on by default, so refine and the coarsen stage that prepares its mesh
+# are already in the shape.)
 job1=$(sbatch --parsable "${sbatch_common[@]}" \
   --job-name="pgs-mvg-${job_name}" \
   --output="pgs-recon_mvg_%j_out.txt" \
@@ -170,20 +171,27 @@ EOF
 )
 printf '  job 2  %-22s %s  %s\n' "densify" "${part_gpu}" "${job2}"
 
-# --- Job 3: mesh, refine, texture on a high-memory node ----------------------
-# --from reconstruct with no --to runs reconstruct, refine and texture. This is
-# the only job that needs the big allocation.
+# --- Job 3: mesh, coarsen, refine, texture on a high-memory node -------------
+# --from reconstruct with no --to runs reconstruct, coarsen, refine and texture.
+# This is the only job that needs the big allocation -- coarsen is here only
+# because it sits between the two stages that do, and it is cheap enough not to
+# be worth a job of its own: one mesh in, one mesh out, single-threaded, and
+# measured at 13.6 GiB peak RSS on a 26M-face mesh (ADR 0009). If it ever does
+# want its own job, it needs nothing but the mesh -- no scene, no undistorted
+# images, no depth maps.
 #
 # If it is OOM-killed, resubmit it unchanged and it resumes: whatever finished is
 # recorded complete and skipped. To retry refine less aggressively instead, add
 # an argument it owns and the stages downstream of it re-run too:
 #   pgs-recon -o <dir> --from refine --refine-resolution-level 2
 #
-# Memory is not the only way this job runs out. At the pinned OpenMVS, refine's
-# mesh *preparation* remeshes with single-threaded CGAL before any optimization
-# starts, and on a large mesh that can burn hours on one core with flat RSS -- so
-# a timeout here means --time or the knobs below, not --mem:
-#   pgs-recon -o <dir> --from refine --refine-ensure-edge-size 0
+# Memory used to not be the only way this job ran out: refine's mesh
+# *preparation* remeshed with single-threaded CGAL before any optimization
+# started, at a cost that varied 135x between meshes and burned hours on one
+# core with flat RSS. The coarsen stage does that reduction instead and tells
+# RefineMesh to skip it (ADR 0009), so a timeout here is now the optimization
+# itself. If coarsen is what is slow, cut harder:
+#   pgs-recon -o <dir> --from coarsen --coarsen-ratio 0.2
 job3=$(sbatch --parsable "${sbatch_common[@]}" \
   --job-name="pgs-mesh-${job_name}" \
   --output="pgs-recon_mesh_%j_out.txt" \
