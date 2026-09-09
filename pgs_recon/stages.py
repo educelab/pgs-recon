@@ -145,6 +145,7 @@ STAGE_ARGS: Dict[str, Tuple[str, ...]] = {
                'refine_min_resolution', 'refine_scales', 'refine_scale_step',
                'refine_ensure_edge_size', 'refine_max_face_area'),
     'decimate': ('decimate_max_error', 'decimate_max_faces',
+                 'decimate_quadric_seed', 'decimate_min_gain',
                  'decimate_prefer'),
     'texture': ('name', 'file_type', 'texture_resolution_level',
                 'texture_max_size'),
@@ -268,6 +269,31 @@ def validate_budgets(args) -> None:
                              f'distance or a face count; pass 0 to turn the '
                              f'decimate stage off, or a positive value to '
                              f'bound it.')
+
+
+def validate_search(args) -> None:
+    """Refuse a decimate search setting the binary would refuse, but do it here.
+
+    Kept apart from :func:`validate_budgets` because these are not budgets: they
+    tune the search and never gate the stage, so a zero means something
+    different in each (``--decimate-min-gain 0`` searches to the round cap,
+    where a zero budget switches the stage off). What they share is when the
+    complaint has to arrive. ``pgs-decimate`` checks both itself, but the stage
+    runs after densify, reconstruct and refine have been paid for, and a typo
+    that costs a night of cluster time is not a good error message.
+    """
+    seed = getattr(args, 'decimate_quadric_seed', None)
+    if seed is not None and seed < 0:
+        raise StageError(f'--decimate-quadric-seed={seed} is negative. It is a '
+                         f'quadric threshold, which cannot be; omit it to have '
+                         f'one derived from the budget and the mesh.')
+    gain = getattr(args, 'decimate_min_gain', None)
+    if gain is not None and not 0 <= gain < 1:
+        raise StageError(f'--decimate-min-gain={gain} is outside [0, 1). It is '
+                         f'the share of the result\'s faces still worth '
+                         f'another full measurement, so 1 or more would stop '
+                         f'the search before it could win anything, and 0 is '
+                         f'the way to search to the round cap.')
 
 
 def clear_zeroed_budgets(args, explicit: set, logger) -> None:

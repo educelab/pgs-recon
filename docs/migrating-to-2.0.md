@@ -250,7 +250,10 @@ command line, or strip the `None` lines. A config written by 2.0 round-trips.
   enables the stage; a budget of `0` disables it on a resume, which is the only
   way to, since arguments are inherited from the manifest — and because `0`
   turns off the *stage*, it drops an inherited second budget with it. Nothing
-  changes for a run that states no budget.
+  changes for a run that states no budget. Two further flags,
+  `--decimate-quadric-seed` and `--decimate-min-gain`, tune what the search
+  spends getting there and never what it guarantees; both are optional and
+  neither enables the stage.
 * **`--import-capture n` is new** (`pgs-import --capture/-C` is the same choice for
   the standalone importer). A PGS scan holds every capture position once per
   *capture*, each with its own lighting and camera set; 1.7 hardcoded capture 0

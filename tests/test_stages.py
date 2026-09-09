@@ -22,7 +22,8 @@ from pgs_recon import layout
 from pgs_recon.stages import (STAGE_ARGS, STAGE_IO, STAGES, StageError,
                               StageTracker, clear_zeroed_budgets,
                               drifted_stages, pipeline_shape, resolve_range,
-                              revert_out_of_range, validate_budgets)
+                              revert_out_of_range, validate_budgets,
+                              validate_search)
 
 ROOT = Path('/recon')
 
@@ -46,7 +47,9 @@ DEFAULTS = dict(
     free_space_support=False, mvs_smooth=2,
     mvs_refine=True, refine_decimate=None, refine_resolution_level=None,
     refine_min_resolution=None, refine_scales=3, refine_scale_step=None,
-    decimate_max_error=None, decimate_max_faces=None, decimate_prefer='error',
+    decimate_max_error=None, decimate_max_faces=None,
+    decimate_quadric_seed=None, decimate_min_gain=None,
+    decimate_prefer='error',
     name='obj', file_type='obj', texture_resolution_level=None,
     texture_max_size=0,
     # flow control
@@ -588,6 +591,26 @@ class TestShapeChanges(unittest.TestCase):
                    make_args(decimate_max_error=0.2)):
             with self.subTest(ok=ok):
                 validate_budgets(ok)
+
+    def test_a_bad_search_setting_is_refused_before_the_run(self):
+        # pgs-decimate refuses these itself, but only once densify, reconstruct
+        # and refine have been paid for.
+        for off, word in ((make_args(decimate_quadric_seed=-1e-7), 'negative'),
+                          (make_args(decimate_min_gain=1.0), '[0, 1)'),
+                          (make_args(decimate_min_gain=-0.1), '[0, 1)')):
+            with self.subTest(off=off):
+                with self.assertRaises(StageError) as ctx:
+                    validate_search(off)
+                self.assertIn(word, str(ctx.exception))
+
+    def test_the_search_settings_have_a_zero_that_means_something(self):
+        # Unlike a budget, zero is not the off switch here: it searches to the
+        # round cap, and a seed of zero asks for the derived one.
+        for ok in (make_args(), make_args(decimate_min_gain=0),
+                   make_args(decimate_min_gain=0.99),
+                   make_args(decimate_quadric_seed=0)):
+            with self.subTest(ok=ok):
+                validate_search(ok)
 
     def test_dropping_decimate_reruns_texture_and_nothing_earlier(self):
         # Recovering from a bad budget costs one stage, not a pipeline: only

@@ -218,9 +218,29 @@ Notes:
   a negative distance or face count has no other reading.
 * The stage sits between `refine` and `texture`, so the deliverable is textured
   at its final resolution rather than textured twice.
+* **The search costs real time**, because every round decimates *and* measures,
+  and the measurement is ten samples per face of the candidate — so a probe that
+  barely coarsens anything is the expensive one. Two flags price that, and
+  neither can cost you the deviation bound:
+  `--decimate-min-gain` (default `0.1`) stops the search once it can still
+  remove less than that share of the current result's faces, and
+  `--decimate-quadric-seed` starts it from a threshold you supply instead of one
+  derived from the budget. Neither flag turns the stage on.
+* **Where a seed comes from: the same object's last run.** The derived seed is
+  very nearly a constant, and it overshoots every real run by between 370x and
+  95,000x. At one fixed budget the right threshold varies about 255x between
+  objects but only about 4-9x between reruns of one object, so the object's own
+  history is the only predictor on offer today. Take `search.quadric_error` out
+  of that object's previous `decimate_report.json` and pass it as
+  `--decimate-quadric-seed`; it seeds the search rather than replacing it, so
+  the remaining few-fold is what the search is still there to close. On one real
+  mesh, feeding back its own converged threshold took the search from 7 rounds
+  and 55 s to 3 rounds and 24 s, for a marginally coarser result. Do not carry a
+  seed between different objects.
 * `mvs/decimate_report.json` records faces in and out, the measured max, mean
   and RMS deviation in both directions, what was cleaned, whether the mesh is
-  non-manifold, and which bound stopped the search. The manifest records its
+  non-manifold, every round the search tried, and both which bound stopped the
+  search and why it stopped probing. The manifest records its
   path under the `deviation` role.
 * A world-unit budget on a run with no `autoscale` stage is a number with no
   physical meaning, and the run warns about it.
