@@ -17,6 +17,13 @@ ExternalProject_Add(
     # #1297) by rewriting Clean onto cdcseacave/halfmesh, which needs C++20
     # <format> (GCC 13+; the images are on GCC 11.4), so we carry the equivalent
     # one-line guard instead of bumping the pin.
+    # ScopeEnsureEdgeSizeToInput scopes RefineMesh's `--ensure-edge-size 2`
+    # ("force") to the first image scale. At 0 and at the default 1 the pass
+    # already runs at most once, on the input mesh; only "force" also remeshes
+    # at the later scales, single-threaded and silent, over the mesh Subdivide
+    # has just grown. The coarsen stage has to pass "force" (ADR 0009 s4, ADR
+    # 0010), so without this the flag pgs-recon needs for the input pass is
+    # also the flag that puts two CGAL remeshes into the refinement loop.
     GIT_TAG ca991d50964ad2cfabc94c88d61a444999670a5d
     DOWNLOAD_NO_PROGRESS ON
     DOWNLOAD_EXTRACT_TIMESTAMP OFF
@@ -25,6 +32,7 @@ ExternalProject_Add(
       COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVS-v2.4-RemoveMTLTransparency.diff || true
       COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVS-v2.4-FixRefineCUDABounds.diff || true
       COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVS-v2.4-FixSpikeRemovalStaleVertex.diff || true
+      COMMAND patch -p1 --forward -i ${CMAKE_SOURCE_DIR}/patches/openMVS-v2.4-ScopeEnsureEdgeSizeToInput.diff || true
     CMAKE_CACHE_ARGS
         ${GLOBAL_CMAKE_ARGS}
         ${GLOBAL_CUDA_ARGS}

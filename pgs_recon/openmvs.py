@@ -239,6 +239,13 @@ def mvs_refine(scene: Path, mesh: Path, output: Path,
     ``ensure_edge_size=0`` skips only that pass. None of these are defaults
     here, because each changes the mesh that comes out: the coupling is
     ``run_pipeline``'s, being an invariant of ours rather than the binary's.
+
+    ``ensure_edge_size=2`` is the one value whose meaning differs from stock
+    OpenMVS. Upstream, "force" runs the edge-size pass at *every* image scale,
+    the later ones remeshing what ``Subdivide`` just grew; this build carries
+    ``openMVS-v2.4-ScopeEnsureEdgeSizeToInput.diff``, which scopes it to the
+    first scale, where ``0`` and ``1`` already confined it
+    (`ADR 0010 <../docs/adr/0010-edge-size-pass-on-the-input-only.md>`_).
     """
     work = work_dir(scene, mesh, output)
     command = [

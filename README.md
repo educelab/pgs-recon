@@ -206,6 +206,14 @@ nothing in its log to say so. Both flags follow the stage rather than the
 caller for exactly that reason, and overriding one warns rather than silently
 changing what the other means.
 
+`2` means *force on the input mesh* in these images. Upstream it forces the pass
+at every image scale of the refinement loop, the later ones isotropically
+remeshing the mesh subdivision has just grown — which only `--decimate 1` ever
+reaches, and which no stock OpenMVS run performs. A patched `RefineMesh` scopes
+it to the first scale, where `0` and `1` already confined it (ADR 0010). The fix
+lives in the C++ toolchain, so it arrives with a rebuilt image rather than with a
+`pgs-recon` upgrade.
+
 `--refine-decimate` is a face *fraction* and has nothing to do with the
 `decimate` stage below, which states a geometric bound. It was called
 `--decimation-factor` before 2.0. `--refine-max-face-area` is *not* a remedy for
