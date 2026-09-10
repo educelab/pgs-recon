@@ -125,9 +125,15 @@ what makes `refine` run `--decimate 1 --ensure-edge-size 2`: the binary guards
 the edge-size pass on its own decimation, so one flag without the other is a
 silent 3.9x regression in refine input. That coupling is derived in
 `stages.refine_flags` rather than folded into `args`, so it cannot be inherited
-across a shape change. `stages.COARSEN_RATIO` is the target fraction (0.375,
-derived as `6 * 1.0 px^2 / 16`) and `utils.ply.face_count` reads the input's
-count out of its PLY header — the only place the pipeline reads a mesh file.
+across a shape change. `--ensure-edge-size 2` ("force") is also the only value
+upstream lets reach the later image scales, where the pass remeshes what
+subdivision just grew;
+`dependencies/patches/openMVS-v2.4-ScopeEnsureEdgeSizeToInput.diff` scopes it to
+the first scale, where the other two values already sat (ADR 0010) — so the
+wrapper's `2` means something narrower here than in stock OpenMVS.
+`stages.COARSEN_RATIO` is the target fraction (0.375, derived as
+`6 * 1.0 px^2 / 16`) and `utils.ply.face_count` reads the input's count out of
+its PLY header — the only place the pipeline reads a mesh file.
 
 `mvs_decimate` is the one MVS-side wrapper that is not OpenMVS: it drives our
 `pgs-decimate`, which coarsens a mesh as far as a *measured* deviation budget

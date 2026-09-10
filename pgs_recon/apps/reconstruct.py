@@ -338,7 +338,8 @@ def build_parser() -> configargparse.ArgumentParser:
     # Refine's mesh *preparation*, where a large mesh now spends its wall clock.
     opts_mvs.add_argument('--refine-ensure-edge-size', default=None, type=int,
                           help='improve edge sizes and vertex valence before '
-                               'refinement (0 - disabled, 1 - auto, 2 - force). '
+                               'refinement (0 - disabled, 1 - auto, 2 - force '
+                               'on the input mesh). '
                                'Left unset with the coarsen stage in the '
                                'pipeline this is 2, because RefineMesh guards '
                                'this pass on its own decimation and would '

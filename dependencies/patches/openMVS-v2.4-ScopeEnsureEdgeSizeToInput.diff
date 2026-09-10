@@ -1,0 +1,74 @@
+RefineMesh's `--ensure-edge-size 2` ("force") applies the CGAL isotropic-remeshing
+pass at *every* image scale of the coarse-to-fine loop, not only to the input mesh.
+This scopes "force" to the first scale, which is the only scale the other two
+values can reach.
+
+The pass is `Mesh::EnsureEdgeSize` -> `PMP::isotropic_remeshing`, 10 iterations
+(`Mesh.h:187` defaults `max_iters=50`, clamped by `MINF(max_iters, 10)`), followed
+by a `Mesh::Clean` -- both single-threaded CGAL over a `Surface_mesh` copy of the
+whole mesh, and both logging only on completion, so a long one is indistinguishable
+from a hang.
+
+Where it runs is decided by the guard at `SceneRefine.cpp:556`:
+
+    if ((nEnsureEdgeSize == 1 && !bNoDecimation) || nEnsureEdgeSize > 1)
+
+`fDecimateMesh` reaches `SubdivideMesh` only on the first scale -- every later one
+is passed `1.f`, which sets `bNoDecimation` -- so at `0` (disabled) and at the
+default `1` (auto) the pass already runs at most once, on the input. Only `2`
+crosses into the later scales, where the mesh has just been subdivided against
+images 4x larger in area per scale, and where `EnsureEdgeSize`'s own default
+target of 2.25x the current mean edge length (`epsilonMin=-0.5`, `epsilonMax=-4`,
+target `(0.5 + 4)/2` mean edges; confirmed by the `Ensured edge size` line of a
+real run at 0.0620153 against a 0.0275624 mean) then remeshes coarser than what
+that subdivision produced.
+
+This matters here because pgs-recon's `coarsen` stage must pass `--decimate 1
+--ensure-edge-size 2` (ADR 0009 s4): with its own decimation off, "force" is the
+only value that reaches the pass at all, and upstream's tri-state has no value
+meaning "force on the input only". So turning off the CGAL decimation the coarsen
+stage replaces also, unavoidably, turns the remeshing pass on at the two later
+scales, which no stock OpenMVS run performs -- with all defaults the pass runs
+exactly once, at scale 0.
+
+Behaviour for `--ensure-edge-size 0` and `1` is unchanged: the guard already
+excluded the later scales for both. Only "force" changes, and it changes toward
+what every other configuration already does.
+
+The file's own `#define MESHOPT_ENSUREEDGESIZE 1 // 0 - at all resolution`
+(`SceneRefine.cpp:42`) records the same intent: value 1 selects the first
+resolution, 0 would select all of them. Not fixed upstream and not reported --
+the behaviour is only reachable via "force", which upstream's own defaults do not
+use. The CUDA path (`Scene::RefineMeshCUDA`) carries a duplicate of the loop and
+the guard, and is patched identically; it is a separate code path in the same
+binary, selected by --cuda-device.
+
+--- a/libs/MVS/SceneRefine.cpp
++++ b/libs/MVS/SceneRefine.cpp
+@@ -1312,7 +1312,12 @@
+ 		refine.ListVertexFacesPre();
+ 
+ 		// automatic mesh subdivision
+-		refine.SubdivideMesh(nMaxFaceArea, nScale == 0 ? fDecimateMesh : 1.f, nCloseHoles, nEnsureEdgeSize);
++		// the edge-size pass conditions the mesh the optimizer starts from, so it
++		// belongs to the first scale only, like the decimation beside it: at the
++		// finer scales it remeshes what Subdivide has just built, from ~4x the
++		// faces per scale, and to a target coarser than that subdivision.
++		refine.SubdivideMesh(nMaxFaceArea, nScale == 0 ? fDecimateMesh : 1.f, nCloseHoles,
++			nScale == 0 ? nEnsureEdgeSize : 0);
+ 
+ 		// extract array of triangle normals
+ 		refine.ListVertexFacesPost();
+--- a/libs/MVS/SceneRefineCUDA.cpp
++++ b/libs/MVS/SceneRefineCUDA.cpp
+@@ -870,7 +870,9 @@
+ 		refine.ListVertexFacesPre();
+ 
+ 		// automatic mesh subdivision
+-		refine.SubdivideMesh(nMaxFaceArea, nScale == 0 ? fDecimateMesh : 1.f, nCloseHoles, nEnsureEdgeSize);
++		// scoped to the first scale, as in the CPU path
++		refine.SubdivideMesh(nMaxFaceArea, nScale == 0 ? fDecimateMesh : 1.f, nCloseHoles,
++			nScale == 0 ? nEnsureEdgeSize : 0);
+ 
+ 		// extract array of triangle normals
+ 		refine.ListVertexFacesPost();
