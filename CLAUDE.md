@@ -137,10 +137,33 @@ its PLY header — the only place the pipeline reads a mesh file.
 
 `mvs_decimate` is the one MVS-side wrapper that is not OpenMVS: it drives our
 `pgs-decimate`, which coarsens a mesh as far as a *measured* deviation budget
-allows and writes a JSON report of what that cost (ADR 0008). Stating a budget
-(`--decimate-max-error`/`--decimate-max-faces`) is what puts the stage in the
-shape — the gate is truthiness, so `0` removes it again on a resume — and it is
-the one stage whose enablement has no boolean flag of its own.
+allows and writes a JSON report of what that cost (ADR 0008). `--mvs-decimate`
+puts it in the shape, on by default, and `stages.decimate_target()` names what it
+coarsens to: `--decimate-max-faces` if given, else `DECIMATE_RATIO` (0.3) of the
+input's face count — the same ladder `coarsen_target()` uses, plus
+`--decimate-ratio 0`, which drops the face target so `--decimate-max-error`
+searches alone. `--decimate-prefer` is deliberately *not* in that ladder: it
+exists to arbitrate the two budgets, so a precedence rule between them would
+delete it. `coarsen` carries the identical interface — same targets, same
+tie-break, same search, same measurement and geometry flags, generated from
+`_add_decimation_options()` so the two cannot drift — and differs only in three
+defaults: the ratio, and the two measurement flags it turns down to the floor
+because nothing consumes the deviation it produces. Its search is available and
+off: no `--coarsen-max-error` is what keeps it to one round, which is what ADR
+0009 is actually about. `decimate` is not gated on `mvs_refine` (ADR 0008
+Decision 7) -- without refine it coarsens `reconstruct`'s mesh, which is the
+largest thing the pipeline ever hands `texture` -- but the *default ratio* has no
+derivation there, so `warn_decimate_without_refine()` says so unless the caller
+stated a ratio or a count. The ratio is refine's last act read backwards — one uniform
+subdivision, measured at 3.80–3.93x across twelve cluster runs, a property of
+`--refine-scales` rather than of the object, exactly as `COARSEN_RATIO` is a
+property of the rig.
+
+The budgets *used to be* the enable flag: the stage was in the
+shape while either was truthy, so `0` removed it on a resume where an omitted
+flag would have inherited the recorded budget. A defaulted target can never be
+falsy, so `--decimate-ratio` could not have a default while that held. The
+budgets now only bound the stage, and `0` on either means "not this target".
 
 ### How a stage gets its paths (ADR 0005, ADR 0006)
 

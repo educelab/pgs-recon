@@ -143,13 +143,23 @@ STAGE_ARGS: Dict[str, Tuple[str, ...]] = {
     'reconstruct': ('free_space_support', 'mvs_smooth',
                     'mvs_remove_spurious', 'mvs_remove_spikes',
                     'mvs_close_holes'),
-    'coarsen': ('mvs_coarsen', 'coarsen_ratio', 'coarsen_max_faces'),
+    'coarsen': ('mvs_coarsen', 'coarsen_ratio', 'coarsen_max_faces',
+                'coarsen_max_error', 'coarsen_prefer', 'coarsen_max_rounds',
+                'coarsen_quadric_seed', 'coarsen_min_gain',
+                'coarsen_samples_per_face', 'coarsen_curvature_samples',
+                'coarsen_preserve_boundary', 'coarsen_preserve_topology',
+                'coarsen_normal_check', 'coarsen_optimal_placement',
+                'coarsen_quality_threshold'),
     'refine': ('mvs_refine', 'refine_decimate', 'refine_resolution_level',
                'refine_min_resolution', 'refine_scales', 'refine_scale_step',
                'refine_ensure_edge_size', 'refine_max_face_area'),
-    'decimate': ('decimate_max_error', 'decimate_max_faces',
-                 'decimate_quadric_seed', 'decimate_min_gain',
-                 'decimate_prefer'),
+    'decimate': ('mvs_decimate', 'decimate_ratio', 'decimate_max_error',
+                 'decimate_max_faces', 'decimate_quadric_seed',
+                 'decimate_min_gain', 'decimate_prefer',
+                 'decimate_max_rounds', 'decimate_samples_per_face',
+                 'decimate_curvature_samples', 'decimate_preserve_boundary',
+                 'decimate_preserve_topology', 'decimate_normal_check',
+                 'decimate_optimal_placement', 'decimate_quality_threshold'),
     'texture': ('name', 'file_type', 'texture_resolution_level',
                 'texture_max_size'),
 }
@@ -267,6 +277,24 @@ COARSEN_RATIO = 6.0 * 1.0 / 16.0
 #: and the mesh handed to refine is not the size the ratio asked for.
 COARSEN_FACE_TOLERANCE = 0.05
 
+#: The face fraction ``decimate`` cuts the *refined* mesh to. Refine's last act
+#: is one uniform subdivision, and measuring it across the twelve cluster runs
+#: of 2026-09-10 (``TEST_FINAL_PHerc*_recon_20260910_*``) gives 3.80x-3.93x,
+#: mean **3.88x**, a spread of 3.4% -- a property of ``--refine-scales`` and
+#: ``--refine-scale-step``, not of the fragment, exactly as
+#: :data:`COARSEN_RATIO` is a property of the rig. Undoing it exactly would be
+#: 0.26; 0.3 is deliberately a little above that, so the delivered mesh keeps a
+#: buffer over what refine itself worked at rather than landing on it.
+#:
+#: A ratio rather than a count because the target scales with the input, and
+#: consistent *reduction* is the short-term goal -- the same reduction on every
+#: fragment, in preference to per-mesh tuning. Note that two of those twelve
+#: left refine at 17.7M faces rather than ~11M (an extra subdivision at scale
+#: 2), so a ratio gives them a proportionally larger deliverable; a fixed count
+#: or an area-derived density is the rule to reach for if consistent delivered
+#: *size* ever matters more.
+DECIMATE_RATIO = 0.3
+
 #: What ``coarsen`` in the shape means for ``RefineMesh``: skip the CGAL
 #: decimation (``--decimate 1``) and *force* the edge-size pass
 #: (``--ensure-edge-size 2``). Both, or neither -- ``SceneRefine.cpp:556`` guards
@@ -294,6 +322,36 @@ def coarsen_target(input_faces: int, args) -> int:
     return max(1, round(input_faces * ratio))
 
 
+def decimate_target(input_faces: int, args) -> Optional[int]:
+    """The face count ``decimate`` asks ``pgs-decimate`` for, or None.
+
+    The same ladder as :func:`coarsen_target` -- an explicit
+    ``--decimate-max-faces`` wins, else :data:`DECIMATE_RATIO` (or
+    ``--decimate-ratio``) times the input's face count -- with one addition it
+    needs and coarsen does not: a ratio of ``0`` returns *no count at all*.
+
+    That is how the stage switches from a face target to a pure deviation
+    search. ``--decimate-max-error`` is deliberately **not** in this ladder:
+    ``--decimate-prefer`` exists precisely to arbitrate the two budgets when
+    both are given, and a precedence rule between them would delete it. Only
+    the two *face* sources are ranked; the error budget is orthogonal.
+
+    Unlike coarsen's, the result is not floored at one face. A floor there
+    protects a stage whose only target is a count; here ``None`` is a real
+    answer, and flooring would coarsen a deliverable to nothing rather than
+    hand the search its budget.
+    """
+    faces = getattr(args, 'decimate_max_faces', None)
+    if faces:
+        return int(faces)
+    ratio = getattr(args, 'decimate_ratio', None)
+    if ratio is None:
+        ratio = DECIMATE_RATIO
+    if not ratio:
+        return None
+    return max(1, round(input_faces * ratio))
+
+
 def validate_coarsen(args) -> None:
     """Refuse a coarsen target that has no reading, before anything is paid for.
 
@@ -315,13 +373,20 @@ def validate_coarsen(args) -> None:
     ``--coarsen-max-faces 0`` is not a mistake and not an off switch -- the
     stage has ``--no-mvs-coarsen`` for that -- it is the documented way to say
     "no count, use the ratio", which is what an unset flag means anyway.
+
+    The accepted range is ``[0, 1)``, matching :func:`validate_decimate`, and
+    zero means "no ratio" in both. The refusals are the same too: what has no
+    reading is a stage with *nothing* to aim at -- no ratio, no count and no
+    deviation budget. ADR 0009 is about what coarsen defaults to, not about
+    what it may be asked for, so ``--coarsen-max-error`` is a real fallback
+    here exactly as ``--decimate-max-error`` is there.
     """
     ratio = getattr(args, 'coarsen_ratio', None)
-    if ratio is not None and not 0 < ratio < 1:
+    if ratio is not None and not 0 <= ratio < 1:
         raise StageError(f'--coarsen-ratio={ratio} is not a fraction of the '
-                         f'input mesh to keep. It must be greater than 0 and '
-                         f'less than 1; at 1 the stage reduces nothing and '
-                         f'refine still skips its own preparation, so pass '
+                         f'input mesh to keep. It must be at least 0 and less '
+                         f'than 1; at 1 the stage reduces nothing and refine '
+                         f'still skips its own preparation, so pass '
                          f'--no-mvs-coarsen to leave the reduction to '
                          f'RefineMesh instead.')
     faces = getattr(args, 'coarsen_max_faces', None)
@@ -330,6 +395,90 @@ def validate_coarsen(args) -> None:
                          f'budget is a count; pass 0 (or omit it) to let '
                          f'--coarsen-ratio set the target, or --no-mvs-coarsen '
                          f'to drop the stage.')
+    error = getattr(args, 'coarsen_max_error', None)
+    if error is not None and error < 0:
+        raise StageError(f'--coarsen-max-error={error} is negative. A budget '
+                         f'is a distance; pass 0 (or omit it) to leave the '
+                         f'stage on its face target alone, which is what keeps '
+                         f'it to one round.')
+    if ratio is not None and not ratio and not faces and not error:
+        raise StageError('--coarsen-ratio=0 drops the face target, and neither '
+                         '--coarsen-max-faces nor --coarsen-max-error is set, '
+                         'so the stage has nothing to aim at. Give one of '
+                         'them, restore a ratio, or pass --no-mvs-coarsen to '
+                         'leave the reduction to RefineMesh.')
+    _validate_shared_decimation(args, 'coarsen')
+
+
+def validate_decimate(args) -> None:
+    """Refuse a decimate target that has no reading, before anything is paid for.
+
+    :func:`validate_coarsen`'s counterpart, and the same refusals: the ratio's
+    accepted range is ``[0, 1)``, ``0`` means "no ratio", and what is refused is
+    having *nothing* to aim at -- no ratio, no count and no deviation budget.
+
+    ``--decimate-max-faces 0`` follows ``--coarsen-max-faces 0``: not an off
+    switch, just "no count, use the ratio". The off switch is
+    ``--no-mvs-decimate``, a real flag rather than the zero budget it used to be
+    (ADR 0008 Decision 6, amended).
+    """
+    ratio = getattr(args, 'decimate_ratio', None)
+    if ratio is not None and not 0 <= ratio < 1:
+        raise StageError(f'--decimate-ratio={ratio} is not a fraction of the '
+                         f'refined mesh\'s faces to keep. It must be at least '
+                         f'0 and less than 1; at 1 the stage collapses nothing '
+                         f'and writes its input through, so pass '
+                         f'--no-mvs-decimate to drop it instead. Pass 0 to '
+                         f'drop the face target and decimate to '
+                         f'--decimate-max-error alone.')
+    if ratio is not None and not ratio:
+        faces = getattr(args, 'decimate_max_faces', None)
+        error = getattr(args, 'decimate_max_error', None)
+        if not faces and not error:
+            raise StageError('--decimate-ratio=0 drops the face target, and '
+                             'neither --decimate-max-faces nor '
+                             '--decimate-max-error is set, so the stage has '
+                             'nothing to aim at. Give one of them, restore a '
+                             'ratio, or pass --no-mvs-decimate to drop the '
+                             'stage.')
+    _validate_shared_decimation(args, 'decimate')
+
+
+def _validate_shared_decimation(args, stage: str) -> None:
+    """The search, round-cap and geometry checks both decimation stages share.
+
+    ``pgs-decimate`` makes every one of these itself, but it runs after densify,
+    reconstruct and refine have been paid for, and a typo that costs a night of
+    cluster time is not a good error message. Both stages are checked the same
+    way because both carry the same flags; ``stage`` only picks the prefix the
+    message names.
+    """
+    off = f'--no-mvs-{stage}'
+    rounds = getattr(args, f'{stage}_max_rounds', None)
+    if rounds is not None and rounds < 1:
+        raise StageError(f'--{stage}-max-rounds={rounds} is below 1. The '
+                         f'search needs at least one round to measure '
+                         f'anything; pass {off} to skip the stage.')
+    seed = getattr(args, f'{stage}_quadric_seed', None)
+    if seed is not None and seed < 0:
+        raise StageError(f'--{stage}-quadric-seed={seed} is negative. It is a '
+                         f'quadric threshold, which cannot be; omit it to have '
+                         f'one derived from the budget and the mesh.')
+    gain = getattr(args, f'{stage}_min_gain', None)
+    if gain is not None and not 0 <= gain < 1:
+        raise StageError(f'--{stage}-min-gain={gain} is outside [0, 1). It is '
+                         f'the share of the result\'s faces still worth '
+                         f'another full measurement, so 1 or more would stop '
+                         f'the search before it could win anything, and 0 is '
+                         f'the way to search to the round cap.')
+    quality = getattr(args, f'{stage}_quality_threshold', None)
+    if quality is not None and not 0 < quality <= 0.866:
+        raise StageError(f'--{stage}-quality-threshold={quality} is outside '
+                         f'(0, 0.866]. It is not a looseness dial: vcglib '
+                         f'clamps a triangle\'s quality to it and then '
+                         f'divides, so 0 makes every collapse infinitely '
+                         f'expensive and the mesh passes through untouched. '
+                         f'0.866 is an equilateral triangle\'s quality.')
 
 
 def refine_flags(args, shape: Sequence[str]) -> Dict[str, object]:
@@ -355,6 +504,42 @@ def refine_flags(args, shape: Sequence[str]) -> Dict[str, object]:
         return flags
     return {d: REFINE_WITH_COARSEN[d] if v is None else v
             for d, v in flags.items()}
+
+
+def warn_decimate_without_refine(args, shape: Sequence[str], explicit,
+                                 logger) -> None:
+    """Warn when the default ratio is applied to a mesh refine never touched.
+
+    :data:`DECIMATE_RATIO` is refine's last act read backwards -- one uniform
+    subdivision, measured at 3.88x -- so with no ``refine`` in the shape there
+    is no subdivision to undo and the default is just a number, applied to
+    whatever ``reconstruct`` produced.
+
+    The *stage* is still worth running, which is why this is not a gate: without
+    refine, ``reconstruct``'s mesh is the largest thing the pipeline ever hands
+    ``texture``, and ADR 0008 Decision 7 puts decimate after ``reconstruct``
+    precisely so that case is covered. What is unjustified is the target, not
+    the stage, so the warning names the two flags that state one.
+
+    Silent when the caller chose a ratio or a count themselves: they have said
+    what they want for this shape, and there is nothing left to tell them.
+    """
+    if 'decimate' not in shape or 'refine' in shape:
+        return
+    if 'decimate_ratio' in explicit or getattr(args, 'decimate_max_faces', None):
+        return
+    ratio = getattr(args, 'decimate_ratio', None)
+    if ratio is None:
+        ratio = DECIMATE_RATIO
+    if not ratio:
+        return
+    logger.warning(
+        f'--decimate-ratio={ratio} is the default, and it is derived from the '
+        f'subdivision RefineMesh does at its last scale -- which this run does '
+        f'not have, so there is no subdivision for it to undo. The decimate '
+        f'stage is still worth running on reconstruct\'s mesh, but the target '
+        f'is arbitrary here: state --decimate-ratio or --decimate-max-faces '
+        f'for what this shape should deliver.')
 
 
 def warn_refine_decimation(args, shape: Sequence[str], logger) -> None:
@@ -392,9 +577,11 @@ def warn_refine_decimation(args, shape: Sequence[str], logger) -> None:
             'so. Pass --refine-ensure-edge-size 2 to force that pass.')
 
 
-# The decimate stage's targets, which are also its enable flag (ADR 0008 s6).
-# Named once: `pipeline_shape` reads them for the gate and
-# `clear_zeroed_budgets` for the disable path, and the two have to agree.
+# The decimate stage's two budgets. They used to be its enable flag as well --
+# the stage was in the shape while either was truthy, so a zero turned it off
+# (ADR 0008 s6) -- which is no longer true: `--no-mvs-decimate` is the switch
+# and `--decimate-ratio` supplies a target when neither budget is given. All
+# that is left here is the shared negativity check below.
 DECIMATE_BUDGETS: Tuple[str, ...] = ('decimate_max_error', 'decimate_max_faces')
 
 
@@ -402,74 +589,23 @@ def validate_budgets(args) -> None:
     """Refuse a negative decimate budget, which no layer below reads as one.
 
     ``pgs-decimate`` reads a non-positive target as *not given*, so a typo'd
-    ``-1`` does not tighten anything: on its own it reaches the binary as no
-    target at all and fails the run after densify, reconstruct and refine have
-    already been paid for; beside a face budget it silently vanishes and the
-    mesh is coarsened to a bound the caller never set. Zero is the documented
-    off switch and stays one; a negative number is a mistake with no reading.
+    ``-1`` does not tighten anything: it silently vanishes, and the stage
+    coarsens to whatever target is left -- the ratio, or the other budget --
+    rather than to the bound the caller thought they set. Zero says "not this
+    one" and is fine; a negative number is a mistake with no reading.
+
+    Zero no longer turns the stage off. It did while the budgets *were* the
+    enable flag; ``--no-mvs-decimate`` is the switch now, and a zero budget
+    falls through to :data:`DECIMATE_RATIO` like an omitted one.
     """
     for dest in DECIMATE_BUDGETS:
         value = getattr(args, dest, None)
         if value is not None and value < 0:
             flag = '--' + dest.replace('_', '-')
             raise StageError(f'{flag}={value} is negative. A budget is a '
-                             f'distance or a face count; pass 0 to turn the '
-                             f'decimate stage off, or a positive value to '
-                             f'bound it.')
-
-
-def validate_search(args) -> None:
-    """Refuse a decimate search setting the binary would refuse, but do it here.
-
-    Kept apart from :func:`validate_budgets` because these are not budgets: they
-    tune the search and never gate the stage, so a zero means something
-    different in each (``--decimate-min-gain 0`` searches to the round cap,
-    where a zero budget switches the stage off). What they share is when the
-    complaint has to arrive. ``pgs-decimate`` checks both itself, but the stage
-    runs after densify, reconstruct and refine have been paid for, and a typo
-    that costs a night of cluster time is not a good error message.
-    """
-    seed = getattr(args, 'decimate_quadric_seed', None)
-    if seed is not None and seed < 0:
-        raise StageError(f'--decimate-quadric-seed={seed} is negative. It is a '
-                         f'quadric threshold, which cannot be; omit it to have '
-                         f'one derived from the budget and the mesh.')
-    gain = getattr(args, 'decimate_min_gain', None)
-    if gain is not None and not 0 <= gain < 1:
-        raise StageError(f'--decimate-min-gain={gain} is outside [0, 1). It is '
-                         f'the share of the result\'s faces still worth '
-                         f'another full measurement, so 1 or more would stop '
-                         f'the search before it could win anything, and 0 is '
-                         f'the way to search to the round cap.')
-
-
-def clear_zeroed_budgets(args, explicit: set, logger) -> None:
-    """Let an explicit zero budget turn the stage off, not just its own target.
-
-    Zero is documented as the way to drop decimation from a resumed run, but the
-    stage is in the shape while *either* budget is truthy and ``apply_stored``
-    has already folded the recorded ones back in. Without this, a run recorded
-    with both budgets keeps decimating -- to the face target the caller was
-    trying to stop -- and the flag's own help is wrong.
-
-    An explicit zero therefore clears the pair. Unless the other budget is
-    explicit on this run too: naming both is a caller saying "not this bound,
-    that one", which is a target change and not a disable.
-    """
-    given = {d: getattr(args, d, None) for d in DECIMATE_BUDGETS
-             if d in explicit and hasattr(args, d)}
-    if not given or any(given.values()):
-        return
-    for dest in DECIMATE_BUDGETS:
-        inherited = getattr(args, dest, None)
-        if dest in given or not inherited:
-            continue
-        flag = '--' + dest.replace('_', '-')
-        logger.warning(f'{flag}={inherited} came from the manifest, and a zero '
-                       f'budget turns the whole decimate stage off, so it is '
-                       f'dropped too. Pass {flag} again alongside the zero to '
-                       f'keep decimating to it.')
-        setattr(args, dest, None)
+                             f'distance or a face count; pass 0 to leave this '
+                             f'one unset, --no-mvs-decimate to drop the stage, '
+                             f'or a positive value to bound it.')
 
 
 def pipeline_shape(args) -> Tuple[str, ...]:
@@ -496,12 +632,16 @@ def pipeline_shape(args) -> Tuple[str, ...]:
         if args.mvs_coarsen:
             shape.append('coarsen')
         shape.append('refine')
-    # Truthiness, not ``is not None``: the target *is* the enable flag, so 0 is
-    # how a resumed run turns the stage off -- omitting it would inherit the
-    # recorded budget through ``apply_stored`` (ADR 0008 s6; issue #20). A zero
-    # given on the command line reaches here having already cleared the other
-    # budget, via ``clear_zeroed_budgets``.
-    if any(getattr(args, dest) for dest in DECIMATE_BUDGETS):
+    # An enable flag like every other stage's. It was budget truthiness until
+    # this flag landed -- the target doubling as the switch, so a zero turned the
+    # stage off on a resume where an omitted flag would have inherited the
+    # recorded budget through ``apply_stored`` (ADR 0008 s6). That made
+    # ``--decimate-ratio``'s default unstatable, since a defaulted target can
+    # never be falsy, and it was always a workaround for issue #20 rather than
+    # a design. Unlike ``coarsen`` this is not gated on ``mvs_refine``:
+    # coarsening prepares a mesh *for* refine, where decimating shrinks the
+    # deliverable and is worth doing with or without one.
+    if args.mvs_decimate:
         shape.append('decimate')
     shape.append('texture')
     return tuple(sorted(shape, key=stage_index))

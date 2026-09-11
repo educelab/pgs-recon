@@ -115,6 +115,12 @@ def fake_run(tracker, args) -> None:
         tracker.end('refine', inputs={'scene': scene_in, 'mesh': mesh_in},
                     outputs={'mesh': layout.refine_mesh(root)})
 
+    if tracker.begin('decimate'):
+        mesh_in = tracker.require('mesh')
+        tracker.end('decimate', inputs={'mesh': mesh_in},
+                    outputs={'mesh': layout.decimate_mesh(root),
+                             'deviation': layout.decimate_report(root)})
+
     if tracker.begin('texture'):
         scene_in, mesh_in = tracker.require('scene'), tracker.require('mesh')
         tracker.end('texture', inputs={'scene': scene_in, 'mesh': mesh_in},
@@ -285,9 +291,9 @@ class TestChain(TrackerCase):
         fake_run(self.tracker(args), args)
         tracker = self.tracker(make_args(from_stage='texture', rerun=True))
         self.assertTrue(tracker.begin('texture'))
-        # The mesh role is bound to what refine wrote, not to what
-        # reconstruct did.
-        self.assertEqual(self.root / 'mvs/refine_mesh.ply',
+        # The mesh role is bound to what the *last* producer wrote -- with a
+        # default shape that is decimate, not refine and not reconstruct.
+        self.assertEqual(self.root / 'mvs/decimate_mesh.ply',
                          tracker.require('mesh'))
 
 
@@ -465,7 +471,7 @@ class TestStagedJobs(TrackerCase):
 
         job2 = self.tracker(args)
         self.assertEqual(['densify', 'reconstruct', 'coarsen', 'refine',
-                          'texture'], self.runs(job2))
+                          'decimate', 'texture'], self.runs(job2))
         self.assertEqual('skip', job2.status_of('convert'))
         fake_run(job2, args)
 
@@ -511,8 +517,8 @@ class TestStagedJobs(TrackerCase):
 
         plain = make_args(mvs_densify=False)
         tracker = self.tracker(plain, explicit={'mvs_densify'})
-        self.assertEqual(['reconstruct', 'coarsen', 'refine', 'texture'],
-                         self.runs(tracker))
+        self.assertEqual(['reconstruct', 'coarsen', 'refine', 'decimate',
+                          'texture'], self.runs(tracker))
         self.assertEqual('inputs changed: scene', tracker.dirty['reconstruct'])
         fake_run(tracker, plain)
         # The mesh keeps its name across the shape change (ADR 0006) and is

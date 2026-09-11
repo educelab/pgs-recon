@@ -20,6 +20,17 @@ problem this amendment exists for. Decisions 4 and 5 and the implementation note
 revision; the superseded mechanism is recorded alongside its replacement rather
 than deleted, because its failure is the argument for what replaced it.
 
+**Amended again** after the 2026-09-10 batch, which is the first where every run
+finished: twelve decimate runs, 36 min to 4h54m, removing on average half the
+faces. Decision 6's enablement is reversed — `--mvs-decimate` is a real flag now
+and the budgets only bound the stage — because Decision 5 gained a fourth target,
+`--decimate-ratio`, which cannot have a default while a defaulted target would
+also mean "always on". Decisions 5 and 6 carry the revision. The contract is
+again untouched: what the stage *measures* and what it guarantees are unchanged,
+and the ratio is a way of stating a face target, not a new kind of bound. The
+search this batch indicts is filed separately as issues #24-#27 and is not in
+this change.
+
 ## Context
 
 A finished reconstruction's mesh is multiple millions of faces, which makes the
@@ -184,6 +195,48 @@ known world units or has the same goal:
 | `--max-faces` | face budget |
 | `--quadric-error` | raw threshold, documented as unitless, escape hatch |
 
+**Amended.** The pipeline adds a fourth way of naming the second of those:
+`--decimate-ratio`, a fraction of the stage's input face count, defaulting to
+`stages.DECIMATE_RATIO` (0.3). It is not a new target *kind* — it resolves to a
+face count in `stages.decimate_target()` before the binary sees anything — and
+`pgs-decimate` itself is unchanged by it.
+
+It exists because the deviation search is expensive and, on this corpus, was not
+buying what it cost: across the twelve runs of 2026-09-10 it chose face counts
+spanning 1.55M–6.95M on inputs that were near-identical in surface area, and
+every result measured 0.023–0.096 mm of `decimated_to_original` against a 1.000
+mm budget. What a ratio buys instead is a target knowable *before* the stage
+runs, so the collapse is one round. The value is refine's last act read
+backwards: `RefineMesh` ends with one uniform subdivision, measured at
+3.80×–3.93× (mean 3.88×, spread 3.4%) across all twelve, which is a property of
+`--refine-scales` and `--refine-scale-step` rather than of the object — the same
+kind of invariant `COARSEN_RATIO` is, and established the same way. 0.3 rather
+than the 0.26 that would undo it exactly, so the deliverable keeps a buffer over
+the density refine itself worked at.
+
+The three face sources rank: an explicit `--*-max-faces` wins, else the ratio,
+and `--*-ratio 0` yields no count at all — which is how a caller asks for the
+deviation search alone. `--*-max-error` is deliberately **not** in that ladder.
+`--prefer` is what arbitrates the two budgets, and a precedence rule between them
+would delete it.
+
+The `coarsen` stage gets all of this too, and `--coarsen-max-error`,
+`--coarsen-prefer`, `--coarsen-max-rounds`, `--coarsen-quadric-seed` and
+`--coarsen-min-gain` besides. ADR 0009's argument is about what coarsen
+*defaults* to — a face count, one round, which is what makes it affordable
+against the CGAL pass it replaces — and not about what it may be asked for.
+Withholding the search there bought nothing and cost the symmetry: both stages
+drive the same binary, and an operator who wants to bound coarsen's deviation on
+one run had no way to say so. No `--coarsen-max-error` leaves the stage exactly
+as it was, which is what the default does.
+
+So the two interfaces are now identical, flag for flag, and generated from one
+function (`_add_decimation_options()`) so they cannot drift. Three defaults
+differ, and only those three: the ratio (0.375 against 0.3, each derived for its
+own position in the pipeline), and `--*-samples-per-face` / `--*-curvature-samples`,
+which coarsen turns down to the floor because nothing consumes a deviation it
+produces while decimate's is what the run reports.
+
 `--quadric-seed` is a fourth value of the same kind as `--quadric-error` and is
 deliberately not a target: it *starts* the search rather than replacing it, so
 the measured guarantee survives it. It exists because the seed is a guess and is
@@ -201,44 +254,93 @@ the pipeline**. Under `--prefer faces` the report carries
 mistaken for one that was. A tool whose default silently violates its own stated
 bound is worse than one that needs a flag to do so.
 
-### 6. Enablement: the target *is* the enable flag
+### 6. Enablement: a flag, like every other stage
+
+**Amended.** This decision is reversed. What it originally said is kept below,
+because its failure is the argument for the replacement.
+
+`--mvs-decimate` / `--no-mvs-decimate` is the enable flag, defaulting to **on**,
+and `pipeline_shape` reads it the way it reads `args.mvs_refine`. The budgets no
+longer gate anything: `--decimate-max-error 0` now means "not this target" and
+falls through to `--decimate-ratio`, exactly as an omitted flag does.
+`clear_zeroed_budgets()` is deleted with the mechanism it served.
+
+The reason is Decision 5's fourth target. A defaulted `--decimate-ratio` and a
+"the target is the enable flag" rule are mutually exclusive: a defaulted target
+can never be falsy, so under the old rule the stage would have been unconditional
+and unturnoffable. One of the two had to go, and the ratio is what makes the
+stage affordable.
+
+The old rule was also always a workaround for issue #20 rather than a design. Its
+whole apparatus — truthiness rather than `is not None`, the documented zero, the
+clearing of the budget beside it, the warning about the one it dropped, the
+exception for a caller who names both explicitly — existed to let a resumed run
+clear an argument that `apply_stored` would otherwise fold back in. A real
+boolean has the same problem in principle and does not solve #20; what it does is
+stop one stage from carrying a bespoke solution to it that nothing else in the
+pipeline shares. #20 stays open and is the right place for the general fix.
+
+This is a **behaviour change on resumed runs**, accepted deliberately while the
+2.0 line is in alpha: a run that used `--decimate-max-error 0` to drop the stage
+will now decimate to the default ratio. `--no-mvs-decimate` is the replacement,
+and the flag's help says so.
+
+A **negative** budget is still refused outright, in `validate_budgets()` and
+again in `pgs-decimate` itself. `Targets::have*` reads non-positive as *not
+given*, so `-1` is not a tighter bound: it silently vanishes and the stage
+coarsens to whatever target is left — the ratio, or the other budget — rather
+than to the bound the caller thought they set.
+
+`validate_decimate()` refuses the one combination with no reading left: a zero
+ratio with neither budget set, which leaves the stage nothing to aim at.
+`validate_coarsen()` refuses exactly the same combination, and the shared
+`_validate_shared_decimation()` makes the search, round-cap and geometry checks
+identical for both. The two stages are the same interface throughout; what
+differs is only what they *default* to.
+
+#### Superseded: the target as the enable flag
 
 `pipeline_shape` has two idioms — a boolean (`args.mvs_refine`) and presence of a
-value (`args.mvg_autoscale is not None`). Decimation takes the second: a
-`--decimate-max-error` or `--decimate-max-faces` puts the stage in the shape, and
-there is no `--mvs-decimate`. This makes "enabled with no target" and "target set
+value (`args.mvg_autoscale is not None`). Decimation took the second: a
+`--decimate-max-error` or `--decimate-max-faces` put the stage in the shape, and
+there was no `--mvs-decimate`. This made "enabled with no target" and "target set
 but stage off" unrepresentable.
 
-The gate is **truthiness, not `is not None`**, so `--decimate-max-error 0`
-switches the stage off. That is the disable path, and it exists because
-`apply_stored` (`stages.py:396-401`) folds the manifest's effective arguments in
-as defaults: on a resume, simply *omitting* the flag inherits the recorded value
-and the stage runs anyway. Zero is also honest as a value — a zero deviation
-budget permits only free collapses — and it must be said in the flag's help text,
-because it is not guessable. `--mvg-autoscale` has the same wart with no way out;
-a general mechanism for clearing an inherited argument is filed as issue #20 and
-is deliberately not in this change.
+The gate was **truthiness, not `is not None`**, so `--decimate-max-error 0`
+switched the stage off. That was the disable path, and it existed because
+`apply_stored` folds the manifest's effective arguments in as defaults: on a
+resume, simply *omitting* the flag inherits the recorded value and the stage runs
+anyway. Zero was also honest as a value — a zero deviation budget permits only
+free collapses — and had to be said in the flag's help text, because it is not
+guessable. `--mvg-autoscale` has the same wart with no way out.
 
-Because the gate is `any()` over the two budgets, a zero has to clear the budget
+Because the gate was `any()` over the two budgets, a zero had to clear the budget
 *beside* it as well as itself, or a run recorded with both would keep decimating
-to the inherited face target — the stage the flag is documented to switch off
-surviving on the other budget. `clear_zeroed_budgets()` does that, after
-`revert_out_of_range` and before the shape is read off the budgets, and warns
-about the one it drops. The exception is a run that names both budgets
+to the inherited face target — the stage the flag was documented to switch off
+surviving on the other budget. `clear_zeroed_budgets()` did that, after
+`revert_out_of_range` and before the shape was read off the budgets, and warned
+about the one it dropped. The exception was a run that named both budgets
 explicitly: `--decimate-max-error 0 --decimate-max-faces 2000000` is a caller
 saying "not this bound, that one", which is a target change and not a disable.
-
-A **negative** budget is refused outright, in `validate_budgets()` and again in
-`pgs-decimate` itself. `Targets::have*` reads non-positive as *not given*, so
-`-1` is not a tighter bound: alone it reaches the binary as no target at all and
-fails the run after densify, reconstruct and refine have been paid for, and
-beside a face budget it silently vanishes and the mesh is coarsened to a target
-nobody set. Zero is the off switch and a negative number has no second reading.
 
 ### 7. Position, and what it produces
 
 The `decimate` stage sits between `refine` (or `reconstruct`, when refine is off)
 and `texture`, consuming `mesh` and rebinding `mesh`, exactly as `refine` does.
+It is deliberately **not** gated on `mvs_refine` the way `coarsen` is: coarsening
+prepares a mesh *for* refine and has nothing to do without one, where decimating
+shrinks the deliverable, and on a `--no-mvs-refine` run `reconstruct`'s mesh is
+the largest thing the pipeline ever hands `texture`.
+
+**Amended** alongside Decision 5. What does not survive a missing refine is the
+*default target*: `DECIMATE_RATIO` is refine's last subdivision read backwards,
+so with no refine there is no subdivision to undo and 0.3 is just a number
+applied to whatever `reconstruct` produced. The stage stays ungated and
+`warn_decimate_without_refine()` says so, naming `--decimate-ratio` and
+`--decimate-max-faces`; it is silent once the caller has stated either, and
+silent when `--decimate-ratio 0` leaves the deviation budget governing. Gating
+the stage instead was considered and rejected: it would have left a no-refine run
+with nothing to shrink its deliverable at all.
 Placing it *before* refine — as a replacement for RefineMesh's CGAL prep pass —
 is a different contract (feed refine faces that project to about a pixel, not a
 world-unit deviation budget) and is deliberately not this stage. That use is
