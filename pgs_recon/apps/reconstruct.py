@@ -20,13 +20,14 @@ from pgs_recon.openmvs import (mvs_decimate, mvs_densify, mvs_reconstruct,
                                mvs_refine, mvs_texture)
 from pgs_recon.pgs_data import init_sfm_pgs, get_tag_option
 from pgs_recon.stages import (COARSEN_FACE_TOLERANCE, COARSEN_RATIO,
-                              CONTROL_ARGS, NO_PERSIST, STAGES, StageError,
-                              StageTracker, apply_stored, clear_zeroed_budgets,
-                              coarsen_target, drifted_stages, explicit_dests,
-                              find_manifest, load_manifest, pipeline_shape,
-                              refine_flags, resolve_range, revert_out_of_range,
-                              utc_now, validate_arg_map, validate_budgets,
-                              validate_coarsen, validate_search,
+                              CONTROL_ARGS, DECIMATE_RATIO, NO_PERSIST,
+                              STAGES, StageError, StageTracker, apply_stored,
+                              coarsen_target, decimate_target, drifted_stages,
+                              explicit_dests, find_manifest, load_manifest,
+                              pipeline_shape, refine_flags, resolve_range,
+                              revert_out_of_range, utc_now, validate_arg_map,
+                              validate_budgets, validate_coarsen,
+                              validate_decimate, warn_decimate_without_refine,
                               warn_refine_decimation, write_manifest)
 from pgs_recon.toolchain import Recorder
 from pgs_recon.utility import ToolFailed
@@ -107,6 +108,115 @@ def init_sfm_generic2(scan_dir: Path, sfm_file: Path, camdb_path: Path,
         view.pose = scene.add_pose(sfm.Pose())
 
     sfm.export_scene(path=sfm_file, scene=scene)
+
+
+def _add_decimation_options(group, stage: str, *, samples: int,
+                            curvature: bool) -> None:
+    """Add the flags ``coarsen`` and ``decimate`` share, under one prefix.
+
+    Both stages drive ``pgs-decimate``, so both get the *same* capabilities:
+    the same two targets, the same tie-break, the same search, the same
+    measurement cost and the same collapse geometry. Only the defaults differ,
+    and only where the two stages genuinely want different ones. Written once
+    so the surfaces cannot drift apart.
+
+    The search flags are here rather than on decimate alone. ADR 0009 is about
+    what coarsen *defaults* to -- a face count, one round, which is what makes
+    it affordable against the CGAL pass it replaces -- not about what it may be
+    asked to do. Giving no ``--coarsen-max-error`` leaves it exactly as it was.
+
+    ``samples``/``curvature`` are the stage's defaults, not the binary's:
+    coarsen turns measurement down to its floor because nothing consumes a
+    deviation it produces, and decimate leaves the binary's own defaults alone
+    because its deviation is what the run reports.
+    """
+    flag = f'--{stage}-'
+    # None means "omit the flag, let the binary decide", so say whose default
+    # is being described rather than printing `None` at the reader.
+    def shown(value, binary):
+        return f'binary default: {binary}' if value is None else f'default: {value}'
+
+    group.add_argument(f'{flag}samples-per-face', type=int, default=samples,
+                       metavar='n',
+                       help='Uniform deviation samples per face of the coarser '
+                            'mesh, per direction, floored at a million. The '
+                            'measurement is most of this stage\'s wall clock, '
+                            f'so this is the cost dial ({shown(samples, 10)})')
+    group.add_argument(f'{flag}curvature-samples', default=curvature,
+                       action=argparse.BooleanOptionalAction,
+                       help='Add a curvature-weighted sampling pass at half '
+                            'the uniform count, biasing samples toward where '
+                            'deviation is largest. Counts toward the measured '
+                            f'maximum only ({shown(curvature, True)})')
+    group.add_argument(f'{flag}preserve-boundary', default=None,
+                       action=argparse.BooleanOptionalAction,
+                       help='Do not collapse boundary edges (binary default: '
+                            'on)')
+    group.add_argument(f'{flag}preserve-topology', default=None,
+                       action=argparse.BooleanOptionalAction,
+                       help='Refuse collapses that change the topology. With '
+                            'this on, non-manifold geometry is what stalls a '
+                            'collapse short of its target -- the stage warns '
+                            'and the report counts it (binary default: on)')
+    group.add_argument(f'{flag}normal-check', default=None,
+                       action=argparse.BooleanOptionalAction,
+                       help='Refuse collapses that flip a face normal (binary '
+                            'default: on)')
+    group.add_argument(f'{flag}optimal-placement', default=None,
+                       action=argparse.BooleanOptionalAction,
+                       help='Place the collapsed vertex where the quadric is '
+                            'minimal rather than at an endpoint (binary '
+                            'default: on)')
+    group.add_argument(f'{flag}quality-threshold', type=float, default=None,
+                       metavar='q',
+                       help='Penalize collapses producing triangles below this '
+                            'quality, in (0, 0.866]. Not a looseness dial: 0 '
+                            'is refused, because vcglib clamps to it and then '
+                            'divides, so every collapse becomes infinitely '
+                            'expensive and the mesh passes through untouched '
+                            '(binary default: 0.3)')
+    group.add_argument(f'{flag}prefer', choices=['error', 'faces'],
+                       default='error', type=str.lower,
+                       help='Which budget wins when a deviation budget and a '
+                            'face target disagree. Inert unless a deviation '
+                            'budget is given, which is why a stage with no '
+                            'search in its defaults still carries it. The '
+                            'default protects the deviation budget, so the '
+                            'failure mode is a mesh larger than you asked for '
+                            'rather than one that lost a feature (default: '
+                            '%(default)s)')
+    group.add_argument(f'{flag}max-rounds', type=int, default=None,
+                       metavar='n',
+                       help='Cap on decimate-and-measure rounds. Only a '
+                            'deviation budget makes the stage search at all; '
+                            'a face target is reached in one round whatever '
+                            'this says (binary default: 10)')
+    group.add_argument(f'{flag}quadric-seed', type=float, default=None,
+                       metavar='q',
+                       help='First threshold the deviation search probes, in '
+                            'vcglib\'s unitless quadric error. Only seeds the '
+                            'search -- unlike the binary\'s --quadric-error it '
+                            'does not replace it, so the deviation is still '
+                            'measured and still bounds the result. The derived '
+                            'seed is a guess and is routinely orders of '
+                            'magnitude high. Where to get a good one: the '
+                            '"quadric_error" under "search" in this same '
+                            'object\'s previous report. The right threshold '
+                            'varies a couple of hundredfold between objects '
+                            'and only a few fold between reruns of one, so do '
+                            'not carry a seed from a different object.')
+    group.add_argument(f'{flag}min-gain', type=float, default=None,
+                       metavar='share',
+                       help='Stop the deviation search once it can still '
+                            'remove less than this share of the current '
+                            'result\'s faces. Measured deviation is a '
+                            'staircase in the threshold, so a budget landing '
+                            'between two steps can never be approached to '
+                            'within a few percent and each further round pays '
+                            'a full measurement for a few percent of the face '
+                            'count. In [0, 1); 0 searches to the round cap. '
+                            'Coarseness is all this can cost you -- never the '
+                            'deviation bound (binary default: 0.1)')
 
 
 def build_parser() -> configargparse.ArgumentParser:
@@ -305,6 +415,13 @@ def build_parser() -> configargparse.ArgumentParser:
                                'before refinement, instead of letting '
                                'RefineMesh do it. Ignored without '
                                '--mvs-refine. See the coarsen options below.')
+    opts_mvs.add_argument('--mvs-decimate', default=True,
+                          action=argparse.BooleanOptionalAction,
+                          help='Shrink the refined mesh before it is textured. '
+                               'On by default: refine\'s last act is a uniform '
+                               'subdivision that multiplies the face count by '
+                               '~3.9, and this is what takes it back off. See '
+                               'the decimate options below.')
     opts_mvs.add_argument('--mvs-smooth', type=int, default=2,
                           help='Number of smoothing iterations after initial '
                                'surface reconstruction. 0 is disabled.')
@@ -377,10 +494,13 @@ def build_parser() -> configargparse.ArgumentParser:
         'whose cost at a fixed target varies 135x between meshes and has '
         'killed refine jobs on the wall clock. Coarsening is a face budget, '
         'not a deviation budget: the target is a count and there is nothing '
-        'to search for, which is what makes it cheap. It is not the decimate '
-        'stage -- that one states a geometric bound and shrinks the '
-        'deliverable; this one only feeds refine, whose edge-size pass '
-        're-reduces the result by a further 3.6-4.1x before iteration zero.')
+        'to search for, which is what makes it cheap. The search is available '
+        '(--coarsen-max-error) but off, and the flags below mirror the '
+        'decimate stage\'s one for one -- the two differ in what they default '
+        'to, not in what they can do. What still separates them is purpose: '
+        'this one only feeds refine, whose edge-size pass re-reduces the '
+        'result by a further 3.6-4.1x before iteration zero, while decimate '
+        'shrinks the deliverable.')
     opts_coarsen.add_argument('--coarsen-ratio', type=float,
                               default=COARSEN_RATIO, metavar='f',
                               help='Fraction of the input mesh\'s faces to '
@@ -398,6 +518,19 @@ def build_parser() -> configargparse.ArgumentParser:
                               help='Face target as an absolute count, '
                                    'overriding --coarsen-ratio. For matching '
                                    'a previous run\'s refine input exactly.')
+    opts_coarsen.add_argument('--coarsen-max-error', type=float, default=None,
+                              metavar='UNITS',
+                              help='Deviation budget, in the solved scene\'s '
+                                   'units. Unset by default, which is what '
+                                   'keeps this stage to one round -- and one '
+                                   'round is what makes it affordable against '
+                                   'the CGAL pass it replaces (ADR 0009). Set '
+                                   'it and the stage searches, exactly as '
+                                   'decimate does, with --coarsen-prefer '
+                                   'deciding against the face target. Only '
+                                   'meaningful with --mvg-autoscale.')
+    _add_decimation_options(opts_coarsen, 'coarsen', samples=1,
+                            curvature=False)
 
     opts_decimate = parser.add_argument_group(
         'decimate options',
@@ -406,8 +539,25 @@ def build_parser() -> configargparse.ArgumentParser:
         'started from. That distance is measured on each candidate rather than '
         'estimated, so the result is never further off than you allowed -- and '
         'a JSON report beside the mesh records what the coarsening cost. '
-        'Stating a budget is what turns the stage on; there is no separate '
-        'enable flag.')
+        'On by default and switched with --mvs-decimate/--no-mvs-decimate; '
+        'stating a budget used to be what turned it on, and a zero budget was '
+        'the only way to turn it off again. Like coarsen, the default target '
+        'is a face count (--decimate-ratio) and so the default path is one '
+        'round; --decimate-max-error is what asks for the search.')
+    opts_decimate.add_argument('--decimate-ratio', type=float,
+                               default=DECIMATE_RATIO, metavar='f',
+                               help='Fraction of the refined mesh\'s faces to '
+                                    'keep, and the stage\'s default target. '
+                                    'RefineMesh\'s last act is one uniform '
+                                    'subdivision measured at 3.80-3.93x across '
+                                    'twelve cluster runs -- a property of '
+                                    '--refine-scales, not of the object -- so '
+                                    'the default takes that back off with a '
+                                    'little room to spare. Overridden by '
+                                    '--decimate-max-faces. Pass 0 to drop the '
+                                    'face target entirely and decimate to '
+                                    '--decimate-max-error alone '
+                                    '(default: %(default)s)')
     opts_decimate.add_argument('--decimate-max-error', type=float, default=None,
                                metavar='UNITS',
                                help='Deviation budget: the largest distance any '
@@ -415,65 +565,21 @@ def build_parser() -> configargparse.ArgumentParser:
                                     'the other. In the solved scene\'s units, '
                                     'which are physical only when '
                                     '--mvg-autoscale ran -- otherwise they are '
-                                    'arbitrary and --decimate-max-faces is the '
-                                    'flag you want. Giving this turns the '
-                                    'decimate stage on; giving 0 turns it off '
-                                    'again, which is the only way to, because '
-                                    'a resumed run inherits the budget the '
-                                    'manifest recorded when the flag is simply '
-                                    'omitted. A 0 also drops an inherited '
-                                    '--decimate-max-faces, unless you pass '
-                                    'that one too.')
+                                    'arbitrary and a face target is what you '
+                                    'want. Searching for this costs a full '
+                                    'measurement per round and is what makes '
+                                    'the stage expensive, so it is not the '
+                                    'default target; --decimate-ratio is. '
+                                    'Beside a face target, --decimate-prefer '
+                                    'says which wins.')
     opts_decimate.add_argument('--decimate-max-faces', type=int, default=None,
                                metavar='n',
-                               help='Face budget, for a scan that was never '
-                                    'scaled to physical units. Turns the stage '
-                                    'on and off exactly as above.')
-    opts_decimate.add_argument('--decimate-quadric-seed', type=float,
-                               default=None, metavar='q',
-                               help='First threshold the search probes, in '
-                                    'vcglib\'s unitless quadric error. Only '
-                                    'seeds the search -- unlike the binary\'s '
-                                    '--quadric-error it does not replace it, '
-                                    'so the deviation is still measured and '
-                                    'still bounds the result. The derived seed '
-                                    'is a guess and is routinely orders of '
-                                    'magnitude high, which costs the rounds '
-                                    'spent descending from it. Where to get a '
-                                    'good one: the "quadric_error" under '
-                                    '"search" in this same object\'s previous '
-                                    'decimate_report.json. That is the '
-                                    'threshold the last run converged at, and '
-                                    'the object\'s own history is the only '
-                                    'predictor there is -- the right threshold '
-                                    'varies a couple of hundredfold between '
-                                    'objects but only a few fold between reruns '
-                                    'of one, so do not carry a seed from a '
-                                    'different object. Does not turn the stage '
-                                    'on by itself.')
-    opts_decimate.add_argument('--decimate-min-gain', type=float, default=None,
-                               metavar='share',
-                               help='Stop the search once it can still remove '
-                                    'less than this share of the current '
-                                    'result\'s faces. Measured deviation is a '
-                                    'staircase in the threshold, so a budget '
-                                    'landing between two steps can never be '
-                                    'approached to within a few percent and '
-                                    'only the face count is left to improve; '
-                                    'each further round then pays a full '
-                                    'measurement of a multi-million-face mesh '
-                                    'for a few percent of it. In [0, 1); 0 '
-                                    'searches to the round cap. Coarseness is '
-                                    'all this can cost you -- never the '
-                                    'deviation bound (default: 0.1)')
-    opts_decimate.add_argument('--decimate-prefer', choices=['error', 'faces'],
-                               default='error', type=str.lower,
-                               help='Which budget wins when the two disagree. '
-                                    'The default protects the deviation '
-                                    'budget, so the failure mode is a mesh '
-                                    'larger than you asked for rather than one '
-                                    'that lost a feature (default: '
-                                    '%(default)s)')
+                               help='Face target as an absolute count, '
+                                    'overriding --decimate-ratio. Pass 0 (or '
+                                    'omit it) to let the ratio set the target. '
+                                    'To drop the stage, --no-mvs-decimate.')
+    _add_decimation_options(opts_decimate, 'decimate', samples=None,
+                            curvature=None)
 
     opts_stage = parser.add_argument_group(
         'staged run options',
@@ -563,18 +669,13 @@ def _main():
     # Before the shape is read off them: a negative budget is a mistake no layer
     # below can act on, and it should cost an exit rather than a reconstruction.
     validate_budgets(args)
-    validate_search(args)
     validate_coarsen(args)
+    validate_decimate(args)
 
     # Enable flags declare the pipeline shape; --from/--to select a window of it
     shape = pipeline_shape(args)
     from_stage, to_stage = resolve_range(args, shape)
     revert_out_of_range(args, stored, explicit, from_stage, to_stage, logger)
-    # An explicit zero clears the budget it was given beside as well as itself,
-    # or the stage it is documented to turn off survives on the other one (ADR
-    # 0008 s6). After the revert, so a zero the range did not authorize is back
-    # to its recorded value before it can drop anything.
-    clear_zeroed_budgets(args, explicit, logger)
     # Reverting an out-of-range override can change the shape back
     shape = pipeline_shape(args)
     from_stage, to_stage = resolve_range(args, shape)
@@ -595,6 +696,7 @@ def _main():
     # own log: the CGAL pass left on over an already-coarsened mesh, and
     # --decimate 1 taking the edge-size pass down with it.
     warn_refine_decimation(args, shape, logger)
+    warn_decimate_without_refine(args, shape, explicit, logger)
 
     # Only when it was asked for: coarsening is on by default, so warning on
     # the default would fire at everyone who legitimately runs --no-mvs-refine
@@ -603,9 +705,8 @@ def _main():
             and not args.mvs_refine):
         logger.warning('--mvs-coarsen has no effect without --mvs-refine: '
                        'coarsening only prepares a mesh for refinement. To '
-                       'shrink the deliverable, state a budget for the '
-                       'decimate stage (--decimate-max-error / '
-                       '--decimate-max-faces).')
+                       'shrink the deliverable, use the decimate stage '
+                       '(--mvs-decimate, on by default).')
 
     # Only the PGS importer reads capture indices. Warn rather than fail, so a
     # shared config carrying PGS settings still drives a generic run.
@@ -966,8 +1067,23 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
                 f'nothing will reduce this mesh -- lower --coarsen-max-faces, '
                 f'or pass --no-mvs-coarsen to leave the reduction to '
                 f'RefineMesh.')
-        mvs_decimate(mesh_in, output=coarse, max_faces=target, max_error=0,
-                     samples_per_face=1, curvature_samples=False)
+        # `max_error=0` unless asked for: no deviation budget is what collapses
+        # the search to one round, and one round is what makes this affordable
+        # against the CGAL pass it replaces (ADR 0009). Everything else is the
+        # decimate stage's call, flag for flag.
+        mvs_decimate(mesh_in, output=coarse, max_faces=target,
+                     max_error=args.coarsen_max_error or 0,
+                     prefer=args.coarsen_prefer,
+                     max_rounds=args.coarsen_max_rounds,
+                     quadric_seed=args.coarsen_quadric_seed,
+                     min_gain=args.coarsen_min_gain,
+                     samples_per_face=args.coarsen_samples_per_face,
+                     curvature_samples=args.coarsen_curvature_samples,
+                     preserve_boundary=args.coarsen_preserve_boundary,
+                     preserve_topology=args.coarsen_preserve_topology,
+                     normal_check=args.coarsen_normal_check,
+                     optimal_placement=args.coarsen_optimal_placement,
+                     quality_threshold=args.coarsen_quality_threshold)
         # The drift canary. `Decimated faces N (100%, ...)` in RefineMesh's log
         # was the only place this ratio was ever observable, and disabling
         # that pass removes it -- so the numbers go in the stage record, where
@@ -985,7 +1101,14 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
         else:
             facts['achieved_faces'] = achieved
             facts['achieved_ratio'] = round(achieved / input_faces, 6)
-            if abs(achieved - target) > COARSEN_FACE_TOLERANCE * target:
+            # Only when the count was actually the binding target. With
+            # `--coarsen-max-error` and `--coarsen-prefer error` the stage is
+            # allowed to stop short of it, and the canary would read a
+            # deliberate stop as a stalled collapse.
+            searched = bool(args.coarsen_max_error) and \
+                args.coarsen_prefer == 'error'
+            if (not searched
+                    and abs(achieved - target) > COARSEN_FACE_TOLERANCE * target):
                 logger.warning(
                     f'coarsen asked for {target} faces and got '
                     f'{achieved}, off by more than '
@@ -1028,12 +1151,45 @@ def run_pipeline(tracker: StageTracker, args, output: Path,
         mesh_in = tracker.require('mesh')
         decimated = layout.decimate_mesh(output)
         report = layout.decimate_report(output)
+        # The face target, and the only place this stage reads its input. An
+        # explicit count needs no header and neither does --decimate-ratio 0,
+        # which is how the caller asks for the deviation search alone.
+        target = args.decimate_max_faces or None
+        if target is None and args.decimate_ratio:
+            try:
+                input_faces = face_count(mesh_in)
+            except (OSError, NotAPlyHeader) as e:
+                raise StageError(
+                    f'cannot read a face count out of {mesh_in}, so there is '
+                    f'no input size to take --decimate-ratio of. '
+                    f'{str(e).rstrip(".")}. Give --decimate-max-faces to state '
+                    f'the target outright, --decimate-ratio 0 to decimate to '
+                    f'--decimate-max-error alone, or --no-mvs-decimate to drop '
+                    f'the stage.') from e
+            if input_faces < 1:
+                # `element face 0` is a point cloud. Every ratio of it is zero,
+                # and there is no surface to hand the texturer either.
+                raise StageError(
+                    f'{mesh_in} declares no faces, so there is no surface to '
+                    f'decimate. The stage that produced it did not write a '
+                    f'mesh; re-run it before this one.')
+            target = decimate_target(input_faces, args)
+            logger.info(f'Decimating {input_faces} faces to {target} '
+                        f'({target / input_faces:.4f} of the input)')
         mvs_decimate(mesh_in, output=decimated, report=report,
                      max_error=args.decimate_max_error,
-                     max_faces=args.decimate_max_faces,
+                     max_faces=target,
                      quadric_seed=args.decimate_quadric_seed,
                      min_gain=args.decimate_min_gain,
-                     prefer=args.decimate_prefer)
+                     max_rounds=args.decimate_max_rounds,
+                     prefer=args.decimate_prefer,
+                     samples_per_face=args.decimate_samples_per_face,
+                     curvature_samples=args.decimate_curvature_samples,
+                     preserve_boundary=args.decimate_preserve_boundary,
+                     preserve_topology=args.decimate_preserve_topology,
+                     normal_check=args.decimate_normal_check,
+                     optimal_placement=args.decimate_optimal_placement,
+                     quality_threshold=args.decimate_quality_threshold)
         tracker.end('decimate', inputs={'mesh': mesh_in},
                     outputs={'mesh': decimated, 'deviation': report})
 

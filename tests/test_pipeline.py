@@ -40,7 +40,7 @@ from unittest import mock
 
 from pgs_recon import layout, toolchain
 from pgs_recon.toolchain import MVG_BIN, MVS_BIN
-from pgs_recon.stages import StageError
+from pgs_recon.stages import DECIMATE_RATIO, StageError
 from pgs_recon.utility import ToolFailed
 
 from test_toolchain import flag, make_fake_prefix
@@ -277,6 +277,10 @@ class TestFullRun(PipelineCase):
             # ours to do now (ADR 0009).
             'mvs/coarsen_mesh.ply',
             'mvs/convert_scene.mvs',
+            # decimate is in a default shape too: refine's
+            # last act is a ~3.9x subdivision and this takes it back off.
+            'mvs/decimate_mesh.ply',
+            'mvs/decimate_report.json',
             'mvs/obj.obj',
             'mvs/reconstruct_mesh.ply',
             # Every intermediate is <stage>_<role> (ADR 0006): refine's output
@@ -306,6 +310,7 @@ class TestFullRun(PipelineCase):
             'ReconstructMesh',
             'pgs-decimate',                                 # coarsen
             'RefineMesh',
+            'pgs-decimate',                                 # decimate
             'TextureMesh',
         ], self.ran())
 
@@ -329,14 +334,27 @@ class TestFullRun(PipelineCase):
 class TestDecimateStage(PipelineCase):
     """The stage between refine and texture, and what enabling it is.
 
-    ADR 0008: the budget *is* the enable flag, the coarse mesh is what gets
-    textured, and the report is recorded so a finished run states the deviation
-    its deliverable is within.
+    ADR 0008: the coarse mesh is what gets textured, and the report is recorded
+    so a finished run states the deviation its deliverable is within. The
+    budget *was* also the enable flag; that is ``--mvs-decimate`` now, and
+    ``--decimate-ratio`` supplies a target when no budget is given.
     """
 
-    def test_no_budget_means_no_decimate_stage(self):
+    def test_it_runs_by_default_to_the_ratio(self):
         out = self.tmp / 'recon'
         self.run_recon(out)
+        self.assertTrue((out / 'mvs' / 'decimate_mesh.ply').exists())
+        self.assertTrue((out / 'mvs' / 'decimate_report.json').exists())
+        argv = self.argv_writing('decimate_mesh.ply')
+        # DECIMATE_RATIO of the fake refine mesh's face count, and no deviation
+        # budget: the default target is a count.
+        self.assertEqual(str(round(FAKE_FACES * DECIMATE_RATIO)),
+                         flag(argv, '--max-faces'))
+        self.assertIsNone(flag(argv, '--max-error'))
+
+    def test_the_flag_is_what_drops_it(self):
+        out = self.tmp / 'recon'
+        self.run_recon(out, '--no-mvs-decimate')
         self.assertFalse((out / 'mvs' / 'decimate_mesh.ply').exists())
         self.assertFalse((out / 'mvs' / 'decimate_report.json').exists())
         # `pgs-decimate` still runs -- coarsen drives the same binary -- so the
@@ -345,6 +363,13 @@ class TestDecimateStage(PipelineCase):
                          [Path(str(flag(c, '-o'))).name
                           for c, _ in self.commands
                           if Path(c[0]).name == 'pgs-decimate'])
+
+    def test_a_zero_ratio_hands_the_search_the_error_budget_alone(self):
+        self.run_recon(self.tmp / 'recon', '--decimate-ratio', '0',
+                       '--decimate-max-error', '0.2')
+        argv = self.argv_writing('decimate_mesh.ply')
+        self.assertEqual('0.2', flag(argv, '--max-error'))
+        self.assertIsNone(flag(argv, '--max-faces'))
 
     def test_a_budget_puts_it_between_refine_and_texture(self):
         self.run_recon(self.tmp / 'recon', '--decimate-max-error', '0.2')
@@ -363,8 +388,10 @@ class TestDecimateStage(PipelineCase):
                          flag(argv, '-o'))
         self.assertEqual(str(out / 'mvs' / 'decimate_report.json'),
                          flag(argv, '--report'))
-        # No face budget was given, so the binary's own default governs.
-        self.assertIsNone(flag(argv, '--max-faces'))
+        # No explicit count, so --decimate-ratio supplies one beside the
+        # deviation budget, and --decimate-prefer arbitrates the two.
+        self.assertEqual(str(round(FAKE_FACES * DECIMATE_RATIO)),
+                         flag(argv, '--max-faces'))
 
     def test_the_search_levers_reach_argv(self):
         self.run_recon(self.tmp / 'recon', '--decimate-max-error', '0.2',
@@ -382,16 +409,38 @@ class TestDecimateStage(PipelineCase):
         self.assertIsNone(flag(argv, '--quadric-seed'))
         self.assertIsNone(flag(argv, '--min-gain'))
 
-    def test_a_seed_alone_does_not_turn_the_stage_on(self):
-        """It tunes the search; the budgets are still the only enable flag
-        (ADR 0008 s6), and a seed with nothing to search for is a no-op."""
+    def test_a_seed_reaches_argv_without_gating_anything(self):
+        """It tunes the search and never enabled the stage; --mvs-decimate does
+        that now, and the seed rides along with whatever target is set."""
         self.run_recon(self.tmp / 'recon', '--decimate-quadric-seed', '1e-7')
-        # As above, coarsen drives the same binary, so what says the stage is
-        # off is that nothing wrote its output -- not that the tool never ran.
-        self.assertEqual(['coarsen_mesh.ply'],
-                         [Path(str(flag(c, '-o'))).name
-                          for c, _ in self.commands
-                          if Path(c[0]).name == 'pgs-decimate'])
+        argv = self.argv_writing('decimate_mesh.ply')
+        self.assertEqual('1e-07', flag(argv, '--quadric-seed'))
+
+    def test_the_measurement_and_geometry_flags_reach_argv(self):
+        """The wrapper exposed these all along; until this landed no stage
+        could reach them, which put the stage's own cost dial out of reach."""
+        self.run_recon(self.tmp / 'recon',
+                       '--decimate-samples-per-face', '2',
+                       '--no-decimate-curvature-samples',
+                       '--decimate-max-rounds', '4',
+                       '--no-decimate-preserve-topology',
+                       '--decimate-quality-threshold', '0.5')
+        argv = self.argv_writing('decimate_mesh.ply')
+        self.assertEqual('2', flag(argv, '--samples-per-face'))
+        self.assertEqual('0', flag(argv, '--curvature-samples'))
+        self.assertEqual('4', flag(argv, '--max-rounds'))
+        self.assertEqual('0', flag(argv, '--preserve-topology'))
+        self.assertEqual('0.5', flag(argv, '--quality-threshold'))
+
+    def test_the_geometry_flags_are_absent_unasked(self):
+        self.run_recon(self.tmp / 'recon')
+        argv = self.argv_writing('decimate_mesh.ply')
+        for absent in ('--preserve-boundary', '--preserve-topology',
+                       '--normal-check', '--optimal-placement',
+                       '--quality-threshold', '--max-rounds',
+                       '--samples-per-face', '--curvature-samples'):
+            with self.subTest(flag=absent):
+                self.assertIsNone(flag(argv, absent))
 
     def test_texture_is_handed_the_coarse_mesh(self):
         """The deliverable is born coarse: texturing faces that are about to be
@@ -427,17 +476,36 @@ class TestDecimateStage(PipelineCase):
         self.assertEqual(str(out / 'mvs' / 'reconstruct_mesh.ply'),
                          flag(self.argv_for('pgs-decimate'), '-i'))
 
-    def test_a_zero_budget_on_a_resume_drops_the_stage_and_reruns_texture(self):
-        """The documented way back from a budget that was wrong.
+    def test_a_defaulted_ratio_without_refine_warns(self):
+        # The stage still runs -- reconstruct's mesh is the largest thing the
+        # pipeline ever hands texture -- but the ratio is refine's subdivision
+        # read backwards, and there was no subdivision.
+        with self.assertLogs('pgs-recon', level='WARNING') as caught:
+            self.run_recon(self.tmp / 'recon', '--no-mvs-refine')
+        text = '\n'.join(caught.output)
+        self.assertIn('--decimate-ratio', text)
+        self.assertIn('no subdivision for it to undo', text)
+        self.assertEqual('decimate_mesh.ply',
+                         flag(self.argv_for('TextureMesh'), '-m'))
 
-        Omitting the flag would inherit the recorded budget, so ``0`` is the
-        off switch -- and dropping the stage costs one re-run, not a pipeline,
-        because texture's recorded mesh stops matching its binding.
+    def test_a_stated_target_without_refine_does_not_warn(self):
+        out = self.tmp / 'recon'
+        self.run_recon(out, '--no-mvs-refine', '--decimate-max-faces', '2000000')
+        argv = self.argv_writing('decimate_mesh.ply')
+        self.assertEqual('2000000', flag(argv, '--max-faces'))
+
+    def test_no_mvs_decimate_on_a_resume_drops_the_stage_and_reruns_texture(self):
+        """The way back from a decimation that was wrong.
+
+        It was ``--decimate-max-error 0`` while the budget was the enable flag;
+        a zero now just clears that one target. Dropping the stage costs one
+        re-run, not a pipeline, because only texture's recorded mesh stops
+        matching its binding.
         """
         out = self.tmp / 'recon'
         self.run_recon(out, '--decimate-max-error', '0.2')
         self.commands.clear()
-        meta = self.run_recon(out, '--decimate-max-error', '0')
+        meta = self.run_recon(out, '--no-mvs-decimate')
         self.assertEqual(['TextureMesh'], self.ran())
         self.assertEqual('refine_mesh.ply',
                          flag(self.argv_for('TextureMesh'), '-m'))
@@ -669,7 +737,9 @@ class TestCoarsenStage(PipelineCase):
         self.run_recon(self.tmp / 'recon')
         argv = self.argv_writing('coarsen_mesh.ply')
         self.assertEqual('0', flag(argv, '--max-error'))
-        self.assertIsNone(flag(argv, '--prefer'))
+        # No deviation budget is what makes it one round; --prefer rides along
+        # and is inert without one.
+        self.assertEqual('error', flag(argv, '--prefer'))
 
     def test_the_measurement_is_turned_down_and_no_report_is_written(self):
         # `pgs-decimate` measures on every round whatever the target, so the
@@ -719,13 +789,52 @@ class TestCoarsenStage(PipelineCase):
         self.assertEqual('2', flag(argv, '--ensure-edge-size'))
         self.assertEqual('coarsen_mesh.ply', flag(argv, '-m'))
 
+    def test_the_error_budget_turns_it_into_a_search(self):
+        """Available but off. ADR 0009 is about what this stage defaults to,
+        not about what it may be asked for."""
+        self.run_recon(self.tmp / 'recon', '--coarsen-max-error', '0.05',
+                       '--coarsen-prefer', 'faces',
+                       '--coarsen-max-rounds', '3',
+                       '--coarsen-min-gain', '0.2')
+        argv = self.argv_writing('coarsen_mesh.ply')
+        self.assertEqual('0.05', flag(argv, '--max-error'))
+        self.assertEqual('faces', flag(argv, '--prefer'))
+        self.assertEqual('3', flag(argv, '--max-rounds'))
+        self.assertEqual('0.2', flag(argv, '--min-gain'))
+        self.assertEqual(str(round(FAKE_FACES * 0.375)),
+                         flag(argv, '--max-faces'))
+
+    def test_the_search_flags_are_absent_unasked(self):
+        """The default call is byte-for-byte the one-round call it always was,
+        bar the inert --prefer."""
+        self.run_recon(self.tmp / 'recon')
+        argv = self.argv_writing('coarsen_mesh.ply')
+        for absent in ('--max-rounds', '--quadric-seed', '--min-gain'):
+            with self.subTest(flag=absent):
+                self.assertIsNone(flag(argv, absent))
+
+    def test_its_own_measurement_and_geometry_flags_reach_argv(self):
+        self.run_recon(self.tmp / 'recon',
+                       '--coarsen-samples-per-face', '3',
+                       '--coarsen-curvature-samples',
+                       '--no-coarsen-normal-check')
+        argv = self.argv_writing('coarsen_mesh.ply')
+        self.assertEqual('3', flag(argv, '--samples-per-face'))
+        self.assertEqual('1', flag(argv, '--curvature-samples'))
+        self.assertEqual('0', flag(argv, '--normal-check'))
+
     def test_dropping_the_stage_leaves_refine_at_its_own_defaults(self):
         self.run_recon(self.tmp / 'recon', '--no-mvs-coarsen')
         argv = self.argv_for('RefineMesh')
         self.assertIsNone(flag(argv, '--decimate'))
         self.assertIsNone(flag(argv, '--ensure-edge-size'))
         self.assertEqual('reconstruct_mesh.ply', flag(argv, '-m'))
-        self.assertNotIn('pgs-decimate', self.ran())
+        # `pgs-decimate` still runs for the decimate stage, which is on by
+        # default; what --no-mvs-coarsen drops is the call before refine.
+        self.assertEqual(['decimate_mesh.ply'],
+                         [Path(str(flag(c, '-o'))).name
+                          for c, _ in self.commands
+                          if Path(c[0]).name == 'pgs-decimate'])
 
     def test_an_explicit_refine_flag_still_wins(self):
         self.run_recon(self.tmp / 'recon', '--refine-decimate', '0.5')
@@ -957,7 +1066,7 @@ class TestResumeIsIdempotent(PipelineCase):
         self.commands.clear()
         self.run_recon(out, '--no-mvs-densify')
         self.assertEqual(['ReconstructMesh', 'pgs-decimate', 'RefineMesh',
-                          'TextureMesh'], self.ran())
+                          'pgs-decimate', 'TextureMesh'], self.ran())
         # The mesh chain is back on the non-dense names, and the dense
         # intermediates are left where they were: nothing deletes.
         self.assertEqual('convert_scene.mvs',

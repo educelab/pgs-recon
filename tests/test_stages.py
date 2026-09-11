@@ -19,13 +19,14 @@ from argparse import Namespace
 from pathlib import Path
 
 from pgs_recon import layout
-from pgs_recon.stages import (COARSEN_RATIO, REFINE_WITH_COARSEN, STAGE_ARGS,
-                              STAGE_IO, STAGES, StageError, StageTracker,
-                              clear_zeroed_budgets, coarsen_target,
-                              drifted_stages, pipeline_shape, refine_flags,
-                              resolve_range, revert_out_of_range,
+from pgs_recon.stages import (COARSEN_RATIO, DECIMATE_RATIO,
+                              REFINE_WITH_COARSEN, STAGE_ARGS, STAGE_IO,
+                              STAGES, StageError, StageTracker, coarsen_target,
+                              decimate_target, drifted_stages, pipeline_shape,
+                              refine_flags, resolve_range, revert_out_of_range,
                               validate_budgets, validate_coarsen,
-                              validate_search, warn_refine_decimation)
+                              validate_decimate, warn_decimate_without_refine,
+                              warn_refine_decimation)
 
 ROOT = Path('/recon')
 
@@ -48,12 +49,23 @@ DEFAULTS = dict(
     mvs_densify=False, densify_resolution_level=None, mask_value=0,
     free_space_support=False, mvs_smooth=2,
     mvs_coarsen=True, coarsen_ratio=COARSEN_RATIO, coarsen_max_faces=None,
+    coarsen_max_error=None, coarsen_prefer='error',
+    coarsen_max_rounds=None, coarsen_quadric_seed=None,
+    coarsen_min_gain=None, coarsen_samples_per_face=1,
+    coarsen_curvature_samples=False, coarsen_preserve_boundary=None,
+    coarsen_preserve_topology=None, coarsen_normal_check=None,
+    coarsen_optimal_placement=None, coarsen_quality_threshold=None,
     mvs_refine=True, refine_decimate=None, refine_resolution_level=None,
     refine_min_resolution=None, refine_scales=3, refine_scale_step=None,
     refine_ensure_edge_size=None,
+    mvs_decimate=True, decimate_ratio=DECIMATE_RATIO,
     decimate_max_error=None, decimate_max_faces=None,
     decimate_quadric_seed=None, decimate_min_gain=None,
-    decimate_prefer='error',
+    decimate_max_rounds=None, decimate_prefer='error',
+    decimate_samples_per_face=None, decimate_curvature_samples=None,
+    decimate_preserve_boundary=None, decimate_preserve_topology=None,
+    decimate_normal_check=None, decimate_optimal_placement=None,
+    decimate_quality_threshold=None,
     name='obj', file_type='obj', texture_resolution_level=None,
     texture_max_size=0,
     # flow control
@@ -389,9 +401,9 @@ class TestPlanning(unittest.TestCase):
         records = build_records(args)
         args.refine_scales = 5
         tracker = make_tracker(args, records, explicit={'refine_scales'})
-        self.assertEqual(['refine', 'texture'], runs(tracker))
+        self.assertEqual(['refine', 'decimate', 'texture'], runs(tracker))
         self.assertIn('--refine-scales', tracker.dirty['refine'])
-        self.assertIn('inputs rebuilt by refine', tracker.dirty['texture'])
+        self.assertIn('inputs rebuilt by decimate', tracker.dirty['texture'])
 
     def test_cascade_stops_at_to(self):
         args = make_args(from_stage='refine', to_stage='refine',
@@ -400,7 +412,7 @@ class TestPlanning(unittest.TestCase):
         tracker = make_tracker(args, records, explicit={'refine_scales'})
         self.assertEqual(['refine'], runs(tracker))
         self.assertEqual('after', tracker.status_of('texture'))
-        self.assertEqual(['texture'], tracker.stale_after_range())
+        self.assertEqual(['decimate', 'texture'], tracker.stale_after_range())
 
     def test_downstream_staleness_warns_and_does_not_error(self):
         log, handler = capturing_logger()
@@ -427,8 +439,8 @@ class TestPlanning(unittest.TestCase):
     def test_rerun_forces_the_range_only(self):
         args = make_args(from_stage='reconstruct', rerun=True)
         tracker = make_tracker(args, build_records(args))
-        self.assertEqual(['reconstruct', 'coarsen', 'refine', 'texture'],
-                         runs(tracker))
+        self.assertEqual(['reconstruct', 'coarsen', 'refine', 'decimate',
+                          'texture'], runs(tracker))
         self.assertEqual('--rerun', tracker.dirty['reconstruct'])
         self.assertEqual('done', tracker.status_of('convert'))
 
@@ -454,7 +466,7 @@ class TestPlanning(unittest.TestCase):
         records = build_records(args)
         records['refine']['status'] = 'failed'
         tracker = make_tracker(args, records)
-        self.assertEqual(['refine', 'texture'], runs(tracker))
+        self.assertEqual(['refine', 'decimate', 'texture'], runs(tracker))
 
     def test_producer_rebuild_cascades_when_the_path_is_unchanged(self):
         # sfm rewrites recon_dir/sfm_data.bin at the same path every time, so
@@ -464,7 +476,8 @@ class TestPlanning(unittest.TestCase):
         args.mvg_recon_method = 'stellar'
         tracker = make_tracker(args, records, explicit={'mvg_recon_method'})
         self.assertEqual(['sfm', 'robust', 'colorize', 'convert', 'reconstruct',
-                          'coarsen', 'refine', 'texture'], runs(tracker))
+                          'coarsen', 'refine', 'decimate', 'texture'],
+                         runs(tracker))
         self.assertEqual(records['robust']['inputs']['sfm'],
                          records['sfm']['outputs']['sfm'])
         self.assertIn('inputs rebuilt by sfm', tracker.dirty['robust'])
@@ -519,8 +532,8 @@ class TestShapeChanges(unittest.TestCase):
                          records['reconstruct']['inputs']['scene'])
         args = make_args(mvs_densify=False)
         tracker = make_tracker(args, records, explicit={'mvs_densify'})
-        self.assertEqual(['reconstruct', 'coarsen', 'refine', 'texture'],
-                         runs(tracker))
+        self.assertEqual(['reconstruct', 'coarsen', 'refine', 'decimate',
+                          'texture'], runs(tracker))
         self.assertEqual('inputs changed: scene',
                          tracker.dirty['reconstruct'])
         self.assertEqual('skip', tracker.status_of('convert'))
@@ -532,7 +545,7 @@ class TestShapeChanges(unittest.TestCase):
         records = build_records(make_args(mvs_densify=False))
         tracker = make_tracker(args, records, explicit={'mvs_densify'})
         self.assertEqual(['densify', 'reconstruct', 'coarsen', 'refine',
-                          'texture'], runs(tracker))
+                          'decimate', 'texture'], runs(tracker))
         self.assertEqual('never run', tracker.dirty['densify'])
         self.assertEqual('skip', tracker.status_of('convert'))
 
@@ -544,7 +557,7 @@ class TestShapeChanges(unittest.TestCase):
                                logger=log)
         tracker.log_plan()
         self.assertEqual(['densify', 'reconstruct'], runs(tracker))
-        self.assertEqual(['coarsen', 'refine', 'texture'],
+        self.assertEqual(['coarsen', 'refine', 'decimate', 'texture'],
                          tracker.stale_after_range())
         self.assertEqual([], tracker.prereq_errors())
         self.assertIn('left stale', handler.text())
@@ -562,57 +575,29 @@ class TestShapeChanges(unittest.TestCase):
                       'texture'):
             self.assertEqual('skip', tracker.status_of(stage))
 
-    def test_a_budget_puts_decimate_in_the_shape(self):
-        # The target is the enable flag: there is no --mvs-decimate, so "enabled
-        # with no target" is unrepresentable (ADR 0008 s6).
-        plain = make_args()
-        self.assertNotIn('decimate', pipeline_shape(plain))
-        by_error = make_args(decimate_max_error=0.2)
-        self.assertIn('decimate', pipeline_shape(by_error))
-        by_faces = make_args(decimate_max_faces=2000000)
-        self.assertIn('decimate', pipeline_shape(by_faces))
+    def test_the_flag_puts_decimate_in_the_shape(self):
+        # An enable flag like every other stage's. It used to be
+        # budget truthiness (ADR 0008 s6), which made a defaulted
+        # --decimate-ratio unstatable: a defaulted target is never falsy.
+        self.assertIn('decimate', pipeline_shape(make_args()))
+        self.assertNotIn('decimate',
+                         pipeline_shape(make_args(mvs_decimate=False)))
+
+    def test_a_zero_budget_no_longer_drops_the_stage(self):
+        # It did while the budgets were the enable flag. Now a zero says "not
+        # this target" and the ratio is still there to fall back on, so the
+        # stage stays and --no-mvs-decimate is the only way out.
+        for still_on in (make_args(decimate_max_error=0),
+                         make_args(decimate_max_faces=0),
+                         make_args(decimate_max_error=0,
+                                   decimate_max_faces=0)):
+            with self.subTest(args=still_on):
+                self.assertIn('decimate', pipeline_shape(still_on))
 
     def test_decimate_sits_between_refine_and_texture(self):
-        shape = pipeline_shape(make_args(decimate_max_error=0.2))
+        shape = pipeline_shape(make_args())
         self.assertEqual(('reconstruct', 'coarsen', 'refine', 'decimate',
                           'texture'), shape[-5:])
-
-    def test_a_zero_budget_leaves_decimate_out(self):
-        # The documented way to turn the stage off on a resume: apply_stored
-        # folds the recorded budget back in, so omitting the flag would not.
-        for off in (make_args(decimate_max_error=0),
-                    make_args(decimate_max_faces=0)):
-            with self.subTest(off=off):
-                self.assertNotIn('decimate', pipeline_shape(off))
-
-    def test_a_zero_budget_clears_the_budget_beside_it(self):
-        # The disable path has to turn the *stage* off, not one target: a run
-        # recorded with both budgets has the face one folded back in by
-        # apply_stored, and would keep decimating to it (ADR 0008 s6).
-        args = make_args(decimate_max_error=0, decimate_max_faces=2000000)
-        logger, handler = capturing_logger()
-        clear_zeroed_budgets(args, {'decimate_max_error'}, logger)
-        self.assertIsNone(args.decimate_max_faces)
-        self.assertNotIn('decimate', pipeline_shape(args))
-        self.assertIn('--decimate-max-faces', handler.text())
-
-    def test_a_zero_beside_an_explicit_budget_is_a_target_change(self):
-        # Naming both on one command line says "not this bound, that one".
-        args = make_args(decimate_max_error=0, decimate_max_faces=2000000)
-        logger, handler = capturing_logger()
-        clear_zeroed_budgets(args, {'decimate_max_error', 'decimate_max_faces'},
-                             logger)
-        self.assertEqual(2000000, args.decimate_max_faces)
-        self.assertIn('decimate', pipeline_shape(args))
-        self.assertEqual('', handler.text())
-
-    def test_an_inherited_zero_clears_nothing(self):
-        # Only a zero the caller typed is a disable; one folded in from the
-        # manifest is just the state the stage was already left in.
-        args = make_args(decimate_max_error=0, decimate_max_faces=2000000)
-        logger, _ = capturing_logger()
-        clear_zeroed_budgets(args, set(), logger)
-        self.assertEqual(2000000, args.decimate_max_faces)
 
     def test_a_negative_budget_is_refused(self):
         # pgs-decimate reads a non-positive target as "not given", so -1 would
@@ -633,13 +618,20 @@ class TestShapeChanges(unittest.TestCase):
 
     def test_a_bad_search_setting_is_refused_before_the_run(self):
         # pgs-decimate refuses these itself, but only once densify, reconstruct
-        # and refine have been paid for.
-        for off, word in ((make_args(decimate_quadric_seed=-1e-7), 'negative'),
-                          (make_args(decimate_min_gain=1.0), '[0, 1)'),
-                          (make_args(decimate_min_gain=-0.1), '[0, 1)')):
-            with self.subTest(off=off):
+        # and refine have been paid for. Checked for *both* stages, which carry
+        # the same flags.
+        cases = [(make_args(decimate_quadric_seed=-1e-7), 'negative',
+                  validate_decimate),
+                 (make_args(decimate_min_gain=1.0), '[0, 1)', validate_decimate),
+                 (make_args(decimate_min_gain=-0.1), '[0, 1)', validate_decimate),
+                 (make_args(coarsen_quadric_seed=-1e-7), 'negative',
+                  validate_coarsen),
+                 (make_args(coarsen_min_gain=1.0), '[0, 1)', validate_coarsen),
+                 (make_args(coarsen_max_rounds=0), 'below 1', validate_coarsen)]
+        for off, word, check in cases:
+            with self.subTest(off=off, check=check.__name__):
                 with self.assertRaises(StageError) as ctx:
-                    validate_search(off)
+                    check(off)
                 self.assertIn(word, str(ctx.exception))
 
     def test_the_search_settings_have_a_zero_that_means_something(self):
@@ -649,17 +641,20 @@ class TestShapeChanges(unittest.TestCase):
                    make_args(decimate_min_gain=0.99),
                    make_args(decimate_quadric_seed=0)):
             with self.subTest(ok=ok):
-                validate_search(ok)
+                validate_decimate(ok)
+        for ok in (make_args(coarsen_min_gain=0),
+                   make_args(coarsen_quadric_seed=0)):
+            with self.subTest(ok=ok):
+                validate_coarsen(ok)
 
     def test_dropping_decimate_reruns_texture_and_nothing_earlier(self):
-        # Recovering from a bad budget costs one stage, not a pipeline: only
-        # texture's recorded mesh stops matching its binding.
-        coarse = make_args(decimate_max_error=0.2)
-        records = build_records(coarse)
+        # Dropping the stage costs one rerun, not a pipeline: only texture's
+        # recorded mesh stops matching its binding.
+        records = build_records(make_args())
         self.assertEqual('mvs/decimate_mesh.ply',
                          records['texture']['inputs']['mesh'])
-        args = make_args(decimate_max_error=0)
-        tracker = make_tracker(args, records, explicit={'decimate_max_error'})
+        args = make_args(mvs_decimate=False)
+        tracker = make_tracker(args, records, explicit={'mvs_decimate'})
         self.assertEqual(['texture'], runs(tracker))
         self.assertEqual('inputs changed: mesh', tracker.dirty['texture'])
         self.assertEqual('off', tracker.status_of('decimate'))
@@ -667,9 +662,9 @@ class TestShapeChanges(unittest.TestCase):
         self.assertEqual([], tracker.prereq_errors())
 
     def test_adding_decimate_reruns_it_and_texture_only(self):
-        args = make_args(decimate_max_error=0.2)
-        records = build_records(make_args())
-        tracker = make_tracker(args, records, explicit={'decimate_max_error'})
+        args = make_args()
+        records = build_records(make_args(mvs_decimate=False))
+        tracker = make_tracker(args, records, explicit={'mvs_decimate'})
         self.assertEqual(['decimate', 'texture'], runs(tracker))
         self.assertEqual('never run', tracker.dirty['decimate'])
         self.assertEqual('skip', tracker.status_of('refine'))
@@ -687,7 +682,7 @@ class TestShapeChanges(unittest.TestCase):
 
     def test_decimate_survives_refine_being_dropped(self):
         # It consumes whatever owns `mesh`, which without refine is reconstruct.
-        args = make_args(mvs_refine=False, decimate_max_error=0.2)
+        args = make_args(mvs_refine=False)
         records = build_records(args)
         self.assertEqual('mvs/reconstruct_mesh.ply',
                          records['decimate']['inputs']['mesh'])
@@ -695,12 +690,147 @@ class TestShapeChanges(unittest.TestCase):
         self.assertEqual([], runs(tracker))
 
     def test_disabling_refine_rebuilds_texture(self):
+        # decimate reruns too: it consumes `mesh`, which reconstruct now owns.
         args = make_args(mvs_refine=False)
         records = build_records(make_args(mvs_refine=True))
         tracker = make_tracker(args, records, explicit={'mvs_refine'})
-        self.assertEqual(['texture'], runs(tracker))
-        self.assertEqual('inputs changed: mesh', tracker.dirty['texture'])
+        self.assertEqual(['decimate', 'texture'], runs(tracker))
+        self.assertEqual('inputs changed: mesh', tracker.dirty['decimate'])
+        self.assertEqual('inputs rebuilt by decimate',
+                         tracker.dirty['texture'])
         self.assertEqual('off', tracker.status_of('refine'))
+
+
+class TestDecimateTarget(unittest.TestCase):
+    """``--decimate-ratio`` and the ladder it sits at the bottom of."""
+
+    def test_the_ratio_undoes_refines_last_subdivision(self):
+        # 3.80x-3.93x across twelve cluster runs, so 0.26 would undo it exactly
+        # and the default keeps a little room over that.
+        self.assertAlmostEqual(0.3, DECIMATE_RATIO)
+
+    def test_the_default_target_is_the_ratio_of_the_input(self):
+        self.assertEqual(3540000, decimate_target(11800000, make_args()))
+
+    def test_an_explicit_count_beats_the_ratio(self):
+        args = make_args(decimate_max_faces=2000000)
+        self.assertEqual(2000000, decimate_target(11800000, args))
+
+    def test_a_zero_count_defers_to_the_ratio(self):
+        # Exactly as --coarsen-max-faces 0 does. Not an off switch.
+        args = make_args(decimate_max_faces=0)
+        self.assertEqual(3540000, decimate_target(11800000, args))
+
+    def test_a_zero_ratio_yields_no_count_at_all(self):
+        # Which is how the caller asks for the deviation search alone. Coarsen
+        # floors its target at one face; flooring here would coarsen a
+        # deliverable to nothing instead of handing the search its budget.
+        args = make_args(decimate_ratio=0, decimate_max_error=0.1)
+        self.assertIsNone(decimate_target(11800000, args))
+
+    def test_the_error_budget_is_not_in_the_ladder(self):
+        # --decimate-prefer exists to arbitrate the two budgets, so a
+        # precedence rule between them would delete it.
+        args = make_args(decimate_max_error=0.1)
+        self.assertEqual(3540000, decimate_target(11800000, args))
+
+    def test_a_ratio_out_of_range_is_refused(self):
+        for bad in (1, 1.5, -0.1):
+            with self.subTest(ratio=bad):
+                with self.assertRaises(StageError) as ctx:
+                    validate_decimate(make_args(decimate_ratio=bad))
+                self.assertIn('--decimate-ratio', str(ctx.exception))
+
+    def test_a_zero_ratio_with_no_budget_is_refused(self):
+        with self.assertRaises(StageError) as ctx:
+            validate_decimate(make_args(decimate_ratio=0))
+        self.assertIn('--no-mvs-decimate', str(ctx.exception))
+
+    def test_a_zero_ratio_is_fine_with_either_budget(self):
+        for ok in (make_args(decimate_ratio=0, decimate_max_error=0.1),
+                   make_args(decimate_ratio=0, decimate_max_faces=2000000)):
+            with self.subTest(args=ok):
+                validate_decimate(ok)
+
+    def test_a_round_cap_below_one_is_refused(self):
+        with self.assertRaises(StageError) as ctx:
+            validate_decimate(make_args(decimate_max_rounds=0))
+        self.assertIn('--decimate-max-rounds', str(ctx.exception))
+
+    def test_a_quality_threshold_out_of_range_is_refused(self):
+        # 0 is not a looser setting: vcglib clamps to it and then divides, so
+        # every collapse becomes infinitely expensive and nothing collapses.
+        for dest, flag_name, check in (
+                ('decimate_quality_threshold', '--decimate-quality-threshold',
+                 validate_decimate),
+                ('coarsen_quality_threshold', '--coarsen-quality-threshold',
+                 validate_coarsen)):
+            for bad in (0, 0.9, -0.1):
+                with self.subTest(dest=dest, value=bad):
+                    with self.assertRaises(StageError) as ctx:
+                        check(make_args(**{dest: bad}))
+                    self.assertIn(flag_name, str(ctx.exception))
+
+    def test_the_ordinary_settings_pass(self):
+        for ok in (make_args(), make_args(decimate_max_rounds=1),
+                   make_args(decimate_quality_threshold=0.866),
+                   make_args(coarsen_quality_threshold=0.3),
+                   make_args(decimate_ratio=0.999)):
+            with self.subTest(args=ok):
+                validate_decimate(ok)
+
+
+class TestDecimateWithoutRefine(unittest.TestCase):
+    """The stage is not gated on refine (ADR 0008 Decision 7); the *default
+    target* is the thing that stops meaning anything without one."""
+
+    def test_the_stage_is_not_gated_on_refine(self):
+        shape = pipeline_shape(make_args(mvs_refine=False))
+        self.assertIn('decimate', shape)
+        self.assertNotIn('coarsen', shape)
+
+    def test_a_defaulted_ratio_without_refine_warns(self):
+        logger, handler = capturing_logger()
+        args = make_args(mvs_refine=False)
+        warn_decimate_without_refine(args, pipeline_shape(args), set(), logger)
+        text = handler.text()
+        self.assertIn('--decimate-ratio', text)
+        self.assertIn('--decimate-max-faces', text)
+
+    def test_a_chosen_ratio_without_refine_is_silent(self):
+        # The caller has said what they want for this shape.
+        logger, handler = capturing_logger()
+        args = make_args(mvs_refine=False, decimate_ratio=0.5)
+        warn_decimate_without_refine(args, pipeline_shape(args),
+                                     {'decimate_ratio'}, logger)
+        self.assertEqual('', handler.text())
+
+    def test_a_face_count_without_refine_is_silent(self):
+        logger, handler = capturing_logger()
+        args = make_args(mvs_refine=False, decimate_max_faces=2000000)
+        warn_decimate_without_refine(args, pipeline_shape(args), set(), logger)
+        self.assertEqual('', handler.text())
+
+    def test_a_zero_ratio_without_refine_is_silent(self):
+        # No face target at all, so there is no unjustified constant to warn
+        # about -- the deviation budget is what governs.
+        logger, handler = capturing_logger()
+        args = make_args(mvs_refine=False, decimate_ratio=0,
+                         decimate_max_error=0.1)
+        warn_decimate_without_refine(args, pipeline_shape(args), set(), logger)
+        self.assertEqual('', handler.text())
+
+    def test_the_ordinary_shape_is_silent(self):
+        logger, handler = capturing_logger()
+        args = make_args()
+        warn_decimate_without_refine(args, pipeline_shape(args), set(), logger)
+        self.assertEqual('', handler.text())
+
+    def test_a_dropped_stage_is_silent(self):
+        logger, handler = capturing_logger()
+        args = make_args(mvs_refine=False, mvs_decimate=False)
+        warn_decimate_without_refine(args, pipeline_shape(args), set(), logger)
+        self.assertEqual('', handler.text())
 
 
 class TestCoarsen(unittest.TestCase):
@@ -773,6 +903,22 @@ class TestCoarsen(unittest.TestCase):
             validate_coarsen(make_args(coarsen_max_faces=-1))
         self.assertIn('--coarsen-max-faces', str(ctx.exception))
 
+    def test_a_zero_ratio_with_nothing_to_aim_at_is_refused(self):
+        # Same refusal as decimate's: no ratio, no count, no deviation budget.
+        with self.assertRaises(StageError) as ctx:
+            validate_coarsen(make_args(coarsen_ratio=0))
+        self.assertIn('--no-mvs-coarsen', str(ctx.exception))
+
+    def test_a_zero_ratio_is_fine_beside_a_count(self):
+        args = make_args(coarsen_ratio=0, coarsen_max_faces=9000000)
+        validate_coarsen(args)
+        self.assertEqual(9000000, coarsen_target(26003288, args))
+
+    def test_a_zero_ratio_is_fine_beside_a_deviation_budget(self):
+        # ADR 0009 is about what coarsen *defaults* to, not what it may be
+        # asked for: the search is available here exactly as it is in decimate.
+        validate_coarsen(make_args(coarsen_ratio=0, coarsen_max_error=0.05))
+
     def test_a_zero_face_count_defers_to_the_ratio(self):
         # Not an off switch -- --no-mvs-coarsen is -- so it means what an unset
         # flag means, and the ratio governs.
@@ -785,7 +931,8 @@ class TestCoarsen(unittest.TestCase):
         records = build_records(args)
         args.coarsen_ratio = 0.2
         tracker = make_tracker(args, records, explicit={'coarsen_ratio'})
-        self.assertEqual(['coarsen', 'refine', 'texture'], runs(tracker))
+        self.assertEqual(['coarsen', 'refine', 'decimate', 'texture'],
+                         runs(tracker))
         self.assertIn('--coarsen-ratio', tracker.dirty['coarsen'])
 
     def test_dropping_it_reruns_refine_because_its_mesh_moves(self):
@@ -795,7 +942,7 @@ class TestCoarsen(unittest.TestCase):
         args = make_args(mvs_coarsen=False)
         records = build_records(make_args())
         tracker = make_tracker(args, records, explicit={'mvs_coarsen'})
-        self.assertEqual(['refine', 'texture'], runs(tracker))
+        self.assertEqual(['refine', 'decimate', 'texture'], runs(tracker))
         self.assertEqual('inputs changed: mesh', tracker.dirty['refine'])
         self.assertEqual('off', tracker.status_of('coarsen'))
 
@@ -803,7 +950,8 @@ class TestCoarsen(unittest.TestCase):
         args = make_args()
         records = build_records(make_args(mvs_coarsen=False))
         tracker = make_tracker(args, records, explicit={'mvs_coarsen'})
-        self.assertEqual(['coarsen', 'refine', 'texture'], runs(tracker))
+        self.assertEqual(['coarsen', 'refine', 'decimate', 'texture'],
+                         runs(tracker))
         self.assertEqual('skip', tracker.status_of('reconstruct'))
 
 
@@ -893,7 +1041,7 @@ class TestLegacyManifests(unittest.TestCase):
     """
 
     def test_a_verbatim_rerun_over_legacy_names_runs_nothing(self):
-        for label, args in (('default', make_args()),
+        for label, args in (('default', make_args(mvs_decimate=False)),
                             ('densified', make_args(mvs_densify=True)),
                             ('scaled', make_args(mvg_robust=True,
                                                  mvg_autoscale=0.47))):
@@ -905,7 +1053,7 @@ class TestLegacyManifests(unittest.TestCase):
     def test_a_later_job_binds_the_names_the_records_carry(self):
         # Not what layout would name them today: the paths handed to the stages
         # are the recorded ones, verbatim.
-        args = make_args(from_stage='texture')
+        args = make_args(mvs_decimate=False, from_stage='texture')
         tracker = make_tracker(args, legacy_records(args))
         self.assertEqual(ROOT / 'mvs/scene.mvs', tracker.require('scene'))
         self.assertEqual(ROOT / 'mvs/scene_refine.ply', tracker.require('mesh'))
@@ -914,7 +1062,7 @@ class TestLegacyManifests(unittest.TestCase):
         # What a legacy directory costs: the first stage that re-runs writes the
         # new name, the cascade carries it downstream, and the old files are
         # left orphaned -- the same thing --rerun has always produced.
-        args = make_args()
+        args = make_args(mvs_decimate=False)
         records = legacy_records(args)
         records['reconstruct']['status'] = 'failed'
         tracker = make_tracker(args, records)
