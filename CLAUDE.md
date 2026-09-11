@@ -54,8 +54,11 @@ carry yet skips rather than taking the others down), `run_command`'s exit
 statuses
 (`test_utility.py`), and `pgs-recon` end to end against a prefix of fake binaries
 plus its `--dry-run` (`test_pipeline.py`, `test_reconstruct.py`, which skip
-themselves when `configargparse`/`sfm_utils`/`exiftool` are missing). All
-stdlib-only, so they run anywhere in seconds — no reconstruction math is
+themselves when `configargparse`/`sfm_utils`/`exiftool` are missing), and the
+shapes `utils.charuco` promises its consumers whatever OpenCV returned
+(`test_charuco.py`, which draws a synthetic sample square at a known
+pixels-per-cm, and needs `cv2`). The planner-and-wrappers core is
+stdlib-only, so it runs anywhere in seconds — no reconstruction math is
 exercised, only what the pipeline asks the binaries to do. CI
 (`.gitlab-ci.yml`) runs that suite three ways — bare Python, with the Python deps
 installed, and inside `ghcr.io/educelab/pgs-recon:edge` (`test:in-image`, the only
