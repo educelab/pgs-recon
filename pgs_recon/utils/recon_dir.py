@@ -1,8 +1,8 @@
 """Locate a pgs-recon run's artifacts from the manifest it wrote.
 
-``pgs-retexture`` and ``pgs-calibrate`` both start from a finished ``pgs-recon``
-output directory, and both must answer the same non-obvious question: *which* of
-the many SfM files in there is the solved scene the mesh was built from. The
+``pgs-retexture`` starts from a finished ``pgs-recon`` output directory and must
+answer a non-obvious question: *which* of the many SfM files in there is the
+solved scene the mesh was built from. The
 answer is the scene fed to ``openMVG2openMVS`` -- after any robust-triangulation
 and autoscale step, before colorize -- so it is no single stage's output, which
 is why the convert stage records its *input*. Getting this wrong yields a
@@ -16,10 +16,14 @@ since-moved scratch disk), so they are never trusted as written.
 
 Each artifact has its own resolver returning a `Resolved`, so callers demand only
 what they use: ``pgs-retexture`` needs the mesh and its frame and calls
-``.require()`` on both, while ``pgs-calibrate`` (whose output is just a pose +
-intrinsic) never asks for the mesh, and tolerates an unresolvable SfM when
-``--sfm-data`` names one -- which is what lets it calibrate against a run that
-stopped before MVS.
+``.require()`` on both, while a caller wanting only a pose need never ask for the
+mesh, and can tolerate an unresolvable SfM when it has been handed one -- which
+is what lets a run that stopped before MVS still be worked against.
+
+``pgs-calibrate`` was the other caller and is gone (ADR 0011). Its replacement,
+``pgs-localize``, is C++ and takes explicit ``--input-scene``/``--matches-dir``
+paths rather than reading this manifest: a second consumer of a format
+``stages.py`` owns is what ADR 0006 exists to prevent.
 """
 import json
 import logging

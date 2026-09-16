@@ -419,11 +419,16 @@ class TestEnumsMatchTheBinary(unittest.TestCase):
     """The enums are transcribed values, and a wrong one is a silently different
     reconstruction rather than an error.
 
-    Checked member by member rather than by spot-check, because these leak past
-    this module: ``pgs-calibrate`` builds two ``choices`` lists straight off
+    Checked member by member rather than by spot-check. These used to leak past
+    this module -- ``pgs-calibrate`` built two ``choices`` lists straight off
     :class:`~pgs_recon.openmvg.CameraModel` and
-    :class:`~pgs_recon.openmvg.ResectionMethod`, so a member added here becomes a
-    value a user can select (see ``test_calibrate``).
+    :class:`~pgs_recon.openmvg.ResectionMethod`, so a member added here for
+    ``openMVG_main_SfM``'s benefit silently became a value offered for
+    ``openMVG_main_SfM_Localization``, a different binary with its own
+    validation. ``CameraModel.SPHERICAL`` arrived exactly that way. That app is
+    gone (ADR 0011) and its replacement spells its own names in C++, so the enums
+    now have one consumer; the per-member check is what keeps them honest to the
+    pinned headers regardless.
     """
 
     #: Each enum's full membership, transcribed from the pinned OpenMVG headers.

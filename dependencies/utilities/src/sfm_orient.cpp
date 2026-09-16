@@ -56,6 +56,7 @@
 
 #include "marker_detection.hpp"
 #include "marker_types.hpp"
+#include "Npy.hpp"
 
 namespace ar  = cv::aruco;
 namespace el  = educelab;
@@ -298,35 +299,6 @@ auto BuildTransform(const Eigen::Matrix3d &R, const Eigen::Vector3d &center,
     Eigen::Matrix4d scl = Eigen::Matrix4d::Identity();
     scl.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * scale;
     return scl * rot * trans;
-}
-
-// Write a 4x4 float64 matrix as NumPy .npy v1.0, C-order, little-endian.
-void WriteNpy(const fs::path &path, const Eigen::Matrix4d &mat)
-{
-    const std::string dictStr =
-        "{'descr': '<f8', 'fortran_order': False, 'shape': (4, 4), }";
-    const std::size_t minLen    = dictStr.size() + 1;  // +1 for \n
-    const std::size_t headerLen = ((minLen + 10 + 63) / 64) * 64 - 10;
-
-    std::string header(headerLen, ' ');
-    std::copy(dictStr.begin(), dictStr.end(), header.begin());
-    header[headerLen - 1] = '\n';
-
-    std::ofstream file(path, std::ios::binary);
-    if (!file) {
-        throw std::runtime_error("Cannot write: " + path.string());
-    }
-    const uint8_t magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y', 0x01, 0x00};
-    file.write(reinterpret_cast<const char *>(magic), 8);
-    const auto hlen = static_cast<uint16_t>(headerLen);
-    file.write(reinterpret_cast<const char *>(&hlen), 2);
-    file.write(header.data(), static_cast<std::streamsize>(headerLen));
-    for (int r = 0; r < 4; ++r) {
-        for (int c = 0; c < 4; ++c) {
-            const double v = mat(r, c);
-            file.write(reinterpret_cast<const char *>(&v), 8);
-        }
-    }
 }
 
 // Apply the 4x4 transform to vertices and rotate normals (if present).
@@ -814,7 +786,7 @@ auto main(int argc, char *argv[]) -> int
     if (wantXform) {
         const fs::path outPath = args["save-transform"].as<std::string>();
         fs::create_directories(fs::weakly_canonical(outPath).parent_path());
-        WriteNpy(outPath, tfm);
+        pgs::npy::write(outPath, tfm);
         std::cout << "Saved transform: " << outPath << "\n";
     }
 

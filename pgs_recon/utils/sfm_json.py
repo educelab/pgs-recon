@@ -5,8 +5,10 @@ rewriting a scene by hand has to handle: polymorphic type registration lives on
 whichever instance happens to be *first* (`fix_polymorphic_registration`), and
 extrinsics are stored as (rotation, center) rather than the (R, t) most
 conventions expect (`transform_extrinsic`). Both bite when a scene is filtered
-down to a subset of views, which is exactly what ``pgs-calibrate`` does to
-extract one localized view and ``pgs-retexture`` does to keep one rig camera.
+down to a subset of views, which is exactly what ``pgs-retexture`` does to keep
+one rig camera. (``pgs-calibrate`` was the other caller; ``pgs-localize``
+replaced it and emits its one-view scene through openMVG's own serializer, so it
+needs neither repair -- see ADR 0011.)
 """
 import json
 import logging

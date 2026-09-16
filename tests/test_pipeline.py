@@ -47,7 +47,7 @@ from test_toolchain import flag, make_fake_prefix
 
 DEPS = ('configargparse', 'sfm_utils', 'exiftool')
 MISSING = [d for d in DEPS if importlib.util.find_spec(d) is None]
-#: ``pgs-retexture``/``pgs-calibrate`` additionally read pixels.
+#: ``pgs-retexture`` additionally reads pixels.
 APP_MISSING = MISSING + [d for d in ('cv2',)
                          if importlib.util.find_spec(d) is None]
 
@@ -1185,56 +1185,6 @@ class TestPrefixResolution(PipelineCase):
         second = self.tmp / 'from-config'
         self.run_recon(second, '-c', str(config), '--to', 'import')
         self.assertEqual(['openMVG_main_SfMInit_ImageListing'], self.ran())
-
-
-@unittest.skipIf(APP_MISSING, f'requires {", ".join(APP_MISSING)}')
-class TestCalibrateLocalizesAgainstTheRecon(PipelineCase):
-    """``pgs-calibrate``'s one wrapper call, whose five paths are easy to swap.
-
-    The rest of the app (image prep, extracting the localized view) is stubbed:
-    what MR2 changed here is the call, and a transposed ``-q``/``-o`` would
-    otherwise only show up against a real OpenMVG.
-    """
-
-    def test_localization_is_given_the_recon_regions_and_a_private_output(self):
-        from pgs_recon.apps import calibrate
-        recon = self.tmp / 'recon'
-        self.run_recon(recon)
-        query = self.tmp / 'query.jpg'
-        query.write_bytes(b'')
-        self.commands.clear()
-
-        out = self.tmp / 'calib'
-        argv = ['pgs-calibrate', '-i', str(query), '-r', str(recon),
-                '-o', str(out), '--path', str(self.prefix),
-                '--log-level', 'ERROR']
-        extracted = []
-        with mock.patch.object(sys, 'argv', argv), \
-                mock.patch('pgs_recon.toolchain.run_command', self.fake), \
-                mock.patch('atexit.register', lambda fn: fn), \
-                mock.patch.object(calibrate, 'prepare_8bit_image',
-                                  side_effect=self._stub_prepare), \
-                mock.patch.object(calibrate, 'extract_calibration',
-                                  side_effect=lambda p, *a: extracted.append(p)):
-            calibrate._main()
-
-        argv = self.argv_for('openMVG_main_SfM_Localization')
-        self.assertEqual(str(recon / 'mvg' / 'matches_dir'), flag(argv, '-m'))
-        self.assertEqual(str(out / 'query'), flag(argv, '-q'))
-        self.assertEqual(str(out / 'query_matches'), flag(argv, '-u'))
-        self.assertEqual(str(out / 'localization'), flag(argv, '-o'))
-        self.assertEqual(str(recon / 'mvg' / 'recon_dir' / 'sfm_data.bin'),
-                         flag(argv, '-i'))
-        # The scene the wrapper reported is the one the calibration is read from.
-        self.assertEqual([out / 'localization' / 'sfm_data_expanded.json'],
-                         extracted)
-
-    @staticmethod
-    def _stub_prepare(src, out_dir):
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
-        prepared = Path(out_dir) / f'{Path(src).stem}.jpg'
-        prepared.write_bytes(b'')
-        return prepared
 
 
 @unittest.skipIf(APP_MISSING, f'requires {", ".join(APP_MISSING)}')

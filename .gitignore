@@ -9,3 +9,11 @@ venv/*
 **/*.sif
 build*/
 *out.txt
+
+# Handoff/plan notes and rig-specific config live at the repo root as working
+# files, never committed: they belong to whoever is doing the work, they name
+# datasets and paths that are not this project's, and the durable half of what
+# they say belongs in docs/adr/ instead.
+HANDOFF-*.md
+PLAN-*.md
+*_camera.txt

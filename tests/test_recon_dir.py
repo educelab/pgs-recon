@@ -1,9 +1,10 @@
 """``pgs_recon.utils.recon_dir``: locating a run's artifacts from its manifest.
 
-Both ``pgs-retexture`` (which needs the mesh and the frame it lives in) and
-``pgs-calibrate`` (which needs neither the mesh nor, given ``--sfm-data``, the
-recorded SfM) resolve against the same manifest, under whichever of its two names
-this directory has (``stages.find_manifest``, ADR 0007). Each artifact has its
+``pgs-retexture`` (which needs the mesh and the frame it lives in) resolves
+against the manifest under whichever of its two names this directory has
+(``stages.find_manifest``, ADR 0007). Each resolver stands alone, so a caller
+that wants only the SfM is not made to have a mesh -- which is the property the
+independence test below pins. Each artifact has its
 own resolver returning a `Resolved`, so the contract worth pinning is: a resolver
 either hands back a path that really exists on disk, or a reason explaining why
 it could not -- never a path that cannot be opened, and never silence.
@@ -154,8 +155,8 @@ class TestResolveTexturedMesh(ReconDirCase):
         self.assertIn('missing from disk', got.reason)
 
     def test_mesh_resolves_independently_of_the_sfm(self):
-        """pgs-calibrate never asks for the mesh; a missing one must not leak
-        into the SfM's resolution (and vice versa)."""
+        """A caller wanting only a pose never asks for the mesh; a missing one
+        must not leak into the SfM's resolution (and vice versa)."""
         recon = self.write(STAGES_FULL, mesh=False)
         self.assertIsNotNone(resolve_solved_sfm(recon).path)
         self.assertIsNone(resolve_textured_mesh(recon).path)
