@@ -1,7 +1,7 @@
 """The one place a capture file on disk becomes pixels.
 
-``pgs-convert``, ``pgs-calibrate`` and ``pgs-retexture`` all have to hand
-OpenMVG/OpenMVS something it can read, and the formats they are pointed at
+``pgs-convert``, ``pgs-retexture`` and (before ``pgs-localize`` replaced it)
+``pgs-calibrate`` all have to hand OpenMVG/OpenMVS something it can read, and the formats they are pointed at
 (16-bit greyscale, CIELab TIFFs) are not it. They used to disagree about how:
 ``pgs-convert`` read in process, while the other two shelled out to ImageMagick
 ``convert``, which ignores a Lab file's WhitePoint tag and decodes every one of
@@ -161,8 +161,7 @@ def prepare_8bit_image(src: Path, out_dir: Path) -> Path:
 
     Unlike ``pgs-retexture``'s ``convert_modality_images`` (which keeps a *set*
     of frames mutually consistent for atlas texturing), this handles ONE
-    standalone image that becomes its own texture, or the query image
-    ``pgs-calibrate`` extracts features from.
+    standalone image that becomes its own texture.
 
     This was ImageMagick, and differs from it only on Lab files; see the module
     docstring.

@@ -88,12 +88,37 @@ un-centered (solved frame); the transform is stored, not pre-applied to it.
 _Avoid_: alignment, normalization
 
 **Localization**:
-Resectioning a *new* image into an existing solved scene by matching its 2D
-features against the reconstruction's 3D structure (OpenMVG
-`SfM_Localization`), recovering that image's pose (and, for an uncalibrated
-camera, intrinsic) in the solved frame. Distinct from the **rig-prior import**:
-the scene is already solved and is not re-solved. This is what `pgs-calibrate`
-does. _Avoid_: registration, alignment, SfM
+Resectioning a *new* image into an existing solved scene, recovering that
+image's pose (and, for an uncalibrated camera, intrinsic) in the solved frame.
+Distinct from the **rig-prior import**: the scene is already solved and is not
+re-solved. This is what `pgs-localize` does, by either of two **correspondence
+backends** — see [ADR 0011](docs/adr/0011-localize-by-rendering-the-mesh.md).
+_Avoid_: registration, alignment, SfM
+
+**Correspondence backend**:
+Where `pgs-localize` gets its 3D↔2D pairs. The **sparse** backend matches the
+query's descriptors against the reconstruction's 3D structure (OpenMVG
+`SfM_Localization`'s method). The **render-and-match** backend renders a textured
+mesh in the query's own modality from a prior pose, matches render against query,
+and lifts the render-side keypoints through the render's own position map. Naming
+which one is meant matters: they have the same output and very different
+accuracy. _Avoid_: matcher (that is the descriptor matcher inside either one)
+
+**Held-out** (of a QA statistic):
+Scored on correspondences the solve did not use — `pgs-localize` splits them on a
+spatial checkerboard, solves on one colour and scores on the other. Deliberately
+not called *independent*: the matches were still found using a render from the
+pose being scored, so it bounds the fit and not the registration. An inlier RMS
+is a different statistic over a set the solve itself chose, and the published
+thresholds do not transfer to it. _Avoid_: independent, validation error
+
+**Standoff**:
+The camera-to-scene distance along the optical axis — concretely, the scene
+origin's depth in camera space, which is the emitted pose's `t[2]`. On the
+spectral rig it is rigid to 0.3 mm across the corpus while lateral position
+floats by 1.7 cm, so it is both the tightest invariant available and the only QA
+gate that does not depend on the correspondence set. _Avoid_: working distance,
+Z
 
 **Calibration** (a family of senses):
 Three steps here all calibrate something, and naming which one is meant is the
@@ -105,12 +130,12 @@ whole job of the word:
 - **autoscale** calibrates the scene's *scale*, fixing the solved frame's
   arbitrary unit against a marker of known physical size — the `autoscale`
   stage, via `pgs-global-scaler`;
-- **`pgs-calibrate`** calibrates a *new* camera into an already-solved scene, by
+- **`pgs-localize`** calibrates a *new* camera into an already-solved scene, by
   **localizing** it.
 
 Unqualified, and especially as an artifact, "calibration" means the third:
 `*_calibration.json`, the reusable single-view calibration emitted by
-`pgs-calibrate`, one localized view carrying a pose + intrinsic in the solved
+`pgs-localize`, one localized view carrying a pose + intrinsic in the solved
 frame. Because a physical camera position is shared across its modalities, that
 calibration is solved once and reused to texture with each modality.
 

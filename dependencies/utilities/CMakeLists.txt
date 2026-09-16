@@ -24,6 +24,17 @@ FetchContent_Declare(
     EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(libcore)
+# bvh (madmann91 v2): header-only ray/triangle BVH, the renderer's nearest-hit
+# structure. Same pin registration-toolkit uses, so pgs-localize's render and
+# rt_reorder_texture's stay comparable -- which is what keeps the measured
+# numbers in ADR 0011 honest.
+FetchContent_Declare(
+    bvh
+    GIT_REPOSITORY https://github.com/madmann91/bvh.git
+    GIT_TAG 66e445b
+    EXCLUDE_FROM_ALL
+)
+FetchContent_MakeAvailable(bvh)
 FetchContent_Declare(
     indicators
     GIT_REPOSITORY https://github.com/p-ranav/indicators.git
@@ -81,7 +92,7 @@ target_compile_features(global_scaler PUBLIC cxx_std_17)
 set_target_properties(global_scaler PROPERTIES OUTPUT_NAME "pgs-global-scaler")
 
 # sfm orient utility
-add_executable(sfm_orient src/sfm_orient.cpp)
+add_executable(sfm_orient src/sfm_orient.cpp src/Npy.hpp)
 target_include_directories(sfm_orient
     PUBLIC
         $<BUILD_INTERFACE:${libcore_SOURCE_DIR}/include>
@@ -134,10 +145,89 @@ target_link_libraries(gen_aruco_markers
 target_compile_features(gen_aruco_markers PUBLIC cxx_std_17)
 set_target_properties(gen_aruco_markers PROPERTIES OUTPUT_NAME "pgs-generate-markers")
 
+# The describer reader, alone in a C++17 library: openMVG's bundled cereal does
+# not compile under C++20 (its StaticObject::LockGuard declares a defaulted copy
+# constructor, which P1008 stopped leaving an aggregate, so cereal's own
+# `return LockGuard{};` finds no constructor). pgs-localize is C++20 because bvh
+# needs std::span, so the one file that has to meet cereal is held back rather
+# than the whole tool.
+add_library(localize_describer STATIC
+        src/localize_describer.hpp
+        src/localize_describer.cpp)
+# openMVG's nonFree tree (the VLFeat SIFT describer) is installed but no
+# imported target carries its include path. Derive it from the one target that
+# points into openMVG_dependencies rather than guessing at the prefix.
+get_target_property(_mvg_cereal_include OpenMVG::cereal INTERFACE_INCLUDE_DIRECTORIES)
+get_filename_component(_mvg_deps_include "${_mvg_cereal_include}" DIRECTORY)
+get_filename_component(_mvg_deps_include "${_mvg_deps_include}" DIRECTORY)
+if(NOT EXISTS "${_mvg_deps_include}/nonFree/sift/SIFT_describer_io.hpp")
+    message(FATAL_ERROR
+        "openMVG's nonFree SIFT describer headers were not found under "
+        "${_mvg_deps_include}. pgs-localize needs them to read the describer "
+        "recorded in a matches directory's image_describer.json.")
+endif()
+target_include_directories(localize_describer
+    PUBLIC
+        src/
+        "${_mvg_deps_include}"
+)
+target_link_libraries(localize_describer
+    Eigen3::Eigen
+    OpenMVG::cereal
+    OpenMVG::openMVG_features
+    OpenMVG::vlsift
+)
+target_compile_features(localize_describer PUBLIC cxx_std_17)
+
+# localization utility
+add_executable(localize
+        src/localize.cpp
+        src/localize_camera.hpp
+        src/localize_camera.cpp
+        src/localize_match.hpp
+        src/localize_match.cpp
+        src/localize_render.hpp
+        src/localize_render.cpp
+        src/localize_solve.hpp
+        src/localize_solve.cpp
+        src/localize_sparse.hpp
+        src/localize_sparse.cpp
+        src/localize_describer.hpp
+        src/Npy.hpp)
+target_include_directories(localize
+    PUBLIC
+        src/
+        $<BUILD_INTERFACE:${libcore_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${bvh_SOURCE_DIR}/src>
+        $<BUILD_INTERFACE:${indicators_SOURCE_DIR}/include>
+)
+target_link_libraries(localize
+    localize_describer
+    Boost::program_options
+    Eigen3::Eigen
+    opencv_core
+    opencv_imgcodecs
+    opencv_imgproc
+    opencv_video
+    OpenMVG::cereal
+    OpenMVG::openMVG_camera
+    OpenMVG::openMVG_features
+    OpenMVG::openMVG_geometry
+    OpenMVG::openMVG_matching
+    OpenMVG::openMVG_multiview
+    OpenMVG::openMVG_sfm
+)
+# C++20, alone among the utilities: bvh v2 needs it (std::span, defaulted
+# comparison operators), and registration-toolkit's rt_core builds at the same
+# standard against the same pin.
+target_compile_features(localize PUBLIC cxx_std_20)
+set_target_properties(localize PROPERTIES OUTPUT_NAME "pgs-localize")
+
 # install
 include(GNUInstallDirs)
 install(TARGETS
     global_scaler
+    localize
     sfm_orient
     gen_aruco_markers
     decimate

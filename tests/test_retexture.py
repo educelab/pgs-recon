@@ -21,6 +21,7 @@ No binary runs -- ``index_modality_images`` reads a directory and
 import importlib.util
 import json
 import logging
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -479,6 +480,146 @@ class TestFilteringSpansTheCapturesCameras(RetextureCase):
             filter_sfm_for_cameras(sfm, 'PGS_', self.tmp / 'modality',
                                    {(4, 0): 'a.jpg'}, self.tmp / 'filtered.json')
         self.assertIn('No solved view shares', str(ctx.exception))
+
+
+class TestProjectiveTexturingTexturesOnlyWhatIsSeen(RetextureCase):
+    """``--calibration`` without ``--use-openmvs`` textures by projecting the
+    mesh through the one calibrated view, and a face that projects inside the
+    image is not the same thing as a face the camera saw: anything behind a
+    nearer part of the mesh would otherwise take the foreground's pixels.
+
+    The kernel is tested in ``test_visibility``; what is held here is the wiring
+    and the OBJ it writes -- an unseen face keeps its geometry and loses its
+    UVs, which is the same thing this file's out-of-view faces already do.
+    """
+    def calibration(self):
+        """``test_visibility``'s camera, written as a one-view calibration:
+        the kernel's tests and these have to be aimed at the same camera, and a
+        second copy of a principal point is how they stop being. Only the lone
+        intrinsic and extrinsic are read (``camera_from_calibration``), so only
+        those are written."""
+        from tests.test_visibility import CAM, H, W
+        path = self.tmp / 'cal.json'
+        path.write_text(json.dumps({
+            'intrinsics': [{'key': 0, 'value': {
+                'polymorphic_id': POLY_FLAG | 1,
+                'polymorphic_name': 'pinhole',
+                'ptr_wrapper': {'id': 1, 'data': {
+                    'width': W, 'height': H, 'focal_length': CAM['f'],
+                    'principal_point': [CAM['cx'], CAM['cy']]}}}}],
+            'extrinsics': [{'key': 0, 'value': {
+                'rotation': CAM['R'].tolist(),
+                'center': CAM['C'].tolist()}}]}))
+        return path
+
+    def write_mesh(self, *quads):
+        """An OBJ of flat quads, each given as ``(depth, x0, x1, y0, y1)`` with
+        the extents in *pixels* off the principal point -- what a patch covers
+        in the image is what matters here, and it is not its size in the scene.
+        Wound so every quad faces the camera, so back-face culling keeps them
+        all and only the depth test can drop one."""
+        from tests.test_visibility import CAM
+        path = self.tmp / 'mesh.obj'
+        verts, faces = [], []
+        for z, x0, x1, y0, y1 in quads:
+            wx0, wx1, wy0, wy1 = (p * z / CAM['f'] for p in (x0, x1, y0, y1))
+            n = len(verts)
+            verts += [(wx0, wy0), (wx0, wy1), (wx1, wy1), (wx1, wy0)]
+            faces += [(n + 1, n + 2, n + 3), (n + 1, n + 3, n + 4)]
+            for i in range(n, len(verts)):
+                verts[i] = verts[i] + (z,)
+        path.write_text(
+            '\n'.join([f'v {x} {y} {z}' for x, y, z in verts]
+                      + [f'f {a} {b} {c}' for a, b, c in faces]) + '\n')
+        return path
+
+    def texture(self, mesh, **kwargs):
+        """Project ``mesh`` through the calibration; returns the counts of
+        textured (``f v/vt ...``) and untextured (``f v ...``) faces."""
+        from pgs_recon.apps.retexture import project_texture_mesh
+        image = self.tmp / 'ir940.jpg'
+        image.write_bytes(b'not read: the projective path copies it')
+        out = self.tmp / 'out' / 'textured.obj'
+        project_texture_mesh(self.calibration(), image, mesh, out, **kwargs)
+        faces = [ln for ln in out.read_text().splitlines()
+                 if ln.startswith('f ')]
+        self.assertTrue((out.parent / 'textured.jpg').is_file())
+        return (sum('/' in ln for ln in faces),
+                sum('/' not in ln for ln in faces))
+
+    #: A 40x40 px patch at depth 5, a small quad hidden right behind it, and a
+    #: third quad off to the side that nothing covers.
+    HIDDEN = ((5.0, -20, 20, -20, 20), (10.0, -5, 5, -5, 5),
+              (10.0, 20, 40, -10, 10))
+
+    def test_a_hidden_face_keeps_its_geometry_and_loses_its_uvs(self):
+        textured, plain = self.texture(self.write_mesh(*self.HIDDEN))
+        self.assertEqual((textured, plain), (4, 2))
+
+    def test_without_the_depth_test_the_hidden_face_is_textured_too(self):
+        # Same mesh, same in-view and front-facing tests: the difference is the
+        # depth test alone, which is what --no-occlusion-cull turns off.
+        textured, plain = self.texture(self.write_mesh(*self.HIDDEN),
+                                       occlusion_coverage=None)
+        self.assertEqual((textured, plain), (6, 0))
+
+    def test_a_partly_hidden_face_is_the_coverage_threshold_s_to_decide(self):
+        # A quad running from the middle of the occluder to well outside it.
+        # The diagonal splits the covered part unevenly, leaving one of its two
+        # faces a quarter visible and the other three quarters, so the threshold
+        # can be read off the count: below both, between them, above both.
+        mesh = self.write_mesh((5.0, -20, 20, -20, 20),
+                               (10.0, 0, 40, -10, 10))
+        self.assertEqual(self.texture(mesh, occlusion_coverage=0.2), (4, 0))
+        self.assertEqual(self.texture(mesh, occlusion_coverage=0.5), (3, 1))
+        self.assertEqual(self.texture(mesh), (2, 2))
+
+    def test_the_mesh_is_never_missing_a_face(self):
+        """Unseen faces are omitted from the texture, not from the mesh: this
+        is a retexture, and dropping geometry would make it a different mesh."""
+        # The default and --no-occlusion-cull are pinned face-for-face above,
+        # at (4, 2) and (6, 0); a partial threshold is the case they miss.
+        textured, plain = self.texture(self.write_mesh(*self.HIDDEN),
+                                       occlusion_coverage=0.25)
+        self.assertEqual(textured + plain, 6)
+
+    def run_main(self, *extra):
+        """Drive the app itself, so what is under test is the wiring and not
+        just ``project_texture_mesh``. Returns the working dir."""
+        from pgs_recon.apps import retexture
+        recon = self.tmp / 'recon'
+        recon.mkdir()
+        (recon / 'pgs-recon.json').write_text('{"stages": {}}')
+        image = self.tmp / 'ir940.jpg'
+        image.write_bytes(b'not read: the projective path copies it')
+        work = self.tmp / 'work'
+        argv = ['pgs-retexture', '-i', str(image),
+                '--calibration', str(self.calibration()),
+                '--recon-dir', str(recon),
+                '--mesh', str(self.write_mesh(*self.HIDDEN)),
+                '-w', str(work), '--log-level', 'ERROR', *extra]
+        # The manifest hook is an atexit in the app; run it now instead, or it
+        # fires against a deleted temp dir once the interpreter exits.
+        with mock.patch.object(sys, 'argv', argv), \
+                mock.patch.object(retexture.atexit, 'register', lambda f: f):
+            retexture._main()
+        return work
+
+    def test_it_leaves_no_empty_mvs_scaffolding(self):
+        """``mvg/`` and ``mvs/`` hold an MVS scene, and this path builds none:
+        naming those directories must not be what creates them."""
+        work = self.run_main('-o', str(self.tmp / 'out' / 'textured.obj'))
+        self.assertTrue((self.tmp / 'out' / 'textured.obj').is_file())
+        self.assertFalse((work / 'mvg').exists())
+        self.assertFalse((work / 'mvs').exists())
+
+    def test_the_default_output_still_lands_in_mvs(self):
+        """Created where written, not never: with no --output-mesh the
+        deliverable's own home is ``mvs/``, so that one does appear -- holding
+        something. ``mvg/`` has no reason to exist either way."""
+        work = self.run_main()
+        self.assertTrue((work / 'mvs' / 'ir940.obj').is_file())
+        self.assertFalse((work / 'mvg').exists())
 
 
 if __name__ == '__main__':

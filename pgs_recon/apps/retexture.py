@@ -11,7 +11,7 @@ inherently single-camera:
     every camera present in both captures contributes.
   - **Localized-camera retexture** (``--calibration``): the images come from a
     camera that was never in the solve, placed in the solved frame by
-    ``pgs-calibrate``. One camera, one pose, no positional correspondence --
+    ``pgs-localize``. One camera, one pose, no positional correspondence --
     inherently single-camera, and unaffected by everything below.
 
 OpenMVS has no native "texture with a different image set" option (verified
@@ -104,6 +104,8 @@ from pgs_recon.utils.sfm_json import (
     fix_polymorphic_registration,
     transform_sfm_extrinsics,
 )
+from pgs_recon.utils.visibility import (DEFAULT_DEPTH_BIAS, project_points,
+                                        visible_fraction)
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +271,7 @@ def convert_modality_images(img_map: Dict[tuple, Path], out_dir: Path,
 
 def repoint_calibration(calibration_json: Path, image: Path,
                         out_json: Path) -> None:
-    """Re-point a single-view ``pgs-calibrate`` calibration at ``image``.
+    """Re-point a single-view ``pgs-localize`` calibration at ``image``.
 
     The calibration carries one localized view (pose + intrinsic) in the solved
     frame. Texturing a different modality from the same physical pose is just a
@@ -300,7 +302,7 @@ def repoint_calibration(calibration_json: Path, image: Path,
     if len(views) != 1 or len(data.get('extrinsics', [])) != 1 \
             or len(intrinsics) != 1:
         sys.exit(f'Calibration {calibration_json} must contain exactly one '
-                 f'view, pose and intrinsic; is this a pgs-calibrate output?')
+                 f'view, pose and intrinsic; is this a pgs-localize output?')
     vd = views[0]['value']['ptr_wrapper']['data']
 
     # Header only: the dimensions are all this needs, and a modality capture is
@@ -386,6 +388,8 @@ def load_obj_mesh(mesh_path: Path):
 def project_texture_mesh(calibration_json: Path, texture_image: Path,
                          mesh_path: Path, out_obj: Path,
                          backface_cull: bool = True,
+                         occlusion_coverage: Optional[float] = 1.0,
+                         occlusion_bias: float = DEFAULT_DEPTH_BIAS,
                          recorder: Recorder = None) -> None:
     """Texture a mesh by projecting it through the calibrated view, so the OBJ's
     UVs index the *original* modality image directly (no OpenMVS atlas, no
@@ -394,45 +398,68 @@ def project_texture_mesh(calibration_json: Path, texture_image: Path,
 
     Each vertex is projected with the calibrated pose/intrinsic to a pixel, then
     to a UV (image origin is top-left, OBJ's is bottom-left, so v is flipped).
-    A triangle is textured only if all three vertices are in front of the camera
-    and inside the image, and (if ``backface_cull``) the face points toward the
-    camera — which drops a closed mesh's hidden underside and grazing edges.
-    Triangles outside the view are omitted (that surface was not imaged), the
-    single-view analogue of OpenMVS' empty-color.
+    A triangle is textured only if it is one the camera actually saw, which is
+    three separate questions:
 
-    NOTE: this does not do depth-based occlusion, so a surface that overhangs
-    itself would project the foreground onto the hidden region. For the open
-    surface meshes this targets the effect is negligible; use ``--use-openmvs``
-    when true occlusion handling is required.
+      - all three vertices are in front of the camera and inside the image;
+      - (if ``backface_cull``) the face points toward the camera, which drops a
+        closed mesh's hidden underside and grazing edges;
+      - (if ``occlusion_coverage`` is not None) at least that fraction of the
+        face's own pixels is not covered by some nearer part of the mesh, by the
+        depth test in :mod:`pgs_recon.utils.visibility`. Back-face culling is not
+        this: a face hidden behind a fold still faces the camera, and without the
+        depth test it takes the fold's pixels.
+
+    Triangles that fail any of the three are written without UVs rather than
+    dropped (that surface was not imaged), the single-view analogue of OpenMVS'
+    empty-color.
+
+    ``occlusion_coverage`` is a fraction because occlusion is not per-face: a
+    triangle straddling an occlusion boundary is partly imaged and partly not,
+    and a mesh cannot texture half a triangle. 1.0 textures only the faces seen
+    whole; lower keeps the boundary face and accepts the foreground smeared over
+    the hidden part of it. ``None`` skips the depth test entirely.
     """
     R, C, f, cx, cy, W, H, disto = camera_from_calibration(calibration_json)
     V, F = load_obj_mesh(mesh_path)
     if len(V) == 0 or len(F) == 0:
         sys.exit(f'Mesh {mesh_path} has no geometry to texture')
 
-    Xc = (R @ (V - C).T).T
-    Z = Xc[:, 2]
-    with np.errstate(divide='ignore', invalid='ignore'):
-        x = Xc[:, 0] / Z
-        y = Xc[:, 1] / Z
-    if disto is not None:
-        r2 = x * x + y * y
-        rad = 1.0 + disto[0] * r2 + disto[1] * r2 * r2 + disto[2] * r2 ** 3
-        x, y = x * rad, y * rad
-    u = f * x + cx
-    v = f * y + cy
+    uv_px, Z = project_points(V, R, C, f, cx, cy, disto)
+    u, v = uv_px[:, 0], uv_px[:, 1]
 
     valid = (Z > 1e-9) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
     keep = valid[F].all(axis=1)
+    # One gather for both tests below, and one centroid: at a few million faces
+    # the vertices of every face are hundreds of MB, and the two tests want the
+    # same array. Skipped entirely when neither test runs.
+    if backface_cull or occlusion_coverage is not None:
+        tri = V[F]
+        centroid = tri.mean(axis=1)
     if backface_cull:
-        v0, v1, v2 = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
+        v0, v1, v2 = tri[:, 0], tri[:, 1], tri[:, 2]
         normal = np.cross(v1 - v0, v2 - v0)
-        centroid = (v0 + v1 + v2) / 3.0
         keep &= np.einsum('ij,ij->i', normal, C - centroid) > 0
+    if occlusion_coverage is not None:
+        logger.info(f'Depth-testing {len(F)} faces against the calibrated view')
+        # The centroid is projected, not averaged from the projected vertices:
+        # under perspective those are different points, and this one has to be
+        # the face's own pixel.
+        face_uv, face_z = project_points(centroid, R, C, f, cx, cy, disto)
+        frac = visible_fraction(uv_px, Z, F, W, H, face_uv, face_z,
+                                bias=occlusion_bias)
+        # Reported against the faces that were otherwise textureable, so the
+        # numbers say what the depth test cost rather than what was already gone.
+        hidden = int((keep & (frac <= 0.0)).sum())
+        partial = int((keep & (frac > 0.0) & (frac < occlusion_coverage)).sum())
+        keep &= frac >= occlusion_coverage
+        logger.info(f'Occluded: {hidden} face(s) hidden entirely, {partial} '
+                    f'partly hidden and dropped at --occlusion-coverage '
+                    f'{occlusion_coverage:g}')
     Fk = F[keep]
     if len(Fk) == 0:
-        logger.warning('No triangles fall within the calibrated view; '
-                       'the output mesh will have no texture '
+        logger.warning('No triangle is both within the calibrated view and '
+                       'unoccluded; the output mesh will have no texture '
                        '(is the calibration for this mesh?).')
 
     # OBJ texture coords: flip v; clamp tiny FP overshoot.
@@ -470,7 +497,7 @@ def project_texture_mesh(calibration_json: Path, texture_image: Path,
         recorder.note(f'project_texture_mesh mesh={mesh_path.name} '
                       f'texture={tex_dst.name} -> {out_obj.name}')
     logger.info(f'Projected texture: {len(Fk)}/{len(F)} triangles textured '
-                f'({100.0 * len(Fk) / len(F):.1f}% of mesh in view); '
+                f'({100.0 * len(Fk) / len(F):.1f}% of mesh visible); '
                 f'map_Kd={tex_dst.name} -> {out_obj}')
 
 
@@ -677,21 +704,47 @@ def _main():
                              'With --calibration: a SINGLE image file captured '
                              'from the calibrated pose (any filename).')
     parser.add_argument('--calibration', default=None,
-                        help='A pgs-calibrate calibration .json (one localized '
+                        help='A pgs-localize calibration .json (one localized '
                              'view). Textures the mesh from that new pose with '
                              'the single image given by -i, instead of reusing a '
                              'rig camera\'s positions. --capture, --camera-index '
                              'and --sfm-data are ignored in this mode.')
     parser.add_argument('--use-openmvs', action='store_true',
                         help='With --calibration, texture via OpenMVS TextureMesh '
-                             '(regenerates UVs into a resampled atlas; does true '
-                             'occlusion) instead of the default projective UV '
-                             'mapping (UVs point at the original full-res image, '
-                             'reused across modalities).')
+                             '(regenerates UVs into a resampled atlas, and '
+                             'resolves occlusion per texel) instead of the '
+                             'default projective UV mapping (UVs point at the '
+                             'original full-res image, reused across modalities; '
+                             'occlusion resolved per face, see '
+                             '--occlusion-coverage).')
     parser.add_argument('--no-backface-cull', action='store_true',
                         help='With projective UV mapping, keep faces pointing '
                              'away from the camera (default culls them, dropping '
                              'a closed mesh\'s hidden underside).')
+    parser.add_argument('--no-occlusion-cull', action='store_true',
+                        help='With projective UV mapping, skip the depth test '
+                             'and texture every front-facing face in view, '
+                             'including ones hidden behind nearer surface. Only '
+                             'worth it to save the depth pass on a mesh known '
+                             'not to overhang itself.')
+    parser.add_argument('--occlusion-coverage', type=float, default=1.0,
+                        metavar='frac',
+                        help='Fraction of a face that must be unoccluded for it '
+                             'to be textured (default 1.0: only faces the camera '
+                             'sees whole). A face on an occlusion boundary is '
+                             'partly hidden and cannot be half-textured, so this '
+                             'chooses which artifact it gets: 1.0 leaves it '
+                             'untextured, a lower value textures it and smears '
+                             'the occluder over its hidden part.')
+    parser.add_argument('--occlusion-bias', type=float,
+                        default=DEFAULT_DEPTH_BIAS, metavar='frac',
+                        help=f'Depth-relative half of the occlusion test\'s '
+                             f'tolerance: a face is occluded only where '
+                             f'something else is nearer by more than this '
+                             f'fraction of its own depth (default '
+                             f'{DEFAULT_DEPTH_BIAS:g}), covering float error '
+                             f'and mesh noise. The other half follows the '
+                             f'surface\'s depth gradient and is not a knob.')
     parser.add_argument('--convert-texture', action='store_true',
                         help='With projective UV mapping and --calibration: '
                              'convert the modality image to 8-bit sRGB before '
@@ -722,7 +775,7 @@ def _main():
                              'coordinate frame before building the MVS scene. '
                              'Must be paired with --mesh pointing at the centered '
                              'mesh. Ignored in --calibration mode (run '
-                             'pgs-calibrate with --sfm-transform instead to embed '
+                             'pgs-localize with --sfm-transform instead to embed '
                              'the transform in the calibration).')
     parser.add_argument('--mesh', default=None,
                         help='Override the mesh to texture. Use to supply a '
@@ -800,6 +853,15 @@ def _main():
     recon_dir = Path(args.recon_dir)
     calibration = Path(args.calibration) if args.calibration else None
 
+    # The depth test's one knob, resolved to what project_texture_mesh takes:
+    # a fraction, or None for "do not test". Zero is not that -- it would keep
+    # every face the test could ever reject, which is what --no-occlusion-cull
+    # says out loud.
+    coverage = None if args.no_occlusion_cull else args.occlusion_coverage
+    if coverage is not None and not 0.0 < coverage <= 1.0:
+        sys.exit(f'--occlusion-coverage must be in (0, 1]; got {coverage:g}. '
+                 f'Use --no-occlusion-cull to texture occluded faces anyway.')
+
     # -r must be a pgs-recon output whatever this run takes from it: the manifest
     # is the run-tracking record, and the mvg/ mvs/ layout below assumes it.
     load_manifest(recon_dir)
@@ -837,7 +899,7 @@ def _main():
                      f'got shape {sfm_transform.shape}')
         if calibration is not None:
             logger.warning('--sfm-transform is ignored in --calibration mode; '
-                           'run pgs-calibrate --sfm-transform to embed the '
+                           'run pgs-localize --sfm-transform to embed the '
                            'transform in the calibration instead')
             sfm_transform = None
 
@@ -897,11 +959,12 @@ def _main():
 
     # Artifacts integrate into the recon's existing mvg/ and mvs/, prefixed by
     # <stem> so they sit beside the recon's files without overwriting them.
+    # Named here and created below, once the run is known to build a scene at
+    # all: naming a directory must not be what brings it into existence, or the
+    # projective path leaves an empty pair behind.
     paths: Dict[str, Path] = {'working': working_dir}
     paths['mvg'] = working_dir / 'mvg'
     paths['mvs'] = working_dir / 'mvs'
-    paths['mvg'].mkdir(parents=True, exist_ok=True)
-    paths['mvs'].mkdir(parents=True, exist_ok=True)
     paths['modality_8bit'] = paths['mvs'] / f'{stem}_modality'
     paths['mvs_scene'] = paths['mvs'] / f'{stem}_scene.mvs'
     paths['mvs_images'] = paths['mvs'] / f'{stem}_undistorted_images'
@@ -956,17 +1019,20 @@ def _main():
 
     write_metadata()
 
-    # 1-2. Build the SfM scene to texture from. Two modes:
     if calibration is not None:
-        # New pose from pgs-calibrate: texture from one localized view, swapping
-        # in the chosen modality image. No filename convention is needed.
+        # Either way a calibration is one camera at one pose, so -i is one
+        # image rather than a scan directory.
         if not modality_input.is_file():
             sys.exit('--calibration mode expects -i to be a single image file, '
                      f'got: {modality_input}')
+        # Projective UV mapping is a whole run on its own, and the only one that
+        # builds no MVS scene: it projects the mesh into the calibrated view so
+        # the OBJ's UVs point straight at the image (no OpenMVS atlas
+        # resampling; UVs reused across modalities), reading only the pose and
+        # the mesh. It writes the deliverable and, for --convert-texture, the
+        # 8-bit copy -- each of which makes its own directory -- so it returns
+        # before mvg/ and mvs/ exist and leaves no empty pair behind.
         if not args.use_openmvs:
-            # Default: project the mesh into the calibrated view so the OBJ's UVs
-            # point straight at the image (no OpenMVS atlas resampling; UVs
-            # reused across modalities). Projection reads only pose + mesh.
             out_obj = paths['output_mesh']
             if out_obj.suffix.lower() != '.obj':
                 logger.warning('Projective UV mapping writes OBJ with an '
@@ -981,10 +1047,24 @@ def _main():
             logger.info('Projecting mesh into calibrated view for UV mapping')
             project_texture_mesh(calibration, tex_img, mesh_in, out_obj,
                                  backface_cull=not args.no_backface_cull,
+                                 occlusion_coverage=coverage,
+                                 occlusion_bias=args.occlusion_bias,
                                  recorder=recorder)
             logger.info(f'Done. Re-textured mesh: {out_obj}')
             return
-        # OpenMVS path: undistortion reads pixels, so it needs an 8-bit image.
+
+    # Every run that reaches here builds an MVS scene in the recon's mvg/ and
+    # mvs/ layout, which is why the two directories are created at this line and
+    # not where they are named.
+    paths['mvg'].mkdir(parents=True, exist_ok=True)
+    paths['mvs'].mkdir(parents=True, exist_ok=True)
+
+    # 1-2. Build the SfM scene to texture from. Two modes -- a calibration only
+    # reaches here under --use-openmvs:
+    if calibration is not None:
+        # New pose from pgs-localize: texture from one localized view, swapping
+        # in the chosen modality image. No filename convention is needed.
+        # Undistortion reads pixels, so this needs an 8-bit image.
         logger.info('Preparing 8-bit modality image')
         conv = prepare_8bit_image(modality_input, paths['modality_8bit'])
         logger.info('Re-pointing calibration at the modality image')

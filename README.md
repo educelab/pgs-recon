@@ -365,7 +365,7 @@ Key options:
   translation and the bounding-box orientation fallback.
 * `-o, --output-mesh` — write the transformed mesh (requires `--input-mesh`).
 * `--save-transform` — write the 4×4 transform as a NumPy `.npy`, compatible
-  with `pgs-center --load-transform` and `pgs-calibrate`/`pgs-retexture
+  with `pgs-center --load-transform` and `pgs-localize`/`pgs-retexture
   --sfm-transform`.
 * `-s, --marker-size` — marker size in the desired world units (required unless
   `--no-scale` or `--orient-method bbox`).
@@ -376,8 +376,73 @@ Key options:
 
 At least one of `--output-mesh` or `--save-transform` is required.
 
+### `pgs-localize`
+Puts a camera that was never part of the reconstruction into the solved scene
+and emits a reusable pose + intrinsic, so `pgs-retexture --calibration` can
+texture the mesh from it. It replaces the former `pgs-calibrate`; see
+[ADR 0011](docs/adr/0011-localize-by-rendering-the-mesh.md).
+
+There are two ways to find the 3D↔2D correspondences a resection needs, and the
+tool carries both:
+
+| backend | how | needs |
+| --- | --- | --- |
+| **render-and-match** | render a textured mesh **in the query's own modality** from a prior pose, match render against query, and lift the render-side keypoints through the render's own position map | `--mesh` plus a prior pose |
+| **sparse** | match the query's descriptors against the scene structure's, the way `openMVG_main_SfM_Localization` does | `--input-scene` plus `--matches-dir` (the ~2.2 GB of `.feat`/`.desc` regions) |
+
+Give all four and they **chain**, which is the recommended mode: the sparse
+backend resects, its pose becomes the prior, and render-and-match refines from
+there. Measured over twelve datasets, render-and-match lands at 1.81–2.53 px
+where the sparse path lands at 3.96–23.13 px — but the sparse path is a fine
+*prior*, and render-and-match converges from one 861 px off.
+
+```shell
+docker run --rm -v $(pwd):/working ghcr.io/educelab/pgs-recon:edge \
+  pgs-localize \
+    -i /working/spectral/object+MB940IR_015_FN.tif \
+    -m /working/recon/object_IR940.obj \
+    -c /working/overhead-camera.txt \
+    --output-calibration /working/object_calibration.json \
+    --output-camera /working/object_solved.txt \
+    --report /working/object_localize.json \
+    --qa-render /working/object_qa.png
+```
+
+Key options:
+* `-i, --image` — the query image to localize.
+* `-m, --mesh` — a textured mesh **in the same modality as the query**. The tool
+  knows nothing about modality and assumes the caller paired them.
+* `-c, --camera` — a camera file (below) supplying K, always, and the prior pose
+  for the mesh backend.
+* `-s, --input-scene` / `--matches-dir` — the sparse backend's scene and regions.
+* `--sfm-transform` — a 4×4 `.npy` (from `pgs-sfm-orient --save-transform` or
+  `pgs-center`), applied to the scene **at load** so the resection happens in the
+  mesh's frame from the start. Pass it when localizing against a mesh that was
+  centered after reconstruction; omit it when the scene and the mesh share a
+  frame. Unchecked either way — whether a centered mesh exists is not something
+  the tool can see.
+* `--output-calibration` / `--output-camera` — at least one is required. The
+  first is the one-view openMVG scene `pgs-retexture --calibration` consumes; the
+  second is the flat camera file below, which is a valid input to `--camera`.
+* `--report` — a JSON QA sidecar: match counts, inlier count and spread,
+  held-out reprojection statistics, the solved standoff, and a pass/review/fail
+  grade per gate.
+* `--qa-render` — re-render at the **solved** pose and write it plus a difference
+  image against the query. Worth doing: a frame error is a proper rigid motion,
+  so it moves no residual at all, and looking is the only thing that catches it.
+* `--expected-standoff` / `--standoff-tolerance` — gate the solved
+  camera-to-scene distance. Optional, and the only gate that does not depend on
+  the correspondence set.
+* `--mask` — restrict query-side feature detection to a mask's non-zero region
+  (generate one with `pgs-generate-mask`).
+* `--self-test` — render a generated scene from a known pose and check the
+  conventions that are silent when wrong.
+
+`pgs-localize --help` lists the rest; every tunable is a flag, and the ones with
+a derivation carry it in the help string.
+
 ### Camera calibration file format
-`pgs-calibrate` reads and writes camera parameters in a single plain-text
+`pgs-localize` reads and writes camera parameters in a single plain-text
 **camera calibration file**. It is a flat list of `key value` entries, one per
 line; blank lines and lines beginning with `#` are ignored, and unrecognized
 keys are skipped (so the same file can carry both an intrinsic and a pose, and
@@ -385,11 +450,17 @@ each consumer reads only what it needs).
 
 | Key | Meaning |
 | --- | --- |
-| `fx`, `fy` | Focal length in **pixels** (x and y). `fy` defaults to `fx` if omitted. OpenMVG uses a single focal, so the two should match. |
+| `fx`, `fy` | Focal length in **pixels** (x and y). `fy` defaults to `fx` if omitted. OpenMVG carries a single focal, so the two must match. |
 | `cx`, `cy` | Principal point in **pixels**. |
 | `width`, `height` | Image resolution (pixels) the intrinsic is calibrated at. |
 | `k1`, `k2`, `k3` | Radial distortion coefficients (OpenCV/OpenMVG order). Optional; absent means no distortion. |
 | `pose` | 16 whitespace-separated floats: a **row-major 4×4 world-to-camera** matrix in OpenCV convention (`x_cam = R·X + t`). |
+
+`pose` holds the world-to-camera **translation**, not the camera centre. The two
+differ by a sign and a rotation, `C = −Rᵀt`, so a file whose `t` reads
+`(2.67, −2.75, 154.16)` describes a camera at `C = (−2.67, −2.75, 154.16)`.
+Misreading one for the other is a proper rigid motion that no residual can
+reveal, which is why `pgs-localize` logs the centre it derived on load.
 
 Example (an overhead camera with mild barrel distortion):
 
@@ -409,20 +480,18 @@ pose 0.9998 0.0011 -0.0203 12.4 -0.0009 0.9999 0.0102 -8.1 0.0203 -0.0102 0.9997
 
 Two flags use this format:
 
-* **`pgs-calibrate --intrinsic <file>`** reads it as a *precalibrated* query
-  intrinsic. It requires the intrinsic keys (`fx`, `cx`, `cy`, `width`,
-  `height`); `fy` and the `k*` distortion are optional, and any `pose` is
-  ignored (the pose is what calibration solves for). The intrinsic is scaled to
-  the query image's resolution automatically, and the distortion is honored —
-  OpenMVG undistorts the query before resectioning. This is the stable,
-  recommended path for long-focal overhead cameras with few feature matches.
-  (For a focal-only calibration you can instead pass `--focal-length` in pixels,
-  or `--focal-length-mm` together with `--pixel-size` (mm/px) or `--sensor-width`
-  (mm); both assume a centered principal point and no distortion.)
-* **`pgs-calibrate --save-camera-file <file>`** writes the solved calibration in
-  this format (intrinsic + `pose`, with `k*` emitted only when non-zero). It is
-  consumed by [registration-toolkit](https://github.com/educelab/registration-toolkit)
-  and can be fed straight back into `--intrinsic`.
+* **`pgs-localize --camera <file>`** reads it as a *precalibrated* query camera.
+  It requires the intrinsic keys (`fx`, `cx`, `cy`, `width`, `height`); `fy` and
+  the `k*` distortion are optional, and the `pose`, when present, becomes the
+  prior the mesh backend renders from. The intrinsic is scaled to the query
+  image's resolution automatically, and the distortion is honored — openMVG
+  undistorts the query before resectioning. A camera supplied this way is never
+  re-fitted; without one, the focal is recovered by DLT.
+* **`pgs-localize --output-camera <file>`** writes the solved camera in this
+  format. The tool's output is a valid input to its own next run, which is what
+  makes a constant-prior scheme cheap to maintain. It is also what
+  [registration-toolkit](https://github.com/educelab/registration-toolkit) reads
+  as `rt_reorder_texture --camera-file`.
 
 ## Install from source
 ### Install dependencies
@@ -473,8 +542,11 @@ export PGS_RECON_PREFIX="$PWD/dependencies/installed"
 pgs-recon -i images/ -o recon/ --name my-object
 ```
 
-Every entry point (`pgs-recon`, `pgs-retexture`, `pgs-calibrate`) reads it, and
-each also takes a `--path <prefix>` argument that wins over the environment. A
+Every Python entry point (`pgs-recon`, `pgs-retexture`, ...) reads it, and each
+also takes a `--path <prefix>` argument that wins over the environment. The
+`pgs-*` C++ tools — `pgs-localize`, `pgs-decimate`, `pgs-sfm-orient`,
+`pgs-global-scaler`, `pgs-generate-markers` — shell out to nothing, so they need
+no prefix; run them from `<prefix>/bin/` directly. A
 missing binary is reported with the path that was searched and which of the three
 tiers chose the prefix — the argument, the environment, or the built-in default —
 so a typo in any of them is unambiguous. The OpenMVG camera sensor database is

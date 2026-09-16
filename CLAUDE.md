@@ -18,9 +18,13 @@ The compiled binaries are NOT part of this repo. They are built from `dependenci
 via a CMake superbuild that compiles OpenMVG, OpenMVS, VCG, CGAL, OpenCV, Eigen,
 Ceres, libjpeg, plus the in-tree `pgs-recon-utilities` (C++ tools in
 `dependencies/utilities/`, which produce `pgs-global-scaler`, `pgs-sfm-orient`,
-`pgs-generate-markers` and `pgs-decimate`). `pgs-decimate` is the one that needs
-VCG, whose headers the superbuild already installs for OpenMVS; `BuildPGSUtils.cmake`
-passes `-DVCG_ROOT` the way `BuildOpenMVS.cmake` does.
+`pgs-generate-markers`, `pgs-decimate` and `pgs-localize`). `pgs-decimate` is the
+one that needs VCG, whose headers the superbuild already installs for OpenMVS;
+`BuildPGSUtils.cmake` passes `-DVCG_ROOT` the way `BuildOpenMVS.cmake` does.
+`pgs-localize` is the one C++20 target (bvh v2 needs `std::span`), which is why
+the one file that has to meet openMVG's bundled cereal -- it does not compile at
+C++20 -- is its own small C++17 library (ADR 0011). bvh and libcore arrive by
+`FetchContent` at configure time, so the utilities build needs network.
 
 ```shell
 # Build the C++ dependencies (slow; installs to dependencies/installed/ by default)
@@ -30,6 +34,21 @@ cmake --build build/
 # Install the Python pipeline (Python 3.9+)
 python3 -m pip install .
 ```
+
+Iterating on the C++ utilities does **not** need a superbuild. Everything they
+link against is already in the published image, so build only
+`dependencies/utilities` there -- minutes rather than hours:
+
+```shell
+docker run --rm -v "$PWD":/src -w /src ghcr.io/educelab/pgs-recon:edge \
+  bash -lc 'cmake -S dependencies/utilities -B /tmp/bu -DCMAKE_BUILD_TYPE=Release \
+            && cmake --build /tmp/bu -j'
+```
+
+Mount a host directory as the build dir to keep the CMake cache and object files
+between runs. The image carries OpenMVG, OpenCV, Eigen, VCG, EduceLabCore and
+Boost 1.74 under `/usr/local`; libcore and bvh still arrive by `FetchContent`, so
+the configure step needs network.
 
 Disable building bundled libs with `-DBUILD_<EIGEN|JPEG|JPEG_TURBO|OPENCV|CGAL>=OFF`
 to use system versions. Note: OpenMVS and OpenCV must link against the same libjpeg.
@@ -59,7 +78,13 @@ shapes `utils.charuco` promises its consumers whatever OpenCV returned
 (`test_charuco.py`, which draws a synthetic sample square at a known
 pixels-per-cm, and needs `cv2`). The planner-and-wrappers core is
 stdlib-only, so it runs anywhere in seconds — no reconstruction math is
-exercised, only what the pipeline asks the binaries to do. CI
+exercised, only what the pipeline asks the binaries to do. The C++ tools carry their own: `pgs-decimate --self-test` checks a measured
+deviation against the analytic answer on a generated sphere, and
+`pgs-localize --self-test` renders a generated scene from a known pose and
+checks the conventions that are silent when wrong -- the position map
+reprojecting onto its own pixel centres, depth being camera-space Z rather than
+slant range, the UV origin, and nearest-hit occlusion. Neither is reached by the
+Python suite; both need the built binary. CI
 (`.gitlab-ci.yml`) runs that suite three ways — bare Python, with the Python deps
 installed, and inside `ghcr.io/educelab/pgs-recon:edge` (`test:in-image`, the only
 one where the binaries exist, so tests reaching the default prefix cannot pass for
@@ -79,9 +104,20 @@ pgs-recon -i <image_dir> -o <output_dir> --name <object_name>
 
 All console scripts are declared in `setup.cfg` under `[options.entry_points]`.
 `pgs-recon` (`apps/reconstruct.py:main`) is the full pipeline; the other `pgs-*`
-commands are standalone utilities (mesh centering, format conversion, mask
+console scripts are standalone utilities (mesh centering, format conversion, mask
 generation, scan inspection, quality checks, etc.) mapping to modules in
-`pgs_recon/apps/` and `pgs_recon/utils/`.
+`pgs_recon/apps/` and `pgs_recon/utils/`. Five more `pgs-*` commands are bare C++
+binaries with no Python wrapper at all — `pgs-global-scaler`, `pgs-sfm-orient`,
+`pgs-generate-markers`, `pgs-decimate` and `pgs-localize` — built from
+`dependencies/utilities/src/`.
+
+`pgs-localize` puts a camera that was never in the reconstruction into the solved
+scene and emits the one-view calibration `pgs-retexture --calibration` consumes.
+It carries two correspondence backends — sparse (`--input-scene` +
+`--matches-dir`) and render-and-match (`--mesh` + a prior pose), which renders the
+mesh in the query's own modality and lifts matched keypoints through the render's
+position map — and chains them when given both. It replaced `pgs-calibrate`,
+which was deleted; see ADR 0011 for the measurement behind that.
 
 ### Binary discovery at runtime
 
@@ -234,11 +270,15 @@ the wrappers stay a complete library surface over each binary's flags.
   `ply.py` (one function: the face count in a PLY header, which is how `coarsen`
   sizes its target),
   `sfm_json.py` (OpenMVG SfM_Data JSON surgery: cereal polymorphic registration,
-  extrinsic frame transforms), `images.py` (`read_srgb`, the **single** reader
-  behind `pgs-convert`, `pgs-calibrate` and `pgs-retexture`). OpenMVG reads
+  extrinsic frame transforms),
+  `visibility.py` (the pinhole projection `pgs-retexture`'s projective-UV path
+  maps through, and the z-buffer that says which faces that one camera actually
+  saw — ADR 0012),
+  `images.py` (`read_srgb`, the **single** reader
+  behind `pgs-convert` and `pgs-retexture`). OpenMVG reads
   sRGB, not CIELab, and imageio hands back a Lab TIFF's samples undecoded, so
   the photometric and WhitePoint tags are read per *file* — a capture set can
-  mix colorspaces. This used to be ImageMagick for two of the three apps, which
+  mix colorspaces. This used to be ImageMagick for all but `pgs-convert`, which
   ignores WhitePoint and decodes every Lab file as D65 while the EduceLab
   captures are untagged D50; `read_srgb` reproduces it bit-for-bit on 16-bit
   greyscale and 8-bit RGB and differs only there. Nothing shells out for pixels

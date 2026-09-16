@@ -115,8 +115,7 @@ def _optional(*flags) -> list:
     ``bool`` as ``0``/``1``, an :class:`~enum.IntEnum` as its value rather than
     its member name -- is :func:`toolchain._argv_token`'s job, at the one
     chokepoint that stringifies argv, so the rule holds for the flags assembled
-    by hand here too. Callers used to have to remember ``int()``
-    (``calibrate.py`` still does, harmlessly).
+    by hand here too. Callers used to have to remember ``int()``.
     """
     command = []
     for flag, value in flags:
