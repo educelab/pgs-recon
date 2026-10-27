@@ -20,7 +20,8 @@ HALF = 50.0
 
 
 class View(NamedTuple):
-    """A pinhole camera: world-to-camera ``R``, centre ``C``, square pixels."""
+    """A camera: world-to-camera ``R``, centre ``C``, square pixels, and
+    openMVG's ``pinhole_radial_k3`` distortion ``k`` (zero by default)."""
     R: np.ndarray
     C: np.ndarray
     f: float
@@ -28,12 +29,32 @@ class View(NamedTuple):
     cy: float
     width: int
     height: int
+    k: tuple = (0.0, 0.0, 0.0)
+
+
+def _distortion(k, r2):
+    return 1.0 + k[0] * r2 + k[1] * r2 ** 2 + k[2] * r2 ** 3
+
+
+def project(view: View, X: np.ndarray) -> np.ndarray:
+    """World points (N, 3) to pixels (N, 2): openMVG's radial-k3 model, which
+    distorts the normalized coordinates before K."""
+    cam = (np.asarray(X, float) - view.C) @ view.R.T
+    xy = cam[:, :2] / cam[:, 2:]
+    xy = xy * _distortion(view.k, (xy ** 2).sum(1))[:, None]
+    return view.f * xy + [view.cx, view.cy]
 
 
 def rot_x(deg: float) -> np.ndarray:
     t = np.radians(deg)
     return np.array([[1, 0, 0], [0, np.cos(t), -np.sin(t)],
                      [0, np.sin(t), np.cos(t)]])
+
+
+def rot_y(deg: float) -> np.ndarray:
+    t = np.radians(deg)
+    return np.array([[np.cos(t), 0, np.sin(t)], [0, 1, 0],
+                     [-np.sin(t), 0, np.cos(t)]])
 
 
 def rot_z(deg: float) -> np.ndarray:
@@ -86,8 +107,16 @@ def plane_points(view: View) -> np.ndarray:
     the ray misses the plane's extent."""
     u, v = np.meshgrid(np.arange(view.width) + 0.5,
                        np.arange(view.height) + 0.5)
-    d_cam = np.stack([(u - view.cx) / view.f, (v - view.cy) / view.f,
-                      np.ones_like(u)], -1)
+    # Each pixel is a *distorted* location; undistort it by fixed-point
+    # iteration to find the ray it images.
+    xd = (u - view.cx) / view.f
+    yd = (v - view.cy) / view.f
+    x, y = xd.copy(), yd.copy()
+    if any(view.k):
+        for _ in range(20):
+            d = _distortion(view.k, x * x + y * y)
+            x, y = xd / d, yd / d
+    d_cam = np.stack([x, y, np.ones_like(u)], -1)
     d_world = d_cam @ view.R          # R^T d, row-wise
     s = -view.C[2] / d_world[..., 2]
     pts = view.C + s[..., None] * d_world
@@ -114,8 +143,10 @@ def render(view: View, texture: np.ndarray, gamma: float = 0.8,
 
 def camera_file(view: View, with_pose: bool = True) -> str:
     """``view`` in ``localize_camera.hpp``'s flat format."""
+    k1, k2, k3 = view.k
     text = (f'fx {view.f}\nfy {view.f}\ncx {view.cx}\ncy {view.cy}\n'
-            f'width {view.width}\nheight {view.height}\nk1 0\nk2 0\nk3 0\n')
+            f'width {view.width}\nheight {view.height}\n'
+            f'k1 {k1}\nk2 {k2}\nk3 {k3}\n')
     if with_pose:
         m = np.eye(4)
         m[:3, :3], m[:3, 3] = view.R, -view.R @ view.C
@@ -127,3 +158,45 @@ def nudged(view: View, dC=(1.5, -1.0, 3.0), tilt_deg: float = 1.0) -> View:
     """``view`` moved a few units and tilted a degree: a prior, not the truth."""
     return view._replace(R=rot_x(tilt_deg) @ view.R,
                          C=view.C + np.asarray(dC, float))
+
+
+def tie_scene(views, names, points: np.ndarray, frame_scale: float = 0.5,
+              frame_offset=(7.0, -3.0, 2.0)) -> dict:
+    """An openMVG ``sfm_data.json`` holding ``views`` and the tracks of
+    ``points`` through them -- the shape a group's SfM solve has.
+
+    The structure is written in a *different* frame (scaled and shifted), as a
+    group solve's own arbitrary frame would be, so a consumer that trusted the
+    stored coordinates rather than re-triangulating would be visibly wrong.
+    Only tracks seen by two or more views are written.
+    """
+    out = {'sfm_data_version': '0.3', 'root_path': '', 'views': [],
+           'intrinsics': [], 'extrinsics': [], 'structure': [],
+           'control_points': []}
+    ptr = 0x80000000
+    for i, (view, name) in enumerate(zip(views, names)):
+        ptr += 1
+        out['views'].append({'key': i, 'value': {
+            'polymorphic_id': 0x40000000,
+            'ptr_wrapper': {'id': ptr, 'data': {
+                'local_path': '', 'filename': name, 'width': view.width,
+                'height': view.height, 'id_view': i, 'id_intrinsic': 0,
+                'id_pose': i}}}})
+        out['extrinsics'].append({'key': i, 'value': {
+            'rotation': view.R.tolist(), 'center': view.C.tolist()}})
+    v0 = views[0]
+    out['intrinsics'].append({'key': 0, 'value': {
+        'polymorphic_id': 0x80000001, 'polymorphic_name': 'pinhole_radial_k3',
+        'ptr_wrapper': {'id': ptr + 1, 'data': {
+            'width': v0.width, 'height': v0.height, 'focal_length': v0.f,
+            'principal_point': [v0.cx, v0.cy], 'disto_k3': list(v0.k)}}}})
+    uvs = [project(v, points) for v in views]
+    for j, X in enumerate(points):
+        obs = [{'key': i, 'value': {'id_feat': j, 'x': uv[j].tolist()}}
+               for i, (v, uv) in enumerate(zip(views, uvs))
+               if 0 <= uv[j][0] < v.width and 0 <= uv[j][1] < v.height]
+        if len(obs) >= 2:
+            stored = frame_scale * X + np.asarray(frame_offset)
+            out['structure'].append({'key': j, 'value': {
+                'X': stored.tolist(), 'observations': obs}})
+    return out

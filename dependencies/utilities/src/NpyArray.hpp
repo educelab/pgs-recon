@@ -168,4 +168,34 @@ inline void writeTable(const std::filesystem::path& path,
   }
 }
 
+/// Read an (N, @p columns) float64 array as rows. An (0, K) array is valid and
+/// reads as no rows.
+inline auto readTable(const std::filesystem::path& path,
+                      const std::size_t columns)
+    -> std::vector<std::vector<double>>
+{
+  std::ifstream file(path, std::ios::binary);
+  if (not file) {
+    throw BadNpy("cannot read: " + path.string());
+  }
+  const auto header = detail::readHeader(file, path);
+  if (header.find("'<f8'") == std::string::npos) {
+    throw BadNpy("expected float64 ('<f8') in " + path.string());
+  }
+  const auto dims = detail::shapeOf(header, path);
+  if (dims.size() != 2 or dims[1] != columns) {
+    throw BadNpy("expected an (N, " + std::to_string(columns) +
+                 ") array in " + path.string() + ": " + header);
+  }
+  std::vector<std::vector<double>> rows(dims[0], std::vector<double>(columns));
+  for (auto& row : rows) {
+    file.read(reinterpret_cast<char*>(row.data()),
+              static_cast<std::streamsize>(columns * 8));
+  }
+  if (not file) {
+    throw BadNpy("truncated .npy data: " + path.string());
+  }
+  return rows;
+}
+
 }  // namespace pgs::npy

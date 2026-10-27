@@ -24,6 +24,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -40,9 +41,13 @@
 
 #include <boost/program_options.hpp>
 
+#include <ceres/ceres.h>
+#include <ceres/rotation.h>
+
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <openMVG/cameras/Camera_Pinhole_Radial.hpp>
 #include <openMVG/geometry/Similarity3.hpp>
 #include <openMVG/sfm/sfm_data.hpp>
 #include <openMVG/sfm/sfm_data_io.hpp>
@@ -70,8 +75,7 @@ enum EXIT_CODE {
   BAD_ARG = 2,
   IO_ERROR = 3,
   NO_CORRESPONDENCES = 5,
-  SOLVE_FAILED = 6,
-  NOT_IMPLEMENTED = 7
+  SOLVE_FAILED = 6
 };
 
 /// The intrinsic model every hand-held K is expressed in: the lens has visible
@@ -137,13 +141,6 @@ auto parseOrExit(const std::string& name, const po::options_description& opts,
     }
   }
   return -1;
-}
-
-auto notImplemented(const std::string& what) -> int
-{
-  std::cerr << "pgs-localize-joint: " << what << " is not implemented yet "
-               "(ADR 0013).\n";
-  return NOT_IMPLEMENTED;
 }
 
 /// Parse "1,0.5,0.25" into a ladder of positive scales, at most 1.
@@ -698,23 +695,368 @@ auto view(const std::vector<std::string>& argv) -> int
 
 // --- adjust ------------------------------------------------------------------
 
+/// Huber scale, in pixels, for every residual of the joint adjustment: the
+/// mesh anchors were already RANSAC inliers, so this only has to soften the
+/// odd survivor and the tie points that triangulated badly.
+constexpr double kLossPx = 2.0;
+
+/// How far a tie point may reproject from its observations, under the
+/// mesh-only poses and the starting K, before it is not trusted as a tie.
+constexpr double kTieMaxPx = 4.0;
+
+/// The focal cost curve is "flat" when neither end of the sweep costs at least
+/// this much more, relatively, than its minimum. Provisional: nothing measured
+/// sets it yet (ADR 0013, Not settled).
+constexpr double kFlatRise = 0.01;
+
+/// `pinhole_radial_k3`, in the order openMVG's getParams() gives it.
+using KParams = std::array<double, 6>;  // f, cx, cy, k1, k2, k3
+/// A pose as Ceres adjusts it: angle-axis rotation, then translation, of
+/// x_cam = R X + t.
+using PoseParams = std::array<double, 6>;
+
+/// openMVG's pinhole_radial_k3 projection, exactly: distortion multiplies the
+/// normalized coordinates, then K. What `pgs-retexture` and
+/// `utils.visibility.project_points` apply, so the emitted K means the same
+/// thing to every consumer.
+template <typename T>
+void ProjectK3(const T* k, const T* pose, const T* X, T* uv)
+{
+  T p[3];
+  ceres::AngleAxisRotatePoint(pose, X, p);
+  p[0] += pose[3];
+  p[1] += pose[4];
+  p[2] += pose[5];
+  const T x = p[0] / p[2];
+  const T y = p[1] / p[2];
+  const T r2 = x * x + y * y;
+  const T d = T(1.0) + k[3] * r2 + k[4] * r2 * r2 + k[5] * r2 * r2 * r2;
+  uv[0] = k[0] * x * d + k[1];
+  uv[1] = k[0] * y * d + k[2];
+}
+
+/// A mesh anchor: its world point is the mesh's and does not move.
+struct AnchorCost {
+  double u, v, X[3];
+  template <typename T>
+  auto operator()(const T* k, const T* pose, T* r) const -> bool
+  {
+    const T Xt[3] = {T(X[0]), T(X[1]), T(X[2])};
+    T uv[2];
+    ProjectK3(k, pose, Xt, uv);
+    r[0] = uv[0] - T(u);
+    r[1] = uv[1] - T(v);
+    return true;
+  }
+};
+
+/// A tie point: seen by two or more views, its world point is adjusted.
+struct TieCost {
+  double u, v;
+  template <typename T>
+  auto operator()(const T* k, const T* pose, const T* X, T* r) const -> bool
+  {
+    T uv[2];
+    ProjectK3(k, pose, X, uv);
+    r[0] = uv[0] - T(u);
+    r[1] = uv[1] - T(v);
+    return true;
+  }
+};
+
+auto PoseToParams(const geo::Pose3& pose) -> PoseParams
+{
+  PoseParams p{};
+  const Eigen::Matrix3d R = pose.rotation();
+  ceres::RotationMatrixToAngleAxis(R.data(), p.data());  // column-major
+  const Eigen::Vector3d t = pose.translation();
+  p[3] = t[0];
+  p[4] = t[1];
+  p[5] = t[2];
+  return p;
+}
+
+auto ParamsToPose(const PoseParams& p) -> geo::Pose3
+{
+  Eigen::Matrix3d R;
+  ceres::AngleAxisToRotationMatrix(p.data(), R.data());
+  const Eigen::Vector3d t(p[3], p[4], p[5]);
+  return geo::Pose3(R, -R.transpose() * t);
+}
+
+auto MakeK3(const KParams& k, const int width, const int height)
+    -> std::shared_ptr<cam::Pinhole_Intrinsic_Radial_K3>
+{
+  return std::make_shared<cam::Pinhole_Intrinsic_Radial_K3>(
+      width, height, k[0], k[1], k[2], k[3], k[4], k[5]);
+}
+
+/// One localized view, as `view` left it.
+struct ViewInput {
+  fs::path calibration;
+  fs::path output;
+  fs::path image;
+  /// The key a tie scene's views are matched to this one by.
+  std::string filename;
+  int width{0};
+  int height{0};
+  geo::Pose3 meshPose;
+  KParams meshK{};
+  std::vector<AnchorCost> anchors;
+};
+
+/// A tie point and the views that see it.
+struct Track {
+  std::array<double, 3> X{};
+  std::vector<std::pair<std::size_t, std::array<double, 2>>> obs;
+};
+
+struct Solution {
+  KParams k{};
+  std::vector<PoseParams> poses;
+  std::vector<std::array<double, 3>> ties;
+  ceres::Solver::Summary summary;
+};
+
+auto ReadViewInput(const fs::path& calibration, const fs::path& correspondences)
+    -> ViewInput
+{
+  sfm::SfM_Data scene;
+  if (not sfm::Load(scene, calibration.string(),
+                    sfm::ESfM_Data(sfm::VIEWS | sfm::INTRINSICS |
+                                   sfm::EXTRINSICS))) {
+    throw std::runtime_error("could not read " + calibration.string());
+  }
+  for (const auto& [id, view] : scene.GetViews()) {
+    if (not scene.IsPoseAndIntrinsicDefined(view.get())) {
+      continue;
+    }
+    const auto& intrinsic = *scene.GetIntrinsics().at(view->id_intrinsic);
+    const auto type = intrinsic.getType();
+    if (type != cam::PINHOLE_CAMERA and type != cam::PINHOLE_CAMERA_RADIAL1 and
+        type != cam::PINHOLE_CAMERA_RADIAL3) {
+      throw std::runtime_error(calibration.string() +
+                               ": only pinhole and radial intrinsics adjust "
+                               "into pinhole_radial_k3");
+    }
+    ViewInput in;
+    in.calibration = calibration;
+    in.image = fs::path(scene.s_root_path) / view->s_Img_path;
+    in.filename = fs::path(view->s_Img_path).filename().string();
+    in.width = static_cast<int>(intrinsic.w());
+    in.height = static_cast<int>(intrinsic.h());
+    in.meshPose = scene.GetPoseOrDie(view.get());
+    const auto p = intrinsic.getParams();
+    in.meshK = {p[0], p[1], p[2], 0.0, 0.0, 0.0};
+    for (std::size_t i = 3; i < p.size() and i < 6; ++i) {
+      in.meshK[i] = p[i];
+    }
+    for (const auto& row : pgs::npy::readTable(correspondences, 5)) {
+      in.anchors.push_back({row[0], row[1], {row[2], row[3], row[4]}});
+    }
+    return in;
+  }
+  throw std::runtime_error(calibration.string() + " holds no view with a pose");
+}
+
+/// RMS reprojection of a view's anchors under one K and one pose, in pixels.
+auto AnchorRms(const ViewInput& view, const KParams& k, const PoseParams& pose)
+    -> double
+{
+  if (view.anchors.empty()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  double sum = 0.0;
+  for (const auto& a : view.anchors) {
+    double r[2];
+    a(k.data(), pose.data(), r);
+    sum += r[0] * r[0] + r[1] * r[1];
+  }
+  return std::sqrt(sum / static_cast<double>(view.anchors.size()));
+}
+
+/**
+ * @brief Read the groups' tie scenes and triangulate their tracks into the
+ *        mesh's frame.
+ *
+ * A group's SfM solve is in its own arbitrary frame, so its structure is not
+ * used as it stands: each track is re-triangulated from the views' mesh-only
+ * poses and the starting K, which puts it in the frame the anchors are in. A
+ * track survives only if it is seen by two or more of the views being adjusted,
+ * has parallax, lies in front of every camera, and reprojects within
+ * kTieMaxPx everywhere.
+ */
+auto ReadTies(const std::vector<std::string>& scenes,
+              const std::vector<ViewInput>& views, const KParams& startK,
+              std::ostream& report) -> std::vector<Track>
+{
+  std::map<std::string, std::size_t> byName;
+  for (std::size_t i = 0; i < views.size(); ++i) {
+    byName[views[i].filename] = i;
+  }
+  const auto intrinsic = MakeK3(startK, views.front().width,
+                                views.front().height);
+  std::vector<PoseParams> poses;
+  for (const auto& v : views) {
+    poses.push_back(PoseToParams(v.meshPose));
+  }
+
+  std::vector<Track> tracks;
+  std::size_t seen = 0;
+  std::size_t tooFew = 0;
+  std::size_t rejected = 0;
+  for (const auto& path : scenes) {
+    sfm::SfM_Data scene;
+    if (not sfm::Load(scene, path,
+                      sfm::ESfM_Data(sfm::VIEWS | sfm::STRUCTURE))) {
+      throw std::runtime_error("could not read tie scene " + path);
+    }
+    std::map<openMVG::IndexT, std::size_t> local;
+    for (const auto& [id, view] : scene.GetViews()) {
+      const auto name = fs::path(view->s_Img_path).filename().string();
+      if (const auto it = byName.find(name); it != byName.end()) {
+        local[id] = it->second;
+      }
+    }
+    for (const auto& [id, landmark] : scene.GetLandmarks()) {
+      ++seen;
+      Track track;
+      for (const auto& [viewId, ob] : landmark.obs) {
+        if (const auto it = local.find(viewId); it != local.end()) {
+          track.obs.push_back({it->second, {ob.x[0], ob.x[1]}});
+        }
+      }
+      if (track.obs.size() < 2) {
+        ++tooFew;
+        continue;
+      }
+      // Least-squares intersection of the rays: sum (I - d d^T)(X - C) = 0.
+      Eigen::Matrix3d A = Eigen::Matrix3d::Zero();
+      Eigen::Vector3d b = Eigen::Vector3d::Zero();
+      for (const auto& [vi, x] : track.obs) {
+        const auto& pose = views[vi].meshPose;
+        const auto n = intrinsic->ima2cam(
+            intrinsic->get_ud_pixel(openMVG::Vec2(x[0], x[1])));
+        const Eigen::Vector3d d =
+            (pose.rotation().transpose() * Eigen::Vector3d(n[0], n[1], 1.0))
+                .normalized();
+        const Eigen::Matrix3d P = Eigen::Matrix3d::Identity() - d * d.transpose();
+        A += P;
+        b += P * pose.center();
+      }
+      if (A.eigenvalues().real().minCoeff() < 1e-6) {
+        ++rejected;  // no parallax
+        continue;
+      }
+      const Eigen::Vector3d X = A.ldlt().solve(b);
+      track.X = {X[0], X[1], X[2]};
+      bool ok = true;
+      for (const auto& [vi, x] : track.obs) {
+        const auto& pose = views[vi].meshPose;
+        if ((pose.rotation() * (X - pose.center()))[2] <= 0.0) {
+          ok = false;
+          break;
+        }
+        double r[2];
+        TieCost{x[0], x[1]}(startK.data(), poses[vi].data(), track.X.data(), r);
+        if (std::hypot(r[0], r[1]) > kTieMaxPx) {
+          ok = false;
+          break;
+        }
+      }
+      if (not ok) {
+        ++rejected;
+        continue;
+      }
+      tracks.push_back(std::move(track));
+    }
+  }
+  std::size_t observations = 0;
+  for (const auto& t : tracks) {
+    observations += t.obs.size();
+  }
+  std::cout << "Tie points: " << tracks.size() << " of " << seen
+            << " tracks (" << tooFew << " seen by fewer than two of these "
+            << "views, " << rejected << " rejected), " << observations
+            << " observations\n";
+  report << "  \"ties\": {\"scenes\": " << scenes.size()
+         << ", \"tracks_read\": " << seen << ", \"too_few_views\": " << tooFew
+         << ", \"rejected\": " << rejected << ", \"used\": " << tracks.size()
+         << ", \"observations\": " << observations << "},\n";
+  return tracks;
+}
+
+/**
+ * @brief The joint adjustment: one K, every pose, anchors fixed, ties free.
+ *
+ * @param holdF hold the focal at this value (the cost curve), leaving the rest
+ *        of K free unless @p fixK
+ * @param fixK  hold all of K (a board-calibrated camera)
+ */
+auto Solve(const std::vector<ViewInput>& views,
+           const std::vector<Track>& tracks, Solution sol,
+           const std::optional<double> holdF, const bool fixK,
+           const int threads) -> Solution
+{
+  if (holdF) {
+    sol.k[0] = *holdF;
+  }
+  ceres::Problem problem;
+  for (std::size_t i = 0; i < views.size(); ++i) {
+    for (const auto& a : views[i].anchors) {
+      problem.AddResidualBlock(
+          new ceres::AutoDiffCostFunction<AnchorCost, 2, 6, 6>(
+              new AnchorCost(a)),
+          new ceres::HuberLoss(kLossPx), sol.k.data(), sol.poses[i].data());
+    }
+  }
+  for (std::size_t t = 0; t < tracks.size(); ++t) {
+    for (const auto& [vi, x] : tracks[t].obs) {
+      problem.AddResidualBlock(
+          new ceres::AutoDiffCostFunction<TieCost, 2, 6, 6, 3>(
+              new TieCost{x[0], x[1]}),
+          new ceres::HuberLoss(kLossPx), sol.k.data(), sol.poses[vi].data(),
+          sol.ties[t].data());
+    }
+  }
+  if (fixK) {
+    problem.SetParameterBlockConstant(sol.k.data());
+  } else if (holdF) {
+    problem.SetManifold(sol.k.data(), new ceres::SubsetManifold(6, {0}));
+  }
+
+  ceres::Solver::Options options;
+  // Anchors only: a few dozen parameters over many residuals, which dense QR
+  // handles outright. With ties, the points are many and independent, which is
+  // the problem a Schur complement exists for.
+  options.linear_solver_type =
+      tracks.empty() ? ceres::DENSE_QR : ceres::SPARSE_SCHUR;
+  options.max_num_iterations = 200;
+  options.function_tolerance = 1e-12;
+  options.parameter_tolerance = 1e-12;
+  options.num_threads = threads > 0 ? threads : 1;
+  ceres::Solve(options, &problem, &sol.summary);
+  return sol;
+}
+
 auto adjust(const std::vector<std::string>& argv) -> int
 {
   // clang-format off
   po::options_description opts("adjust");
   opts.add_options()
     ("help,h", "print help message")
-    ("calibration", po::value<std::vector<std::string>>()->composing(), "a view's mesh-only calibration. Repeated, once per view")
-    ("correspondences", po::value<std::vector<std::string>>()->composing(), "that view's correspondences. Repeated, paired with --calibration by position")
+    ("calibration", po::value<std::vector<std::string>>()->composing(), "a view's mesh-only calibration, from `view`. Repeated, once per view")
+    ("correspondences", po::value<std::vector<std::string>>()->composing(), "that view's correspondences, from `view`. Repeated, paired with --calibration by position")
     ("output-calibration", po::value<std::vector<std::string>>()->composing(), "where that view's final calibration goes. Repeated, paired by position")
-    ("tie-scene", po::value<std::vector<std::string>>()->composing(), "a group's own SfM solve; its tracks become free tie points. Views are matched to it by image filename")
-    ("output-scene", po::value<std::string>(), "every view at its adjusted pose, sharing one intrinsic")
+    ("tie-scene", po::value<std::vector<std::string>>()->composing(), "a group's own SfM solve; its tracks are re-triangulated into the mesh's frame and become free tie points. Views are matched to it by image filename")
+    ("output-scene", po::value<std::string>(), "every view at its adjusted pose, sharing one intrinsic, with the tie points as structure")
     ("output-camera", po::value<std::string>(), "the shared K and distortion as a flat camera file")
-    ("report", po::value<std::string>(), "JSON report: focal cost curve, per-view divergence, gates")
-    ("camera", po::value<std::string>(), "starting K and distortion")
+    ("report", po::value<std::string>(), "JSON report: K before and after, per-view divergence, the focal cost curve")
+    ("camera", po::value<std::string>(), "starting K and distortion. Default: the K the first calibration was solved with")
     ("fix-intrinsic", po::bool_switch(), "hold K at --camera (a board-calibrated camera)")
-    ("focal-sweep", po::value<std::string>(), "lo:hi:steps, in pixels, for the focal cost curve. The curve always runs; unset picks a range around the starting focal")
-    ("threads", po::value<int>()->default_value(0), "worker threads; 0 uses all")
+    ("focal-sweep", po::value<std::string>(), "lo:hi:steps, in pixels, for the focal cost curve. The curve always runs; unset sweeps 0.8x to 1.2x the adjusted focal in 9 steps")
+    ("divergence-px", po::value<double>()->default_value(1.0, "1"), "a view whose anchors reproject this much worse under the joint solve than under its own mesh-only one is divergent: its mesh-only calibration is emitted instead (ADR 0013 Decision 5). Provisional; nothing measured sets it yet")
+    ("threads", po::value<int>()->default_value(0), "solver threads; 0 uses 1")
   ;
   // clang-format on
   po::variables_map args;
@@ -726,14 +1068,18 @@ auto adjust(const std::vector<std::string>& argv) -> int
       code >= 0) {
     return code;
   }
-  const auto n = args["calibration"].as<std::vector<std::string>>().size();
-  if (args["correspondences"].as<std::vector<std::string>>().size() != n or
-      args["output-calibration"].as<std::vector<std::string>>().size() != n) {
+  const auto calibrations = args["calibration"].as<std::vector<std::string>>();
+  const auto correspondences =
+      args["correspondences"].as<std::vector<std::string>>();
+  const auto outputs = args["output-calibration"].as<std::vector<std::string>>();
+  if (correspondences.size() != calibrations.size() or
+      outputs.size() != calibrations.size()) {
     std::cerr << "ERROR: --calibration, --correspondences and "
                  "--output-calibration are one each per view\n";
     return BAD_ARG;
   }
-  if (args["fix-intrinsic"].as<bool>() and not args.count("camera")) {
+  const auto fixK = args["fix-intrinsic"].as<bool>();
+  if (fixK and not args.count("camera")) {
     std::cerr << "ERROR: --fix-intrinsic holds K at --camera; give one\n";
     return BAD_ARG;
   }
@@ -741,19 +1087,276 @@ auto adjust(const std::vector<std::string>& argv) -> int
                               "camera"})) {
     return IO_ERROR;
   }
+  const auto threads = args["threads"].as<int>();
+  const auto divergencePx = args["divergence-px"].as<double>();
 
-  // Task 4. One openMVG SfM_Data: every view, one shared pinhole_radial_k3
-  // intrinsic, each view's correspondences as landmarks whose structure is held
-  // constant, each tie scene's tracks as free landmarks. Bundle_Adjustment_Ceres
-  // with a robust loss, the intrinsic refined unless --fix-intrinsic.
-  //
-  // Focal cost curve: re-solve with f held at each --focal-sweep step; report
-  // the curve and whether it has a minimum. A flat curve is reported, not
-  // hidden (Decision 4).
-  //
-  // Divergence: each view's adjusted pose against its mesh-only one. Past the
-  // gate, emit the mesh-only pose and flag the view (Decision 5).
-  return notImplemented("adjust");
+  std::ostringstream report;
+  report << "{\n  \"tool\": \"pgs-localize-joint adjust\",\n";
+
+  // --- inputs ------------------------------------------------------------
+  std::vector<ViewInput> views;
+  try {
+    for (std::size_t i = 0; i < calibrations.size(); ++i) {
+      auto v = ReadViewInput(calibrations[i], correspondences[i]);
+      v.output = outputs[i];
+      if (not views.empty() and (v.width != views.front().width or
+                                 v.height != views.front().height)) {
+        throw std::runtime_error(
+            calibrations[i] + " is " + std::to_string(v.width) + "x" +
+            std::to_string(v.height) +
+            "; one shared K needs every view at one resolution");
+      }
+      views.push_back(std::move(v));
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "ERROR: " << e.what() << "\n";
+    return IO_ERROR;
+  }
+  const int width = views.front().width;
+  const int height = views.front().height;
+
+  KParams startK = views.front().meshK;
+  if (args.count("camera")) {
+    try {
+      const auto c = loc::RescaleCamera(
+          loc::ReadCameraFile(args["camera"].as<std::string>()), width, height);
+      if (std::abs(c.fx - c.fy) > 1e-6 * c.fx) {
+        throw std::runtime_error("--camera has fx != fy; pinhole_radial_k3 "
+                                 "carries one focal");
+      }
+      startK = {c.fx, c.cx, c.cy, c.disto[0], c.disto[1], c.disto[2]};
+    } catch (const std::exception& e) {
+      std::cerr << "ERROR: " << e.what() << "\n";
+      return BAD_ARG;
+    }
+  }
+  std::size_t anchors = 0;
+  for (const auto& v : views) {
+    anchors += v.anchors.size();
+  }
+  std::cout << views.size() << " views, " << anchors << " mesh anchors; "
+            << "starting f " << startK[0] << "\n";
+
+  std::vector<Track> tracks;
+  try {
+    const auto scenes =
+        args.count("tie-scene")
+            ? args["tie-scene"].as<std::vector<std::string>>()
+            : std::vector<std::string>{};
+    tracks = ReadTies(scenes, views, startK, report);
+  } catch (const std::exception& e) {
+    std::cerr << "ERROR: " << e.what() << "\n";
+    return IO_ERROR;
+  }
+
+  // --- the joint solve ---------------------------------------------------
+  Solution start;
+  start.k = startK;
+  for (const auto& v : views) {
+    start.poses.push_back(PoseToParams(v.meshPose));
+  }
+  for (const auto& t : tracks) {
+    start.ties.push_back(t.X);
+  }
+  const auto sol = Solve(views, tracks, start, std::nullopt, fixK, threads);
+  std::cout << sol.summary.BriefReport() << "\n";
+  if (not sol.summary.IsSolutionUsable()) {
+    std::cerr << "ERROR: the joint adjustment did not converge\n";
+    return SOLVE_FAILED;
+  }
+  std::cout << "Adjusted f " << sol.k[0] << ", principal point (" << sol.k[1]
+            << ", " << sol.k[2] << "), k = (" << sol.k[3] << ", " << sol.k[4]
+            << ", " << sol.k[5] << ")\n";
+
+  const auto kJson = [](const KParams& k) {
+    return "{\"f\": " + number(k[0]) + ", \"cx\": " + number(k[1]) +
+           ", \"cy\": " + number(k[2]) + ", \"k\": [" + number(k[3]) + ", " +
+           number(k[4]) + ", " + number(k[5]) + "]}";
+  };
+  report << "  \"intrinsic\": {\"start\": " << kJson(startK)
+         << ", \"adjusted\": " << kJson(sol.k)
+         << ", \"fixed\": " << (fixK ? "true" : "false") << "},\n"
+         << "  \"solve\": {\"initial_cost\": "
+         << number(sol.summary.initial_cost)
+         << ", \"final_cost\": " << number(sol.summary.final_cost)
+         << ", \"iterations\": " << sol.summary.iterations.size()
+         << ", \"termination\": "
+         << quote(ceres::TerminationTypeToString(
+                sol.summary.termination_type))
+         << "},\n";
+
+  // --- the focal cost curve (Decision 4) ---------------------------------
+  // Measured every run, never assumed: a flat curve says this set of views
+  // does not determine the focal, whatever the adjustment reported.
+  double lo = 0.8 * sol.k[0];
+  double hi = 1.2 * sol.k[0];
+  int steps = 9;
+  if (args.count("focal-sweep")) {
+    const auto text = args["focal-sweep"].as<std::string>();
+    std::stringstream ss(text);
+    std::string a, b, c;
+    if (not std::getline(ss, a, ':') or not std::getline(ss, b, ':') or
+        not std::getline(ss, c)) {
+      std::cerr << "ERROR: --focal-sweep is lo:hi:steps\n";
+      return BAD_ARG;
+    }
+    try {
+      lo = std::stod(a);
+      hi = std::stod(b);
+      steps = std::stoi(c);
+    } catch (const std::exception&) {
+      std::cerr << "ERROR: --focal-sweep is lo:hi:steps\n";
+      return BAD_ARG;
+    }
+    if (not(lo > 0.0 and hi > lo and steps >= 3)) {
+      std::cerr << "ERROR: --focal-sweep needs 0 < lo < hi and steps >= 3\n";
+      return BAD_ARG;
+    }
+  }
+  std::vector<std::pair<double, double>> curve;
+  for (int s = 0; s < steps; ++s) {
+    const auto f = lo + (hi - lo) * s / (steps - 1);
+    const auto held = Solve(views, tracks, sol, f, fixK, threads);
+    curve.emplace_back(f, held.summary.final_cost);
+  }
+  const auto minIt = std::min_element(
+      curve.begin(), curve.end(),
+      [](const auto& a, const auto& b) { return a.second < b.second; });
+  const auto minCost = minIt->second;
+  const bool interior = minIt != curve.begin() and minIt != curve.end() - 1;
+  const bool rises = curve.front().second >= minCost * (1.0 + kFlatRise) and
+                     curve.back().second >= minCost * (1.0 + kFlatRise);
+  const bool observable = interior and rises;
+  std::cout << "Focal cost curve: minimum at f " << minIt->first << "; "
+            << (observable ? "the focal is determined by these views"
+                           : "FLAT or at the edge of the sweep -- these views "
+                             "do not determine the focal")
+            << "\n";
+  report << "  \"focal_curve\": {\"observable\": "
+         << (observable ? "true" : "false")
+         << ", \"minimum_f\": " << number(minIt->first) << ", \"points\": [";
+  for (std::size_t i = 0; i < curve.size(); ++i) {
+    report << (i ? ", " : "") << "[" << number(curve[i].first) << ", "
+           << number(curve[i].second) << "]";
+  }
+  report << "]},\n";
+
+  // A flat curve is not a weak measurement of the focal, it is none: the
+  // adjustment then drifts along the focal/standoff degeneracy to whatever K
+  // it likes, and its residuals improve while every pose walks away from the
+  // truth (measured on untilted synthetic views: f 1600 -> 11652, every camera
+  // 377 units off, anchors reprojecting *better*). So the joint K is emitted
+  // only when the curve says the views determine it, and otherwise every view
+  // keeps its mesh-only calibration at the starting K (Decision 4).
+  const bool trustK = fixK or observable;
+  if (trustK and not fixK) {
+    if (const auto complaint =
+            loc::ComplainAboutIntrinsic(*MakeK3(sol.k, width, height))) {
+      std::cerr << "ERROR: the joint adjustment produced a K that is not a "
+                   "physical camera: "
+                << *complaint << "\n";
+      return SOLVE_FAILED;
+    }
+  }
+  if (not trustK) {
+    std::cout << "WARNING: these views do not determine the focal, so the "
+                 "joint K is not emitted. Every view keeps its mesh-only "
+                 "calibration at the starting K. To do better, calibrate the "
+                 "camera on a board and pass it with --camera --fix-intrinsic, "
+                 "or add views tilted about different axes (ADR 0013 "
+                 "Decision 4)\n";
+  }
+  const KParams& emitK = trustK ? sol.k : startK;
+  report << "  \"intrinsic_emitted\": "
+         << (trustK ? "\"adjusted\"" : "\"start\"") << ",\n";
+
+  // --- per-view divergence (Decision 5), and emit -------------------------
+  const auto adjusted = MakeK3(emitK, width, height);
+  report << "  \"views\": [\n";
+  std::size_t divergent = 0;
+  try {
+    for (std::size_t i = 0; i < views.size(); ++i) {
+      const auto& v = views[i];
+      const auto meshParams = PoseToParams(v.meshPose);
+      const auto meshRms = AnchorRms(v, v.meshK, meshParams);
+      const auto jointRms = AnchorRms(v, sol.k, sol.poses[i]);
+      const auto jointPose = ParamsToPose(sol.poses[i]);
+      const auto shift = (jointPose.center() - v.meshPose.center()).norm();
+      const Eigen::AngleAxisd turn(jointPose.rotation() *
+                                   v.meshPose.rotation().transpose());
+      const bool isDivergent = trustK and jointRms > meshRms + divergencePx;
+      divergent += isDivergent;
+      const bool meshOnly = isDivergent or not trustK;
+      if (meshOnly) {
+        // Agreement with the mesh outranks agreement with the set.
+        fs::copy_file(v.calibration, v.output,
+                      fs::copy_options::overwrite_existing);
+      } else {
+        loc::WriteCalibration(v.output, *adjusted, jointPose, v.image);
+      }
+      report << "    {\"image\": " << quote(v.image.string())
+             << ", \"anchors\": " << v.anchors.size()
+             << ", \"mesh_only_rms_px\": " << number(meshRms)
+             << ", \"joint_rms_px\": " << number(jointRms)
+             << ", \"center_shift\": " << number(shift)
+             << ", \"rotation_deg\": "
+             << number(turn.angle() * 180.0 / M_PI)
+             << ", \"divergent\": " << (isDivergent ? "true" : "false")
+             << ", \"emitted\": "
+             << (meshOnly ? "\"mesh-only\"" : "\"joint\"") << "}"
+             << (i + 1 < views.size() ? "," : "") << "\n";
+    }
+    report << "  ],\n  \"divergent\": " << divergent << "\n}\n";
+
+    // The set as one scene: one intrinsic, every adjusted pose, ties as
+    // structure.
+    sfm::SfM_Data scene;
+    scene.intrinsics[0] = adjusted;
+    for (std::size_t i = 0; i < views.size(); ++i) {
+      const auto id = static_cast<openMVG::IndexT>(i);
+      scene.views[id] = std::make_shared<sfm::View>(
+          views[i].image.string(), id, 0, id, width, height);
+      scene.poses[id] = trustK ? ParamsToPose(sol.poses[i])
+                               : views[i].meshPose;
+    }
+    for (std::size_t t = 0; t < tracks.size(); ++t) {
+      sfm::Landmark lm;
+      const auto& X = trustK ? sol.ties[t] : start.ties[t];
+      lm.X = Eigen::Vector3d(X[0], X[1], X[2]);
+      for (const auto& [vi, x] : tracks[t].obs) {
+        lm.obs[static_cast<openMVG::IndexT>(vi)] =
+            sfm::Observation(openMVG::Vec2(x[0], x[1]),
+                             static_cast<openMVG::IndexT>(t));
+      }
+      scene.structure[static_cast<openMVG::IndexT>(t)] = lm;
+    }
+    if (not sfm::Save(scene, args["output-scene"].as<std::string>(),
+                      sfm::ESfM_Data(sfm::ALL))) {
+      throw std::runtime_error("could not write --output-scene");
+    }
+
+    loc::Camera shared;
+    shared.fx = shared.fy = emitK[0];
+    shared.cx = emitK[1];
+    shared.cy = emitK[2];
+    shared.width = width;
+    shared.height = height;
+    shared.disto = {emitK[3], emitK[4], emitK[5]};
+    shared.haveDisto = true;
+    loc::WriteCameraFile(args["output-camera"].as<std::string>(), shared);
+
+    std::ofstream(args["report"].as<std::string>()) << report.str();
+  } catch (const std::exception& e) {
+    std::cerr << "ERROR: " << e.what() << "\n";
+    return IO_ERROR;
+  }
+  if (divergent > 0) {
+    std::cout << "WARNING: " << divergent << " of " << views.size()
+              << " views diverged from their mesh-only solve and were emitted "
+                 "at it. More than an occasional one means the no-movement "
+                 "assumption is wrong for this plate (ADR 0013 Decision 5)\n";
+  }
+  return SUCCESS;
 }
 
 } // namespace

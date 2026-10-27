@@ -103,6 +103,7 @@ def adjust(calibrations: Sequence[Path], correspondences: Sequence[Path],
            output_camera: Path, report: Path,
            tie_scenes: Sequence[Path] = (), camera: Optional[Path] = None,
            fix_intrinsic: bool = False, focal_sweep: Optional[str] = None,
+           divergence_px: Optional[float] = None,
            threads: Optional[int] = None) -> None:
     """Jointly adjust every localized view under one shared intrinsic.
 
@@ -118,7 +119,14 @@ def adjust(calibrations: Sequence[Path], correspondences: Sequence[Path],
     where the self-calibration would only add noise. ``focal_sweep`` is
     ``"lo:hi:steps"`` in pixels; unset, the binary picks a range around the
     starting focal. The sweep always runs: observability is measured on every
-    run, never assumed (Decision 4).
+    run, never assumed (Decision 4) -- and when it says the views do not
+    determine the focal, no adjusted K is emitted: every view keeps its
+    mesh-only calibration, and the report's ``intrinsic_emitted`` is
+    ``"start"``.
+
+    ``divergence_px`` is how much worse a view's anchors may reproject under
+    the joint solve than under its own before it is emitted mesh-only
+    (Decision 5).
     """
     counts = {len(calibrations), len(correspondences), len(output_calibrations)}
     if len(counts) != 1:
@@ -135,6 +143,7 @@ def adjust(calibrations: Sequence[Path], correspondences: Sequence[Path],
     command += ['--output-scene', output_scene,
                 '--output-camera', output_camera, '--report', report]
     command += _optional(('--camera', camera), ('--focal-sweep', focal_sweep),
+                         ('--divergence-px', divergence_px),
                          ('--threads', threads))
     if fix_intrinsic:
         command.append('--fix-intrinsic')

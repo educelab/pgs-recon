@@ -153,6 +153,18 @@ determine K; the report says so, and K must come from a board calibration or a
 previous run of the same camera. The report carries each group's tilt spread so a
 flat curve can be traced to its cause.
 
+**A flat curve means no adjusted K is emitted.** It is not a weak measurement
+of the focal but none, and the adjustment does not stay put: it drifts along the
+focal/standoff degeneracy while its residuals *improve*. Measured on untilted
+synthetic views (`tests/test_localize_synthetic.py`, `TestAdjustUntilted`):
+f 1600 -> 11652, k1 0 -> -2.44, every camera 377 units from the truth, anchors
+reprojecting at 0.17 px against 0.31 before. The divergence gate cannot catch
+this, being a reprojection test. So when the curve is flat and K is not fixed,
+every view keeps its mesh-only calibration at the starting K, the report's
+`intrinsic_emitted` says `start`, and the run warns. On tilted views the same
+fixture recovers f to 0.03%, the principal point to 0.3 px and k1 to 0.002, with
+the curve's ends 30-38x its minimum.
+
 The stakes are asymmetric. A focal error absorbed into standoff projects the mesh
 almost identically from near the solved pose, so it costs texture alignment only
 in proportion to relief. A distortion error displaces the frame edges regardless.

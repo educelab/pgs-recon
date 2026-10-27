@@ -14,6 +14,16 @@ What each class guards:
 - :class:`TestLocalizeJoint` -- ADR 0013's per-view path: the overhead position
   map agrees with the plane, and a hand-held view is localized with **no
   prior pose** at all, through the overhead image.
+- :class:`TestAdjust` -- the joint adjustment recovers the true K and lens
+  distortion from views localized with a wrong one, says the focal is
+  observable when the views' tilts make it so, uses tie points from a scene in
+  a foreign frame, and leaves a fixed K alone.
+- :class:`TestAdjustUntilted` -- the control: views with no tilt do not
+  determine the focal, and the adjustment must say so and emit nothing it
+  could not measure. Without the check this guards, the solve walks every
+  camera hundreds of units away while its residuals *improve*.
+- :class:`TestSceneConventions` -- the scene's own renderer and projection
+  agree, so a failure above is the tool's and not the fixture's.
 
 Binaries are found the way the pipeline finds them (``toolchain``), so in the
 published image this tests the installed tools. ``pgs-localize-joint`` is only
@@ -52,6 +62,47 @@ def run(argv) -> subprocess.CompletedProcess:
                              f'{result.returncode}:\n{result.stdout[-3000:]}'
                              f'\n{result.stderr[-3000:]}')
     return result
+
+
+def make_overhead(d: Path, mesh: Path, texture, localize: Path,
+                  joint: Path) -> 'scene.View':
+    """The overhead: the whole plate, straight down, localized with
+    pgs-localize as a real one is (ADR 0011), and its position map."""
+    overhead = scene.View(R=scene.DOWN, C=np.array([0.0, 0.0, 150.0]),
+                          f=1700.0, cx=600.0, cy=600.0, width=1200,
+                          height=1200)
+    cv2.imwrite(str(d / 'overhead.png'), scene.render(overhead, texture,
+                                                      seed=3))
+    (d / 'overhead_prior.cam').write_text(
+        scene.camera_file(scene.nudged(overhead)))
+    run([localize, '--image', d / 'overhead.png', '--mesh', mesh,
+         '--camera', d / 'overhead_prior.cam', '--seed', 1, '--threads', 2,
+         '--output-calibration', d / 'overhead_calibration.json'])
+    run([joint, 'position-map',
+         '--calibration', d / 'overhead_calibration.json',
+         '--mesh', mesh, '--output', d / 'position.npy', '--threads', 2])
+    return overhead
+
+
+def localize_view(joint: Path, d: Path, mesh: Path, image: Path,
+                  camera: Path, out: Path, seed: int = 3) -> Path:
+    """``pgs-localize-joint view`` with the fixture's overhead."""
+    out.mkdir(parents=True, exist_ok=True)
+    run([joint, 'view', '--image', image, '--mesh', mesh,
+         '--overhead-image', d / 'overhead.png',
+         '--overhead-calibration', d / 'overhead_calibration.json',
+         '--overhead-position-map', d / 'position.npy',
+         '--camera', camera,
+         '--output-calibration', out / 'cal.json',
+         '--output-correspondences', out / 'corr.npy',
+         '--output-camera', out / 'cam.txt', '--qa-render', out / 'qa.png',
+         '--report', out / 'report.json', '--seed', seed, '--threads', 2])
+    return out
+
+
+def calibration_center(path: Path) -> 'np.ndarray':
+    data = json.loads(Path(path).read_text())
+    return np.array(data['extrinsics'][0]['value']['center'])
 
 
 def requires_scene(cls):
@@ -121,19 +172,8 @@ class TestLocalizeJoint(unittest.TestCase):
         d = cls.dir = Path(cls.tmp.name)
         texture = scene.make_texture()
         cls.mesh = scene.write_plane(d, texture)
-
-        # The overhead: the whole plate, straight down -- localized with
-        # pgs-localize, as a real one is (ADR 0011).
-        cls.overhead = scene.View(R=scene.DOWN, C=np.array([0.0, 0.0, 150.0]),
-                                  f=1700.0, cx=600.0, cy=600.0, width=1200,
-                                  height=1200)
-        cv2.imwrite(str(d / 'overhead.png'), scene.render(cls.overhead, texture,
-                                                          seed=3))
-        (d / 'overhead_prior.cam').write_text(
-            scene.camera_file(scene.nudged(cls.overhead)))
-        run([cls.localize, '--image', d / 'overhead.png', '--mesh', cls.mesh,
-             '--camera', d / 'overhead_prior.cam', '--seed', 1, '--threads', 2,
-             '--output-calibration', d / 'overhead_calibration.json'])
+        cls.overhead = make_overhead(d, cls.mesh, texture, cls.localize,
+                                     cls.joint)
 
         # The hand-held view: closer, tilted, rotated, a patch of the plate.
         cls.handheld = scene.View(
@@ -145,11 +185,6 @@ class TestLocalizeJoint(unittest.TestCase):
         # K only: the view gets no prior pose from anywhere but the overhead.
         (d / 'handheld.cam').write_text(
             scene.camera_file(cls.handheld, with_pose=False))
-
-        run([cls.joint, 'position-map',
-             '--calibration', d / 'overhead_calibration.json',
-             '--mesh', cls.mesh, '--output', d / 'position.npy',
-             '--threads', 2])
 
     @classmethod
     def tearDownClass(cls):
@@ -170,19 +205,9 @@ class TestLocalizeJoint(unittest.TestCase):
         self.assertLess(np.median(err), 0.1)
 
     def test_view_localizes_with_no_prior_pose(self):
-        d = self.dir / 'view'
-        d.mkdir()
-        run([self.joint, 'view',
-             '--image', self.dir / 'handheld.png', '--mesh', self.mesh,
-             '--overhead-image', self.dir / 'overhead.png',
-             '--overhead-calibration', self.dir / 'overhead_calibration.json',
-             '--overhead-position-map', self.dir / 'position.npy',
-             '--camera', self.dir / 'handheld.cam',
-             '--output-calibration', d / 'cal.json',
-             '--output-correspondences', d / 'corr.npy',
-             '--output-camera', d / 'cam.txt',
-             '--qa-render', d / 'qa.png',
-             '--report', d / 'report.json', '--seed', 3, '--threads', 2])
+        d = localize_view(self.joint, self.dir, self.mesh,
+                          self.dir / 'handheld.png', self.dir / 'handheld.cam',
+                          self.dir / 'view')
         report = json.loads((d / 'report.json').read_text())
         self.assertEqual(report['status'], 'done')
 
@@ -207,6 +232,181 @@ class TestLocalizeJoint(unittest.TestCase):
 
         for name in ('cal.json', 'cam.txt', 'qa.png', 'qa_diff.png'):
             self.assertTrue((d / name).is_file(), name)
+
+
+
+class _AdjustFixture(unittest.TestCase):
+    """Four hand-held views of one distorted camera, localized with a wrong K.
+
+    Subclasses choose the views' rotations (:attr:`POSES`). No tests of its
+    own, so unittest never sets it up for itself.
+    """
+
+    #: The camera the views were taken with.
+    TRUE_K = dict(f=1600.0, cx=403.0, cy=297.0, k=(-0.05, 0.0, 0.0))
+    #: The K they are localized with: focal 5% long, principal point off,
+    #: distortion unknown -- what an EXIF focal and an image centre give.
+    START = dict(f=1680.0, cx=411.0, cy=290.0, k=(0.0, 0.0, 0.0))
+
+    @classmethod
+    def setUpClass(cls):
+        cls.joint = binary('pgs-localize-joint')
+        cls.localize = binary('pgs-localize')
+        cls.tmp = tempfile.TemporaryDirectory()
+        d = cls.dir = Path(cls.tmp.name)
+        texture = scene.make_texture()
+        cls.mesh = scene.write_plane(d, texture)
+        make_overhead(d, cls.mesh, texture, cls.localize, cls.joint)
+
+        poses = cls.POSES()
+        k = cls.TRUE_K
+        cls.views = [scene.View(R=R @ scene.DOWN, C=np.array(C), f=k['f'],
+                                cx=k['cx'], cy=k['cy'], width=800, height=600,
+                                k=k['k']) for R, C in poses]
+        s = cls.START
+        start = cls.views[0]._replace(f=s['f'], cx=s['cx'], cy=s['cy'],
+                                      k=s['k'])
+        cls.start_cam = d / 'start.cam'
+        cls.start_cam.write_text(scene.camera_file(start, with_pose=False))
+
+        cls.names = [f'handheld_{i}.png' for i in range(len(cls.views))]
+        cls.localized = []
+        for i, (view, name) in enumerate(zip(cls.views, cls.names)):
+            cv2.imwrite(str(d / name), scene.render(view, texture, gamma=1.2,
+                                                    seed=20 + i))
+            cls.localized.append(localize_view(
+                cls.joint, d, cls.mesh, d / name, cls.start_cam,
+                d / f'view_{i}', seed=i + 1))
+
+        # A group solve's tracks: points on the plane where the views overlap.
+        g = np.linspace(-5.0, 25.0, 31)
+        pts = np.array([(x, y, 0.0) for x in g for y in g])
+        (d / 'tie_scene.json').write_text(json.dumps(
+            scene.tie_scene(cls.views, cls.names, pts)))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def adjust(self, tag: str, *extra) -> dict:
+        out = self.dir / tag
+        out.mkdir()
+        argv = [self.joint, 'adjust']
+        for i, v in enumerate(self.localized):
+            argv += ['--calibration', v / 'cal.json',
+                     '--correspondences', v / 'corr.npy',
+                     '--output-calibration', out / f'cal_{i}.json']
+        argv += ['--output-scene', out / 'scene.json',
+                 '--output-camera', out / 'camera.txt',
+                 '--report', out / 'report.json', '--threads', 2, *extra]
+        run(argv)
+        self.out = out
+        return json.loads((out / 'report.json').read_text())
+
+
+
+@requires_scene
+class TestAdjust(_AdjustFixture):
+    """Views tilted about different axes: what makes the focal observable on a
+    plane (Zhang's calibration, ADR 0013 Decision 4)."""
+
+    @staticmethod
+    def POSES():
+        return [
+            (scene.rot_x(10) @ scene.rot_z(-25), (8.0, 5.0, 60.0)),
+            (scene.rot_y(-12) @ scene.rot_z(15), (14.0, 1.0, 62.0)),
+            (scene.rot_x(-14) @ scene.rot_y(6) @ scene.rot_z(40),
+             (9.0, 10.0, 58.0)),
+            (scene.rot_y(15), (3.0, 3.0, 61.0)),
+        ]
+
+    def assert_recovers_k(self, report):
+        k = report['intrinsic']['adjusted']
+        self.assertAlmostEqual(k['f'] / self.TRUE_K['f'], 1.0, delta=0.005,
+                               msg=f'focal {k["f"]}')
+        self.assertLess(abs(k['cx'] - self.TRUE_K['cx']), 4.0)
+        self.assertLess(abs(k['cy'] - self.TRUE_K['cy']), 4.0)
+        self.assertAlmostEqual(k['k'][0], self.TRUE_K['k'][0], delta=0.01,
+                               msg=f'k1 {k["k"][0]}')
+
+    def test_recovers_k_and_distortion_from_anchors_alone(self):
+        report = self.adjust('anchors')
+        self.assert_recovers_k(report)
+        self.assertTrue(report['focal_curve']['observable'])
+        self.assertEqual(report['divergent'], 0)
+        self.assertEqual(report['ties']['used'], 0)
+        # Every view ends nearer the truth than its mesh-only solve, which had
+        # the wrong K to work with.
+        for i, view in enumerate(self.views):
+            before = np.linalg.norm(
+                calibration_center(self.localized[i] / 'cal.json') - view.C)
+            after = np.linalg.norm(
+                calibration_center(self.out / f'cal_{i}.json') - view.C)
+            self.assertLess(after, before, f'view {i}: {after} >= {before}')
+            self.assertLess(after, 0.3, f'view {i}')
+
+    def test_ties_from_a_foreign_frame_are_retriangulated(self):
+        report = self.adjust('ties', '--tie-scene', self.dir / 'tie_scene.json')
+        self.assertGreater(report['ties']['used'], 100)
+        self.assert_recovers_k(report)
+        self.assertEqual(report['divergent'], 0)
+        # The adjusted ties are on the plane: they were re-triangulated into
+        # the mesh's frame, not taken from the scene's scaled, shifted one.
+        sfm = json.loads((self.out / 'scene.json').read_text())
+        z = np.array([s['value']['X'][2] for s in sfm['structure']])
+        self.assertGreater(len(z), 100)
+        self.assertLess(np.abs(z).max(), 0.5)
+
+    def test_fixed_intrinsic_is_left_alone(self):
+        report = self.adjust('fixed', '--camera', self.start_cam,
+                             '--fix-intrinsic')
+        k = report['intrinsic']['adjusted']
+        self.assertEqual(k['f'], self.START['f'])
+        self.assertEqual((k['cx'], k['cy']),
+                         (self.START['cx'], self.START['cy']))
+
+
+@requires_scene
+class TestAdjustUntilted(_AdjustFixture):
+    """Every view straight down, rotated only about its own axis: a wrong
+    focal is absorbed into standoff exactly (ADR 0011), so nothing determines
+    it."""
+
+    @staticmethod
+    def POSES():
+        return [(scene.rot_z(a), (x, y, 60.0)) for a, x, y in
+                ((-25, 8.0, 5.0), (15, 14.0, 1.0), (40, 9.0, 10.0),
+                 (0, 3.0, 3.0))]
+
+    def test_unobservable_focal_emits_only_what_was_measured(self):
+        report = self.adjust('flat')
+        self.assertFalse(report['focal_curve']['observable'])
+        self.assertEqual(report['intrinsic_emitted'], 'start')
+        for i, v in enumerate(self.localized):
+            self.assertEqual(report['views'][i]['emitted'], 'mesh-only')
+            self.assertEqual((self.out / f'cal_{i}.json').read_bytes(),
+                             (v / 'cal.json').read_bytes())
+        camera = dict(line.split(None, 1) for line in
+                      (self.out / 'camera.txt').read_text().splitlines())
+        self.assertEqual(float(camera['fx']), self.START['f'])
+
+
+@requires_scene
+class TestSceneConventions(unittest.TestCase):
+    """The fixture's renderer and projection are each other's inverse,
+    distortion included."""
+
+    def test_projection_inverts_the_render_rays(self):
+        view = scene.View(R=scene.rot_x(9) @ scene.DOWN,
+                          C=np.array([2.0, 1.0, 60.0]), f=1600.0, cx=403.0,
+                          cy=297.0, width=800, height=600,
+                          k=(-0.05, 0.01, 0.0))
+        pts = scene.plane_points(view)
+        rows, cols = np.mgrid[0:600:37, 0:800:41]
+        X = pts[rows.ravel(), cols.ravel()]
+        uv = scene.project(view, X)
+        centres = np.stack([cols.ravel() + 0.5, rows.ravel() + 0.5], 1)
+        self.assertLess(np.abs(uv - centres).max(), 1e-6)
 
 
 if __name__ == '__main__':

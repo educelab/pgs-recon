@@ -243,11 +243,20 @@ set_target_properties(localize PROPERTIES OUTPUT_NAME "pgs-localize")
 # nothing else in this build or in pgs-recon depends on it.
 option(PGS_BUILD_VIEWSET "Build pgs-localize-joint (ADR 0013)" OFF)
 if(PGS_BUILD_VIEWSET)
+    # The joint adjustment is its own Ceres problem rather than openMVG's
+    # bundle adjuster: anchors must stay fixed while tie points move, which
+    # openMVG's all-or-nothing structure option cannot express. Ceres is
+    # already installed for openMVG.
+    find_package(Ceres REQUIRED)
     # The same core pgs-localize links, and C++20 through it.
-    add_executable(localize_joint src/localize_joint.cpp src/Npy.hpp)
+    add_executable(localize_joint
+        src/localize_joint.cpp
+        src/Npy.hpp
+        src/NpyArray.hpp)
     target_link_libraries(localize_joint
         localize_core
         Boost::program_options
+        Ceres::ceres
     )
     set_target_properties(localize_joint PROPERTIES
         OUTPUT_NAME "pgs-localize-joint")
