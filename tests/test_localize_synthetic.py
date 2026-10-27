@@ -22,6 +22,9 @@ What each class guards:
   determine the focal, and the adjustment must say so and emit nothing it
   could not measure. Without the check this guards, the solve walks every
   camera hundreds of units away while its residuals *improve*.
+- :class:`TestPipeline` -- ``pgs-localize-set`` end to end on that plate: every
+  phase, from the position map through the group SfM and the joint adjustment
+  to one textured mesh per view, and a second run that redoes nothing.
 - :class:`TestSceneConventions` -- the scene's own renderer and projection
   agree, so a failure above is the tool's and not the fixture's.
 
@@ -30,7 +33,9 @@ published image this tests the installed tools. ``pgs-localize-joint`` is only
 built with ``PGS_BUILD_VIEWSET=ON``; its tests skip without it.
 """
 import json
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -389,6 +394,91 @@ class TestAdjustUntilted(_AdjustFixture):
         camera = dict(line.split(None, 1) for line in
                       (self.out / 'camera.txt').read_text().splitlines())
         self.assertEqual(float(camera['fx']), self.START['f'])
+
+
+@requires_scene
+class TestPipeline(_AdjustFixture):
+    """``pgs-localize-set`` from the command line, twice."""
+
+    POSES = TestAdjust.POSES
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import configargparse  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest('needs configargparse')
+        super().setUpClass()
+        d = cls.dir
+        images = d / 'handheld'
+        images.mkdir()
+        for name in cls.names:
+            shutil.copy(d / name, images / name)
+        recon = d / 'recon'
+        recon.mkdir()
+        (recon / 'pgs-recon.json').write_text('{"stages": {}, "commands": {}}')
+        cls.set_dir = d / 'set'
+        argv = [sys.executable, '-m', 'pgs_recon.viewset.cli',
+                '--recon-dir', recon, '--images', images,
+                '--output', cls.set_dir, '--mesh', cls.mesh,
+                '--ir-reference-mesh', cls.mesh,
+                '--overhead-calibration', d / 'overhead_calibration.json',
+                '--overhead-image', d / 'overhead.png',
+                '--camera', cls.start_cam, '--threads', 2,
+                '--path', toolchain.effective_prefix()]
+        cls.first = run(argv)
+        cls.second = run(argv)
+        cls.meta = json.loads((cls.set_dir / 'pgs-localize-set.json')
+                              .read_text())
+
+    def test_every_view_is_localized(self):
+        views = self.meta['views']
+        self.assertEqual(sorted(views), sorted(Path(n).stem
+                                               for n in self.names))
+        for stem, record in views.items():
+            self.assertEqual(record['status'], 'done', stem)
+
+    def test_the_overlapping_views_are_one_group_and_it_solves(self):
+        self.assertEqual(len(self.meta['groups']['groups']), 1)
+        self.assertEqual(len(self.meta['groups']['groups'][0]), 4)
+        self.assertEqual(len(self.meta['groups']['solved']), 1)
+        report = json.loads((self.set_dir / 'joint' / 'report.json')
+                            .read_text())
+        self.assertGreater(report['ties']['used'], 0)
+
+    def test_the_shared_k_is_recovered(self):
+        report = json.loads((self.set_dir / 'joint' / 'report.json')
+                            .read_text())
+        self.assertEqual(report['intrinsic_emitted'], 'adjusted')
+        k = report['intrinsic']['adjusted']
+        self.assertAlmostEqual(k['f'] / self.TRUE_K['f'], 1.0, delta=0.005)
+        self.assertAlmostEqual(k['k'][0], self.TRUE_K['k'][0], delta=0.01)
+
+    def test_each_view_textures_the_mesh(self):
+        for name in self.names:
+            stem = Path(name).stem
+            obj = self.set_dir / 'views' / stem / 'textured' / f'{stem}.obj'
+            self.assertTrue(obj.is_file(), obj)
+            self.assertIn('vt ', obj.read_text())
+
+    def test_a_second_run_redoes_nothing(self):
+        log = self.second.stdout + self.second.stderr
+        for name in self.names:
+            stem = Path(name).stem
+            self.assertIn(f'{stem}: current, skipping', log)
+            self.assertIn(f'{stem}: texture current, skipping', log)
+        self.assertIn('joint adjustment: current, skipping', log)
+        for word in ('localizing', 'adjusting', 'texturing'):
+            self.assertNotIn(word, log)
+
+    def test_the_manifest_records_every_phase(self):
+        commands = ' '.join(self.meta['commands'].values())
+        for marker in ('position-map', ' view ', ' adjust ',
+                       'openMVG_main_SfM ', 'pgs_recon.apps.retexture'):
+            self.assertIn(marker, commands)
+        self.assertEqual(self.meta['joint']['status'], 'done')
+        for stem, record in self.meta['views'].items():
+            self.assertEqual(record['texture']['status'], 'done', stem)
 
 
 @requires_scene

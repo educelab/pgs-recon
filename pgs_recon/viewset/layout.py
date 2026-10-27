@@ -75,8 +75,30 @@ def surviving_pairs(output: Path) -> Path:
 
 
 def group_dir(output: Path, index: int) -> Path:
-    """One connected group's subset scene and SfM solve."""
+    """One connected group's SfM solve. OpenMVG names the solve itself
+    (``sfm_data.bin``) inside it."""
     return sfm_dir(output) / f'group_{index:03d}'
+
+
+def group_scene(output: Path, index: int) -> Path:
+    """The imported scene cut down to one group's views, ids unchanged."""
+    return group_dir(output, index) / 'group_scene.json'
+
+
+def group_pairs(output: Path, index: int) -> Path:
+    """The surviving pairs between one group's views."""
+    return group_dir(output, index) / 'pairs.txt'
+
+
+def group_putative_matches(output: Path, index: int) -> Path:
+    """One group's matches. In the shared matches directory, not the group's:
+    OpenMVG's matching tools load regions from the directory their output
+    file is in."""
+    return matches_dir(output) / f'group_{index:03d}_matches.bin'
+
+
+def group_filtered_matches(output: Path, index: int) -> Path:
+    return matches_dir(output) / f'group_{index:03d}_matches_filtered.bin'
 
 
 # --- Per view ---------------------------------------------------------------

@@ -5,18 +5,21 @@ and returning what the next phase needs. :func:`run` is nothing but their
 sequence, so the order is readable in one place, as ``run_pipeline`` is for
 ``pgs-recon``.
 
-Phases that are not built yet raise :class:`NotImplementedError` naming the
-ADR 0013 task that builds them, so a run stops at the first gap with a pointer
-rather than producing a partial result that looks whole.
+What may fail without stopping the run is what the ADR treats as evidence
+rather than as the answer: one view failing to localize (it is reported and
+not emitted), and one group failing to solve (it contributes no tie points).
+Everything else stops the run.
 """
 import json
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Sequence
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from pgs_recon import openmvg, toolchain
 from pgs_recon.toolchain import cam_db, run as run_tool
+from pgs_recon.utility import ToolFailed
+from pgs_recon.utils.sfm_json import fix_polymorphic_registration
 from pgs_recon.viewset import groups as groups_mod
 from pgs_recon.viewset import layout, manifest, tools
 from pgs_recon.viewset.inputs import PlateInputs, Reference, Strategy
@@ -62,7 +65,7 @@ def run(plate: PlateInputs, strategy: Strategy, output: Path,
     _check_provenance(meta, plate, reference)
     manifest.write(meta_path, meta)
 
-    imported = import_set(plate, output)
+    imported = import_set(plate, output, opts.camera)
     camera = starting_camera(imported, output, opts)
 
     # Each view is localized against the mesh alone, needing nothing from the
@@ -71,14 +74,15 @@ def run(plate: PlateInputs, strategy: Strategy, output: Path,
     localized = localize_views(plate, reference, position_map, camera, output,
                                opts, meta, meta_path)
 
-    split = reconstruct_groups(imported, output, opts)
+    split, tie_scenes = reconstruct_groups(imported, output, opts)
     meta['groups'] = {'groups': [list(g) for g in split.groups],
-                      'singletons': list(split.singletons)}
+                      'singletons': list(split.singletons),
+                      'solved': [str(s) for s in tie_scenes]}
     manifest.write(meta_path, meta)
 
-    adjust_views(localized, split, camera, output, opts)
+    adjust_views(localized, tie_scenes, camera, output, opts, meta, meta_path)
     if not opts.skip_texture:
-        texture_views(plate, localized, output)
+        texture_views(plate, localized, output, meta, meta_path)
 
 
 # --- Phase 0: the IR reference (Decision 2) ---------------------------------
@@ -154,21 +158,40 @@ def _check_provenance(meta: Dict, plate: PlateInputs, reference: Path) -> None:
 # --- Phase 2: hand-held structure (Decision 3) ------------------------------
 
 
-def import_set(plate: PlateInputs, output: Path) -> Path:
+def import_set(plate: PlateInputs, output: Path,
+               camera: Optional[Path] = None) -> Path:
     """Import the hand-held images as an OpenMVG scene, once.
 
     One shared intrinsic (``-g`` left at upstream's grouping default) in the
-    radial-k3 model, with its focal from EXIF and the sensor database. That
-    intrinsic is the starting K every view is localized with.
+    radial-k3 model. Its K is ``camera``'s when one is given -- which is also
+    what lets images with no EXIF focal import with an intrinsic at all, and
+    without one the group SfM cannot run -- and otherwise OpenMVG's, from EXIF
+    and the sensor database. That K is where every view starts.
     """
     sfm_dir = layout.sfm_dir(output)
     imported = sfm_dir / 'sfm_data.json'  # OpenMVG picks this name
     if not imported.exists():
         sfm_dir.mkdir(parents=True, exist_ok=True)
-        openmvg.init_sfm_generic(_common_dir(plate.images), output_dir=sfm_dir,
-                                 cam_db=cam_db(),
-                                 camera_model=CAMERA_MODEL_RADIAL3)
+        openmvg.init_sfm_generic(
+            _common_dir(plate.images), output_dir=sfm_dir, cam_db=cam_db(),
+            camera_model=CAMERA_MODEL_RADIAL3,
+            intrinsics=_k_matrix(camera) if camera is not None else None)
     return imported
+
+
+def _k_matrix(camera: Path) -> str:
+    """A flat camera file's K as OpenMVG's ``-k`` string,
+    ``"f;0;ppx;0;f;ppy;0;0;1"``."""
+    keys = {}
+    for line in Path(camera).read_text().splitlines():
+        fields = line.split()
+        if len(fields) == 2:
+            keys[fields[0]] = fields[1]
+    try:
+        return (f'{keys["fx"]};0;{keys["cx"]};0;{keys["fy"]};{keys["cy"]};'
+                f'0;0;1')
+    except KeyError as e:
+        sys.exit(f'{camera} has no {e.args[0]}; is it a camera file?')
 
 
 def starting_camera(imported: Path, output: Path, opts: Options) -> Path:
@@ -207,12 +230,15 @@ def camera_file_from_scene(sfm_json: Path) -> str:
             f'k1 {k[0]}\nk2 {k[1]}\nk3 {k[2]}\n')
 
 
-def reconstruct_groups(imported: Path, output: Path,
-                       opts: Options) -> groups_mod.Groups:
-    """Describe and match the hand-held set; split it into groups.
+def reconstruct_groups(imported: Path, output: Path, opts: Options
+                       ) -> Tuple[groups_mod.Groups, List[Path]]:
+    """Describe and match the hand-held set, split it into groups, and solve
+    each group's SfM.
 
-    Returns groups of image *stems*. Solving each group's SfM is the second half
-    of this phase and not built yet (:func:`_solve_group`).
+    Returns the groups, as image *stems*, and the solves that succeeded -- the
+    tie scenes. A group that does not solve is dropped from the ties and the
+    run goes on: ties are evidence, and every view is already anchored to the
+    mesh on its own (Decision 5).
     """
     matches_dir = layout.matches_dir(output)
     if not layout.filtered_matches(output).exists():
@@ -228,31 +254,77 @@ def reconstruct_groups(imported: Path, output: Path,
                                  output_pairs=layout.surviving_pairs(output))
 
     files = _view_files(imported)
-    stems = [Path(files[i]).stem for i in sorted(files)]
-    pairs = [(Path(files[a]).stem, Path(files[b]).stem)
-             for a, b in groups_mod.read_pairs(layout.surviving_pairs(output))]
-    split = groups_mod.split(stems, pairs)
-    logger.info(f'{len(stems)} views: {len(split.groups)} groups '
+    stem_of = {i: Path(name).stem for i, name in files.items()}
+    id_pairs = groups_mod.read_pairs(layout.surviving_pairs(output))
+    split = groups_mod.split([stem_of[i] for i in sorted(files)],
+                             [(stem_of[a], stem_of[b]) for a, b in id_pairs])
+    logger.info(f'{len(files)} views: {len(split.groups)} groups '
                 f'({", ".join(str(len(g)) for g in split.groups) or "none"}), '
                 f'{len(split.singletons)} singletons')
 
+    solved = []
     for index, group in enumerate(split.groups):
-        _solve_group(imported, group, index, output, opts)
-    return split
+        members = {i for i, stem in stem_of.items() if stem in set(group)}
+        pairs = [(a, b) for a, b in id_pairs if a in members and b in members]
+        try:
+            solved.append(_solve_group(imported, members, pairs, index, output,
+                                       opts))
+        except ToolFailed as e:
+            logger.warning(f'group {index} ({len(group)} views) did not solve, '
+                           f'so it contributes no tie points: {e}')
+    return split, solved
 
 
-def _solve_group(imported: Path, group: Sequence[str], index: int,
+def _solve_group(imported: Path, members: set, pairs: list, index: int,
                  output: Path, opts: Options) -> Path:
-    """Subset the imported scene to ``group`` and solve it with OpenMVG.
+    """Solve one group's SfM, returning the ``sfm_data.bin`` OpenMVG wrote.
 
-    Open question to settle while building it: whether ``openMVG_main_SfM``
-    accepts a matches file naming views absent from the scene, or the matches
-    must be subset too.
+    The imported scene is cut down to the group with its view ids unchanged,
+    and the group's pairs are re-matched into a matches file of their own:
+    ``openMVG_main_SfM`` reads every pair it is handed, and a pair naming a view
+    the scene does not hold is not something to rely on it skipping. The
+    regions are shared, so re-matching a group costs only its own pairs.
     """
-    raise NotImplementedError(
-        'Per-group SfM (ADR 0013 task 5): subset the imported scene with '
-        'utils.sfm_json, then openmvg.mvg_sfm(engine="INCREMENTALV2") into '
-        f'{layout.group_dir(output, index)}')
+    solved = layout.group_dir(output, index) / 'sfm_data.bin'
+    if solved.exists():
+        return solved
+    group_dir = layout.group_dir(output, index)
+    group_dir.mkdir(parents=True, exist_ok=True)
+
+    scene = layout.group_scene(output, index)
+    _subset_scene(imported, members, scene)
+    layout.group_pairs(output, index).write_text(
+        ''.join(f'{a} {b}\n' for a, b in pairs))
+
+    putative = layout.group_putative_matches(output, index)
+    filtered = layout.group_filtered_matches(output, index)
+    openmvg.compute_matches(scene, output=putative,
+                            method='FASTCASCADEHASHINGL2',
+                            pairs_file=layout.group_pairs(output, index))
+    openmvg.geometric_filter(scene, matches=putative, output=filtered)
+    return openmvg.mvg_sfm(scene, features_dir=layout.matches_dir(output),
+                           matches=filtered, output_dir=group_dir,
+                           engine='INCREMENTALV2')
+
+
+def _subset_scene(imported: Path, members: set, out: Path) -> None:
+    """``imported`` with only the views in ``members``, ids unchanged, and only
+    the intrinsics they reference -- re-registered with cereal if the one that
+    registered their type was dropped (:mod:`pgs_recon.utils.sfm_json`)."""
+    data = json.loads(Path(imported).read_text())
+    data['views'] = [v for v in data['views'] if v['key'] in members]
+    used = {v['value']['ptr_wrapper']['data']['id_intrinsic']
+            for v in data['views']}
+    all_intrinsics = data.get('intrinsics', [])
+    data['intrinsics'] = fix_polymorphic_registration(
+        all_intrinsics, [i for i in all_intrinsics if i['key'] in used])
+    if not data['intrinsics']:
+        sys.exit(f'{imported} gives these views no intrinsic, and SfM needs '
+                 f'one. Pass --camera with a starting K.')
+    data['extrinsics'] = []
+    data['structure'] = []
+    data['control_points'] = []
+    Path(out).write_text(json.dumps(data, indent=2))
 
 
 # --- Phase 3: per-view localization (Decision 2) ----------------------------
@@ -314,11 +386,52 @@ def localize_views(plate: PlateInputs, reference: Path, position_map: Path,
 # --- Phase 4: joint adjustment (Decision 4, 5) ------------------------------
 
 
-def adjust_views(stems: Sequence[str], split: groups_mod.Groups,
-                 camera: Path, output: Path, opts: Options) -> None:
+def adjust_views(stems: Sequence[str], tie_scenes: Sequence[Path],
+                 camera: Path, output: Path, opts: Options, meta: Dict,
+                 meta_path: Path) -> None:
+    """Adjust every localized view jointly -- unless nothing it reads changed.
+
+    Its inputs are every view's mesh-only calibration and correspondences, the
+    tie scenes, the starting camera, and the options that change the solve. A
+    view re-localized for any reason changes its calibration's fingerprint, so
+    the adjustment follows it.
+    """
     if not stems:
         sys.exit('No view localized; nothing to adjust.')
+    inputs = {'camera': manifest.fingerprint(camera),
+              'options': {'path': 'options',
+                          'fix_intrinsic': opts.fix_intrinsic,
+                          'focal_sweep': opts.focal_sweep}}
+    for s in stems:
+        inputs[f'calibration:{s}'] = manifest.fingerprint(
+            layout.view_calibration(output, s))
+        inputs[f'correspondences:{s}'] = manifest.fingerprint(
+            layout.view_correspondences(output, s))
+    for i, scene in enumerate(tie_scenes):
+        inputs[f'tie_scene:{i}'] = manifest.fingerprint(scene)
+    reason = manifest.stale_reason(meta.get('joint'), inputs)
+    if reason is None:
+        logger.info('joint adjustment: current, skipping')
+        return
+    logger.info(f'joint adjustment: adjusting {len(stems)} views ({reason})')
+
     layout.joint_dir(output).mkdir(parents=True, exist_ok=True)
+    meta['joint'] = {'inputs': inputs, 'status': 'running'}
+    manifest.write(meta_path, meta)
+    try:
+        _run_adjust(stems, tie_scenes, camera, output, opts)
+    except Exception:
+        meta['joint']['status'] = 'failed'
+        manifest.write(meta_path, meta)
+        raise
+    meta['joint']['status'] = 'done'
+    # Every deliverable calibration was just rewritten; texture_views sees that
+    # through each one's fingerprint, so no texture needs invalidating here.
+    manifest.write(meta_path, meta)
+
+
+def _run_adjust(stems: Sequence[str], tie_scenes: Sequence[Path],
+                camera: Path, output: Path, opts: Options) -> None:
     tools.adjust(
         calibrations=[layout.view_calibration(output, s) for s in stems],
         correspondences=[layout.view_correspondences(output, s) for s in stems],
@@ -327,8 +440,7 @@ def adjust_views(stems: Sequence[str], split: groups_mod.Groups,
         output_scene=layout.joint_scene(output),
         output_camera=layout.joint_camera(output),
         report=layout.joint_report(output),
-        tie_scenes=[layout.group_dir(output, i) / 'sfm_data.bin'
-                    for i in range(len(split.groups))],
+        tie_scenes=list(tie_scenes),
         camera=camera, fix_intrinsic=opts.fix_intrinsic,
         focal_sweep=opts.focal_sweep, threads=opts.threads)
 
@@ -336,23 +448,42 @@ def adjust_views(stems: Sequence[str], split: groups_mod.Groups,
 # --- Phase 6: texture each view (Decision 7) --------------------------------
 
 
-def texture_views(plate: PlateInputs, stems: Sequence[str],
-                  output: Path) -> None:
-    """One projective-UV mesh per view, through ``pgs-retexture --calibration``.
+def texture_views(plate: PlateInputs, stems: Sequence[str], output: Path,
+                  meta: Dict, meta_path: Path) -> None:
+    """One projective-UV mesh per view, through ``pgs-retexture --calibration``,
+    redone only for a view whose calibration, image or mesh changed.
 
     The deliverable texture is the hand-held image itself, so the mesh is the
-    reconstruction's, not the IR reference.
+    reconstruction's, not the IR reference. One view failing to texture does
+    not stop the others.
     """
     by_stem = {p.stem: p for p in plate.images}
     for stem in stems:
+        calibration = layout.view_adjusted_calibration(output, stem)
+        inputs = {'calibration': manifest.fingerprint(calibration),
+                  'image': manifest.fingerprint(by_stem[stem]),
+                  'mesh': manifest.fingerprint(plate.mesh)}
+        record = meta['views'][stem]
+        reason = manifest.stale_reason(record.get('texture'), inputs)
+        if reason is None:
+            logger.info(f'{stem}: texture current, skipping')
+            continue
+        logger.info(f'{stem}: texturing ({reason})')
         target = layout.view_textured_mesh(output, stem)
         target.parent.mkdir(parents=True, exist_ok=True)
-        run_tool(_retexture() + [
-            '-i', by_stem[stem],
-            '--calibration', layout.view_adjusted_calibration(output, stem),
-            '-r', plate.recon_dir, '--mesh', plate.mesh,
-            '--output-mesh', target,
-            '--working-dir', layout.view_dir(output, stem)])
+        record['texture'] = {'inputs': inputs, 'status': 'running'}
+        try:
+            run_tool(_retexture() + [
+                '-i', by_stem[stem], '--calibration', calibration,
+                '-r', plate.recon_dir, '--mesh', plate.mesh,
+                '--output-mesh', target,
+                '--working-dir', layout.view_dir(output, stem)])
+        except ToolFailed as e:
+            record['texture']['status'] = 'failed'
+            logger.error(f'{stem}: texturing failed: {e}')
+        else:
+            record['texture']['status'] = 'done'
+        manifest.write(meta_path, meta)
 
 
 # --- Helpers ----------------------------------------------------------------
