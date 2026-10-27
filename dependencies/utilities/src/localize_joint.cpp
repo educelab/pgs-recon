@@ -17,6 +17,9 @@
  *   - **adjust**: one shared intrinsic, every pose, mesh points fixed, tie
  *     points free (Decision 4), with the focal cost curve and the per-view
  *     divergence that checks the no-movement assumption (Decision 5).
+ *   - **qa**: how far each view's image sits from where its calibration says,
+ *     measured against the other views, the overhead, and the reference
+ *     texture, each labelled for how independent it is (Decision 6).
  *
  * Everything here is built from `localize_core`, the code `pgs-localize` runs
  * and ADR 0011 measured; this file is orchestration over it. The command line
@@ -1359,18 +1362,445 @@ auto adjust(const std::vector<std::string>& argv) -> int
   return SUCCESS;
 }
 
+// --- qa ----------------------------------------------------------------------
+
+/// Tile side, in pixels, over which one shift is measured.
+constexpr int kQaTile = 64;
+/// A tile is measured only when this much of it is valid in both images.
+constexpr double kQaTileValid = 0.95;
+/// Pairs overlapping less than this, as a fraction of the target view's
+/// surface pixels, are not compared: too few tiles to say anything.
+constexpr double kQaMinOverlap = 0.05;
+/// A comparison with fewer measured tiles than this is reported, not graded.
+constexpr std::size_t kQaMinTiles = 10;
+/// Provisional grades for a comparison's coherent shift, in target-view
+/// pixels. Nothing measured sets them yet (ADR 0013, Not settled).
+constexpr double kQaReviewPx = 1.0;
+constexpr double kQaFailPx = 3.0;
+
+/// One view as QA sees it: its solved camera and the image it was taken with.
+struct QaView {
+  std::string label;
+  loc::Camera camera;
+  cv::Mat gray01;
+};
+
+auto ReadQaView(const fs::path& calibration,
+                const std::optional<fs::path>& image) -> QaView
+{
+  sfm::SfM_Data scene;
+  if (not sfm::Load(scene, calibration.string(),
+                    sfm::ESfM_Data(sfm::VIEWS | sfm::INTRINSICS |
+                                   sfm::EXTRINSICS))) {
+    throw std::runtime_error("could not read " + calibration.string());
+  }
+  for (const auto& [id, view] : scene.GetViews()) {
+    if (not scene.IsPoseAndIntrinsicDefined(view.get())) {
+      continue;
+    }
+    const auto& intrinsic = *scene.GetIntrinsics().at(view->id_intrinsic);
+    QaView out;
+    out.camera.width = static_cast<int>(intrinsic.w());
+    out.camera.height = static_cast<int>(intrinsic.h());
+    out.camera = loc::CameraFromSolve(out.camera, intrinsic,
+                                      scene.GetPoseOrDie(view.get()));
+    const auto path =
+        image ? *image : fs::path(scene.s_root_path) / view->s_Img_path;
+    out.label = path.filename().string();
+    const auto raw = cv::imread(path.string(), cv::IMREAD_UNCHANGED);
+    if (raw.empty()) {
+      throw std::runtime_error("could not read " + path.string());
+    }
+    if (raw.cols != out.camera.width or raw.rows != out.camera.height) {
+      throw std::runtime_error(path.string() + " is not the size its "
+                               "calibration says");
+    }
+    out.gray01 = loc::ToGray01(raw);
+    return out;
+  }
+  throw std::runtime_error(calibration.string() + " holds no view with a pose");
+}
+
+/// Normalized camera coordinates to the camera's image coordinates, radial
+/// distortion included -- openMVG's pinhole_radial_k3.
+auto Distort(const loc::Camera& c, const double x, const double y)
+    -> cv::Point2d
+{
+  const auto r2 = x * x + y * y;
+  const auto d = 1.0 + c.disto[0] * r2 + c.disto[1] * r2 * r2 +
+                 c.disto[2] * r2 * r2 * r2;
+  return {c.fx * x * d + c.cx, c.fy * y * d + c.cy};
+}
+
+/**
+ * @brief A view's image resampled onto its own ideal pinhole grid -- the grid
+ *        the renderer casts on, so it lines up with that view's render.
+ *
+ * Pixel (u, v) of the grid is the ray through image coordinate (u + 0.5,
+ * v + 0.5) (`localize_render.cpp`); through the lens it lands at a distorted
+ * image coordinate, which is array position (that - 0.5) in the photograph.
+ */
+auto OnIdealGrid(const QaView& v) -> cv::Mat
+{
+  const auto& c = v.camera;
+  cv::Mat mapX(c.height, c.width, CV_32F);
+  cv::Mat mapY(c.height, c.width, CV_32F);
+  for (int r = 0; r < c.height; ++r) {
+    for (int u = 0; u < c.width; ++u) {
+      const auto p = Distort(c, (u + 0.5 - c.cx) / c.fx, (r + 0.5 - c.cy) / c.fy);
+      mapX.at<float>(r, u) = static_cast<float>(p.x - 0.5);
+      mapY.at<float>(r, u) = static_cast<float>(p.y - 0.5);
+    }
+  }
+  cv::Mat out;
+  cv::remap(v.gray01, out, mapX, mapY, cv::INTER_LINEAR, cv::BORDER_CONSTANT,
+            cv::Scalar(std::numeric_limits<float>::quiet_NaN()));
+  return out;
+}
+
+/// What one comparison measured.
+struct Shift {
+  std::string source;
+  std::string target;
+  double overlap{0.0};
+  std::size_t tiles{0};
+  /// The coherent shift: the length of the component-wise median of the
+  /// tiles' shift vectors. This is what is graded. Misregistration moves the
+  /// tiles together, so it survives the median; per-tile noise points every
+  /// way and cancels in it.
+  double shiftPx{std::numeric_limits<double>::quiet_NaN()};
+  Eigen::Vector2d shift{Eigen::Vector2d::Zero()};
+  /// The spread: the median and 90th percentile of the tiles' shift
+  /// *magnitudes*. A magnitude cannot be negative, so noise alone gives these
+  /// a floor well above zero; they say how noisy the measurement was, not how
+  /// far off the view is.
+  double medianPx{std::numeric_limits<double>::quiet_NaN()};
+  double p90Px{std::numeric_limits<double>::quiet_NaN()};
+};
+
+/**
+ * @brief Measure how far @p moving sits from @p fixed, tile by tile.
+ *
+ * Both are on the same grid; @p valid marks where both hold surface. Each is
+ * locally normalized first -- the two are different exposures, possibly
+ * different bands -- and each tile's shift is the phase correlation peak.
+ */
+auto MeasureShift(const cv::Mat& fixed01, const cv::Mat& moving01,
+                  const cv::Mat& valid, Shift& out) -> void
+{
+  // NaN would poison the normalization's blurs; the mask says where it was.
+  cv::Mat a = fixed01.clone();
+  cv::Mat b = moving01.clone();
+  a.setTo(0.0, ~valid);
+  b.setTo(0.0, ~valid);
+  cv::Mat na;
+  cv::Mat nb;
+  loc::LocalNormalize(a, 15.0, 3.0).convertTo(na, CV_32F);
+  loc::LocalNormalize(b, 15.0, 3.0).convertTo(nb, CV_32F);
+  cv::Mat window;
+  cv::createHanningWindow(window, {kQaTile, kQaTile}, CV_32F);
+
+  std::vector<double> mags;
+  std::vector<double> dxs;
+  std::vector<double> dys;
+  for (int y = 0; y + kQaTile <= valid.rows; y += kQaTile) {
+    for (int x = 0; x + kQaTile <= valid.cols; x += kQaTile) {
+      const cv::Rect tile(x, y, kQaTile, kQaTile);
+      if (cv::countNonZero(valid(tile)) <
+          kQaTileValid * kQaTile * kQaTile) {
+        continue;
+      }
+      cv::Scalar mean;
+      cv::Scalar sd;
+      cv::meanStdDev(na(tile), mean, sd);
+      if (sd[0] < 5.0) {
+        continue;  // nothing in it to correlate
+      }
+      double response = 0.0;
+      const auto s =
+          cv::phaseCorrelate(na(tile), nb(tile), window, &response);
+      if (response < 0.05) {
+        continue;
+      }
+      // phaseCorrelate reports where `moving` sits relative to `fixed`.
+      mags.push_back(std::hypot(s.x, s.y));
+      dxs.push_back(s.x);
+      dys.push_back(s.y);
+    }
+  }
+  out.tiles = mags.size();
+  if (mags.empty()) {
+    return;
+  }
+  const auto median = [](std::vector<double> v) {
+    std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+    return v[v.size() / 2];
+  };
+  out.shift = Eigen::Vector2d(median(dxs), median(dys));
+  out.shiftPx = out.shift.norm();
+  std::sort(mags.begin(), mags.end());
+  out.medianPx = mags[mags.size() / 2];
+  out.p90Px = mags[std::min(mags.size() - 1, mags.size() * 9 / 10)];
+}
+
+/**
+ * @brief @p source's image as @p target sees the surface, on @p target's ideal
+ *        grid, and where that is valid.
+ *
+ * Each surface point @p target sees (its render's position map) is projected
+ * into @p source with @p source's distortion, kept only where @p source sees
+ * that same point -- its own render's depth there agrees -- and sampled.
+ */
+auto WarpInto(const QaView& source, const loc::Render& sourceRender,
+              const loc::Render& targetRender, cv::Mat& warped,
+              cv::Mat& valid) -> void
+{
+  const auto& c = source.camera;
+  const auto rows = targetRender.position.rows;
+  const auto cols = targetRender.position.cols;
+  cv::Mat mapX(rows, cols, CV_32F, cv::Scalar(-1));
+  cv::Mat mapY(rows, cols, CV_32F, cv::Scalar(-1));
+  valid = cv::Mat::zeros(rows, cols, CV_8U);
+  for (int r = 0; r < rows; ++r) {
+    for (int u = 0; u < cols; ++u) {
+      const auto& p = targetRender.position.at<cv::Vec3f>(r, u);
+      if (not std::isfinite(p[0])) {
+        continue;
+      }
+      const Eigen::Vector3d xc = c.R * Eigen::Vector3d(p[0], p[1], p[2]) + c.t;
+      if (xc[2] <= 0.0) {
+        continue;
+      }
+      const auto nx = xc[0] / xc[2];
+      const auto ny = xc[1] / xc[2];
+      // Occlusion, on the source's ideal grid where its depth lives.
+      const auto iu = static_cast<int>(std::floor(c.fx * nx + c.cx));
+      const auto iv = static_cast<int>(std::floor(c.fy * ny + c.cy));
+      if (iu < 0 or iv < 0 or iu >= c.width or iv >= c.height) {
+        continue;
+      }
+      const auto seen = sourceRender.depth.at<float>(iv, iu);
+      if (not std::isfinite(seen) or
+          std::abs(seen - xc[2]) > 0.005 * xc[2]) {
+        continue;
+      }
+      const auto d = Distort(c, nx, ny);
+      if (d.x < 0.5 or d.y < 0.5 or d.x > c.width - 1.5 or
+          d.y > c.height - 1.5) {
+        continue;
+      }
+      mapX.at<float>(r, u) = static_cast<float>(d.x - 0.5);
+      mapY.at<float>(r, u) = static_cast<float>(d.y - 0.5);
+      valid.at<unsigned char>(r, u) = 255;
+    }
+  }
+  cv::remap(source.gray01, warped, mapX, mapY, cv::INTER_LINEAR,
+            cv::BORDER_CONSTANT, cv::Scalar(0));
+}
+
+auto Grade(const Shift& s) -> std::string
+{
+  if (s.tiles < kQaMinTiles) {
+    return "unmeasured";
+  }
+  return s.shiftPx > kQaFailPx     ? "fail"
+         : s.shiftPx > kQaReviewPx ? "review"
+                                   : "pass";
+}
+
+auto ShiftJson(const Shift& s, const bool graded) -> std::string
+{
+  std::ostringstream o;
+  o << "{\"source\": " << quote(s.source) << ", \"target\": "
+    << quote(s.target) << ", \"overlap\": " << number(s.overlap)
+    << ", \"tiles\": " << s.tiles << ", \"shift_px\": " << number(s.shiftPx)
+    << ", \"shift\": [" << number(s.shift[0]) << ", " << number(s.shift[1])
+    << "], \"spread_median_px\": " << number(s.medianPx)
+    << ", \"spread_p90_px\": " << number(s.p90Px);
+  if (graded) {
+    o << ", \"grade\": " << quote(Grade(s));
+  }
+  return o.str() + "}";
+}
+
+auto qa(const std::vector<std::string>& argv) -> int
+{
+  // clang-format off
+  po::options_description opts("qa");
+  opts.add_options()
+    ("help,h", "print help message")
+    ("calibration", po::value<std::vector<std::string>>()->composing(), "a view's final calibration; its image is the one the calibration names. Repeated, once per view")
+    ("mesh", po::value<std::string>(), "the mesh the views were localized against; only its geometry is used, for where each view sees the surface")
+    ("overhead-calibration", po::value<std::string>(), "the overhead view's calibration, for the overhead comparison (partly independent, ADR 0013 Decision 6)")
+    ("overhead-image", po::value<std::string>(), "the overhead image to compare against; with --overhead-calibration")
+    ("reference-mesh", po::value<std::string>(), "the IR reference mesh, for the circular comparison: reported, never graded")
+    ("report", po::value<std::string>(), "write the JSON report here")
+    ("threads", po::value<int>()->default_value(0), "renderer threads; 0 uses all")
+  ;
+  // clang-format on
+  po::variables_map args;
+  if (const auto code = parseOrExit("qa", opts, argv,
+                                    {"calibration", "mesh", "report"}, args);
+      code >= 0) {
+    return code;
+  }
+  if (args.count("overhead-calibration") != args.count("overhead-image")) {
+    std::cerr << "ERROR: --overhead-calibration and --overhead-image go "
+                 "together\n";
+    return BAD_ARG;
+  }
+  if (not requireFiles(args, {"calibration", "mesh", "overhead-calibration",
+                              "overhead-image", "reference-mesh"})) {
+    return IO_ERROR;
+  }
+  const auto threads = static_cast<std::size_t>(args["threads"].as<int>());
+
+  std::vector<QaView> views;
+  std::vector<loc::Render> renders;
+  std::vector<cv::Mat> ideal;
+  std::vector<Shift> pairs;
+  std::vector<Shift> overhead;
+  std::vector<Shift> circular;
+  try {
+    const auto mesh = loc::ReadMeshBundle(args["mesh"].as<std::string>());
+    for (const auto& c : args["calibration"].as<std::vector<std::string>>()) {
+      views.push_back(ReadQaView(c, std::nullopt));
+      renders.push_back(loc::RenderMesh(mesh, views.back().camera, threads));
+      ideal.push_back(OnIdealGrid(views.back()));
+    }
+
+    // Overlap consistency: every pair, each way round being the same
+    // measurement, so i < j. Independent of the overhead entirely.
+    for (std::size_t j = 0; j < views.size(); ++j) {
+      const auto surface = cv::countNonZero(renders[j].depth == renders[j].depth);
+      for (std::size_t i = 0; i < j; ++i) {
+        Shift s;
+        s.source = views[i].label;
+        s.target = views[j].label;
+        cv::Mat warped;
+        cv::Mat valid;
+        WarpInto(views[i], renders[i], renders[j], warped, valid);
+        valid &= (ideal[j] == ideal[j]);
+        s.overlap = surface ? static_cast<double>(cv::countNonZero(valid)) /
+                                  surface
+                            : 0.0;
+        if (s.overlap < kQaMinOverlap) {
+          continue;
+        }
+        MeasureShift(ideal[j], warped, valid, s);
+        pairs.push_back(s);
+        std::cout << "  " << s.source << " -> " << s.target << ": overlap "
+                  << s.overlap << ", " << s.tiles << " tiles, shift "
+                  << s.shiftPx << " px (" << Grade(s) << ")\n";
+      }
+    }
+
+    if (args.count("overhead-calibration")) {
+      const auto top = ReadQaView(args["overhead-calibration"].as<std::string>(),
+                                  fs::path(args["overhead-image"]
+                                               .as<std::string>()));
+      const auto topRender = loc::RenderMesh(mesh, top.camera, threads);
+      for (std::size_t j = 0; j < views.size(); ++j) {
+        Shift s;
+        s.source = top.label;
+        s.target = views[j].label;
+        cv::Mat warped;
+        cv::Mat valid;
+        WarpInto(top, topRender, renders[j], warped, valid);
+        valid &= (ideal[j] == ideal[j]);
+        s.overlap = 1.0;
+        MeasureShift(ideal[j], warped, valid, s);
+        overhead.push_back(s);
+        std::cout << "  overhead -> " << s.target << ": " << s.tiles
+                  << " tiles, shift " << s.shiftPx << " px (" << Grade(s)
+                  << ")\n";
+      }
+    }
+
+    if (args.count("reference-mesh")) {
+      const auto ref =
+          loc::ReadMeshBundle(args["reference-mesh"].as<std::string>());
+      for (std::size_t j = 0; j < views.size(); ++j) {
+        const auto render = loc::RenderMesh(ref, views[j].camera, threads);
+        Shift s;
+        s.source = "reference render";
+        s.target = views[j].label;
+        cv::Mat valid = render.textured & (ideal[j] == ideal[j]);
+        s.overlap = 1.0;
+        MeasureShift(ideal[j], loc::ToGray01(render.gray), valid, s);
+        circular.push_back(s);
+      }
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "ERROR: " << e.what() << "\n";
+    return IO_ERROR;
+  }
+
+  // The worst graded result, which is what a caller acts on.
+  std::string worst = "pass";
+  const auto rank = [](const std::string& g) {
+    return g == "fail" ? 2 : g == "review" ? 1 : 0;
+  };
+  for (const auto* set : {&pairs, &overhead}) {
+    for (const auto& s : *set) {
+      if (rank(Grade(s)) > rank(worst)) {
+        worst = Grade(s);
+      }
+    }
+  }
+
+  std::ofstream f(args["report"].as<std::string>());
+  f << "{\n  \"tool\": \"pgs-localize-joint qa\",\n"
+    << "  \"thresholds_px\": {\"review\": " << number(kQaReviewPx)
+    << ", \"fail\": " << number(kQaFailPx)
+    << ", \"min_tiles\": " << kQaMinTiles << ", \"provisional\": true},\n"
+    << "  \"notes\": " << quote(
+         "Shifts are in the target view's pixels. The graded 'shift_px' is "
+         "the length of the tiles' median shift vector -- coherent "
+         "misregistration; 'spread_*' is how noisy the tiles were. "
+         "'pairs' compares hand-held "
+         "views with each other and is independent of the overhead. "
+         "'overhead' is partly independent: the overhead was solved "
+         "separately, but both rest on the same mesh, so an error in the "
+         "mesh is shared and cannot show here. 'circular' compares each view "
+         "with the texture it was registered to; it shows convergence, not "
+         "accuracy, and gates nothing. No view sits on the mesh better than "
+         "the reconstruction allows: ADR 0011 attributes ~1.9 px of its "
+         "~2 px floor to the mesh and its texture (ADR 0013 Decision 2).")
+    << ",\n  \"pairs\": [";
+  for (std::size_t i = 0; i < pairs.size(); ++i) {
+    f << (i ? ",\n    " : "\n    ") << ShiftJson(pairs[i], true);
+  }
+  f << "\n  ],\n  \"overhead\": [";
+  for (std::size_t i = 0; i < overhead.size(); ++i) {
+    f << (i ? ",\n    " : "\n    ") << ShiftJson(overhead[i], true);
+  }
+  f << "\n  ],\n  \"circular\": [";
+  for (std::size_t i = 0; i < circular.size(); ++i) {
+    f << (i ? ",\n    " : "\n    ") << ShiftJson(circular[i], false);
+  }
+  f << "\n  ],\n  \"worst\": " << quote(worst) << "\n}\n";
+  if (not f) {
+    std::cerr << "ERROR: could not write the report\n";
+    return IO_ERROR;
+  }
+  std::cout << "QA: " << pairs.size() << " overlapping pairs, worst grade "
+            << worst << "\n";
+  return SUCCESS;
+}
+
 } // namespace
 
 auto main(int argc, char* argv[]) -> int
 {
   const std::map<std::string, int (*)(const std::vector<std::string>&)>
       commands{{"position-map", positionMap}, {"view", view},
-               {"adjust", adjust}};
+               {"adjust", adjust}, {"qa", qa}};
 
   const std::string first = argc > 1 ? argv[1] : "";
   const auto it = commands.find(first);
   if (it == commands.end()) {
-    std::cout << "Usage: pgs-localize-joint <position-map|view|adjust> "
+    std::cout << "Usage: pgs-localize-joint <position-map|view|adjust|qa> "
                  "[options]\n"
                  "       pgs-localize-joint <command> --help\n\n"
                  "Localize a hand-held view set against a solved scene "

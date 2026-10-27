@@ -370,7 +370,6 @@ class TestAdjust(_AdjustFixture):
         self.assertEqual((k['cx'], k['cy']),
                          (self.START['cx'], self.START['cy']))
 
-
 @requires_scene
 class TestAdjustUntilted(_AdjustFixture):
     """Every view straight down, rotated only about its own axis: a wrong
@@ -468,7 +467,8 @@ class TestPipeline(_AdjustFixture):
             self.assertIn(f'{stem}: current, skipping', log)
             self.assertIn(f'{stem}: texture current, skipping', log)
         self.assertIn('joint adjustment: current, skipping', log)
-        for word in ('localizing', 'adjusting', 'texturing'):
+        self.assertIn('QA: current, skipping', log)
+        for word in ('localizing', 'adjusting', 'texturing', 'measuring'):
             self.assertNotIn(word, log)
 
     def test_the_manifest_records_every_phase(self):
@@ -479,6 +479,46 @@ class TestPipeline(_AdjustFixture):
         self.assertEqual(self.meta['joint']['status'], 'done')
         for stem, record in self.meta['views'].items():
             self.assertEqual(record['texture']['status'], 'done', stem)
+
+    def test_qa_passes_correct_calibrations(self):
+        report = json.loads((self.set_dir / 'qa' / 'report.json').read_text())
+        self.assertEqual(report['worst'], 'pass')
+        graded = [s for s in report['pairs'] if s['grade'] != 'unmeasured']
+        self.assertGreaterEqual(len(graded), 2)
+        for s in graded:
+            self.assertLess(s['shift_px'], 0.5, s)
+        for s in report['overhead']:
+            self.assertGreater(s['tiles'], 10, s)
+            self.assertEqual(s['grade'], 'pass', s)
+        # Reported for every view, and never graded.
+        self.assertEqual(len(report['circular']), len(self.names))
+        self.assertTrue(all('grade' not in s for s in report['circular']))
+
+    def test_qa_sees_a_misregistered_view(self):
+        # Move one view's camera 0.3 units sideways: about 8 px at its
+        # standoff. Every pair it is in must fail; every other pair must not.
+        d = self.dir / 'qa_negative'
+        d.mkdir()
+        cals = [self.set_dir / 'views' / Path(n).stem /
+                f'{Path(n).stem}_calibration.json' for n in self.names]
+        moved = json.loads(cals[0].read_text())
+        moved['extrinsics'][0]['value']['center'][0] += 0.3
+        (d / 'moved.json').write_text(json.dumps(moved))
+        run([binary('pgs-localize-joint'), 'qa',
+             '--calibration', d / 'moved.json',
+             *[a for c in cals[1:] for a in ('--calibration', c)],
+             '--mesh', self.mesh, '--report', d / 'report.json',
+             '--threads', 2])
+        report = json.loads((d / 'report.json').read_text())
+        self.assertEqual(report['worst'], 'fail')
+        moved_name = self.names[0]
+        for s in report['pairs']:
+            if s['grade'] == 'unmeasured':
+                continue
+            involved = moved_name in (s['source'], s['target'])
+            self.assertEqual(s['grade'], 'fail' if involved else 'pass', s)
+        self.assertTrue(any(moved_name in (s['source'], s['target'])
+                            and s['grade'] == 'fail' for s in report['pairs']))
 
 
 @requires_scene

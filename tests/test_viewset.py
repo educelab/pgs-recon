@@ -25,7 +25,11 @@ class TestLayout(unittest.TestCase):
         names = [layout.manifest(OUT), layout.ir_reference_mesh(OUT),
                  layout.overhead_position_map(OUT), layout.surviving_pairs(OUT),
                  layout.group_dir(OUT, 3), layout.joint_scene(OUT),
-                 layout.joint_camera(OUT), layout.joint_report(OUT)]
+                 layout.joint_camera(OUT), layout.joint_report(OUT),
+                 layout.qa_report(OUT), layout.starting_camera(OUT),
+                 layout.group_scene(OUT, 0), layout.group_pairs(OUT, 0),
+                 layout.group_putative_matches(OUT, 0),
+                 layout.group_filtered_matches(OUT, 0)]
         for stem in ('IMG_0001',):
             names += [layout.view_calibration(OUT, stem),
                       layout.view_adjusted_calibration(OUT, stem),

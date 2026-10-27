@@ -17,6 +17,8 @@ with openMVG, OpenCV and the renderer:
   correspondences the adjustment consumes.
 - ``adjust`` -- the joint adjustment: one shared intrinsic, every pose, mesh
   points fixed, tie points free, plus the focal cost curve.
+- ``qa`` -- how far each view's image sits from where its calibration puts
+  it, against the other views, the overhead, and the reference texture.
 
 **Provisional.** The flag names are the ones ADR 0013 implies; nothing has been
 run through them yet.
@@ -147,4 +149,29 @@ def adjust(calibrations: Sequence[Path], correspondences: Sequence[Path],
                          ('--threads', threads))
     if fix_intrinsic:
         command.append('--fix-intrinsic')
+    run(command)
+
+
+def qa(calibrations: Sequence[Path], mesh: Path, report: Path,
+       overhead_calibration: Optional[Path] = None,
+       overhead_image: Optional[Path] = None,
+       reference_mesh: Optional[Path] = None,
+       threads: Optional[int] = None) -> None:
+    """Measure each view's residual misregistration (ADR 0013 Decision 6).
+
+    Each comparison warps one image into another view through ``mesh`` and
+    measures the remaining shift, tile by tile, in the target view's pixels.
+    The report's ``pairs`` compare the views with each other -- independent of
+    the overhead; ``overhead`` compares each with the overhead image -- partly
+    independent, since both rest on ``mesh``; ``circular`` compares each with
+    ``reference_mesh``, the texture it was registered to, and is never graded.
+    """
+    command = [resolve_exe(BINARY), 'qa']
+    for cal in calibrations:
+        command += ['--calibration', cal]
+    command += ['--mesh', mesh, '--report', report]
+    command += _optional(('--overhead-calibration', overhead_calibration),
+                         ('--overhead-image', overhead_image),
+                         ('--reference-mesh', reference_mesh),
+                         ('--threads', threads))
     run(command)

@@ -81,6 +81,7 @@ def run(plate: PlateInputs, strategy: Strategy, output: Path,
     manifest.write(meta_path, meta)
 
     adjust_views(localized, tie_scenes, camera, output, opts, meta, meta_path)
+    qa_views(plate, reference, localized, output, opts, meta, meta_path)
     if not opts.skip_texture:
         texture_views(plate, localized, output, meta, meta_path)
 
@@ -443,6 +444,57 @@ def _run_adjust(stems: Sequence[str], tie_scenes: Sequence[Path],
         tie_scenes=list(tie_scenes),
         camera=camera, fix_intrinsic=opts.fix_intrinsic,
         focal_sweep=opts.focal_sweep, threads=opts.threads)
+
+
+# --- Phase 5: QA (Decision 6) -------------------------------------------------
+
+
+def qa_views(plate: PlateInputs, reference: Path, stems: Sequence[str],
+             output: Path, opts: Options, meta: Dict,
+             meta_path: Path) -> None:
+    """Measure every view's residual misregistration, and say what it found.
+
+    Runs on the deliverable calibrations, so it measures what will be
+    textured. Gates nothing in the run itself: a ``fail`` is logged as an error
+    and recorded, and the views are still textured -- the QA renders and the
+    report are what a person needs to decide, and withholding the textures
+    would only hide what the report is about.
+    """
+    inputs = {f'calibration:{s}': manifest.fingerprint(
+        layout.view_adjusted_calibration(output, s)) for s in stems}
+    inputs['mesh'] = manifest.fingerprint(plate.mesh)
+    inputs['reference'] = manifest.fingerprint(reference)
+    report_path = layout.qa_report(output)
+    reason = manifest.stale_reason(meta.get('qa'), inputs)
+    if reason is None:
+        logger.info('QA: current, skipping')
+    else:
+        logger.info(f'QA: measuring {len(stems)} views ({reason})')
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        tools.qa([layout.view_adjusted_calibration(output, s) for s in stems],
+                 plate.mesh, report_path,
+                 overhead_calibration=plate.overhead.calibration,
+                 overhead_image=plate.overhead.image,
+                 reference_mesh=reference, threads=opts.threads)
+        meta['qa'] = {'inputs': inputs, 'status': 'done'}
+        manifest.write(meta_path, meta)
+
+    report = json.loads(report_path.read_text())
+    meta['qa']['worst'] = report['worst']
+    manifest.write(meta_path, meta)
+    summary = (f'QA: {len(report["pairs"])} overlapping pairs, worst grade '
+               f'{report["worst"]} (thresholds provisional)')
+    flagged = [f'{s["source"]} -> {s["target"]}: {s["shift_px"]} px '
+               f'({s["grade"]})'
+               for s in report['pairs'] + report['overhead']
+               if s['grade'] in ('review', 'fail')]
+    if report['worst'] == 'fail':
+        logger.error(summary + '; look at the QA renders before using: '
+                     + '; '.join(flagged))
+    elif report['worst'] == 'review':
+        logger.warning(summary + ': ' + '; '.join(flagged))
+    else:
+        logger.info(summary)
 
 
 # --- Phase 6: texture each view (Decision 7) --------------------------------

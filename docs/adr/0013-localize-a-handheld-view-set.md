@@ -222,6 +222,19 @@ The checks that gate:
 The reconstruction's floor (Decision 2) is stated in every report as the accuracy
 bound, and is why more views do not lower it.
 
+**The comparisons are graded on the coherent shift, not the typical one.**
+`pgs-localize-joint qa` warps one image into another view through the mesh and
+phase-correlates them tile by tile. Misregistration moves the tiles together;
+per-tile noise points every way. So the graded value is the length of the
+tiles' *median shift vector*, and the median shift *magnitude* is reported only
+as spread. Grading the magnitude was tried first and is wrong: a magnitude cannot
+be negative, so noise alone gives it a floor. Measured on the synthetic plate,
+calibrations known to be within ~0.5 px graded at 0.7-1.9 px that way -- the
+circular check, against the very texture they were solved on, at 0.7 -- and at
+0.09-0.49 px as a coherent shift. A view moved 0.3 units (~8 px) still fails
+every pair it is in. Comparisons on fewer than 10 tiles are reported and not
+graded. The review and fail lines (1 and 3 px) are provisional.
+
 ### 7. Output
 
 - One one-view calibration per view, the shape `pgs-retexture --calibration`

@@ -167,3 +167,11 @@ def joint_camera(output: Path) -> Path:
 def joint_report(output: Path) -> Path:
     """The focal cost curve, per-view divergence, and what each gate said."""
     return joint_dir(output) / 'report.json'
+
+
+# --- QA (Decision 6) --------------------------------------------------------
+
+
+def qa_report(output: Path) -> Path:
+    """Every view's measured misregistration, labelled for independence."""
+    return output / 'qa' / 'report.json'
