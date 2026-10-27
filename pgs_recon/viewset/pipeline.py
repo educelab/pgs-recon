@@ -7,7 +7,8 @@ sequence, so the order is readable in one place, as ``run_pipeline`` is for
 
 What may fail without stopping the run is what the ADR treats as evidence
 rather than as the answer: one view failing to localize (it is reported and
-not emitted), and one group failing to solve (it contributes no tie points).
+not emitted), and one group's tie points failing to triangulate (it
+contributes none).
 Everything else stops the run.
 """
 import json
@@ -74,7 +75,7 @@ def run(plate: PlateInputs, strategy: Strategy, output: Path,
     localized = localize_views(plate, reference, position_map, camera, output,
                                opts, meta, meta_path)
 
-    split, tie_scenes = reconstruct_groups(imported, output, opts)
+    split, tie_scenes = reconstruct_groups(imported, localized, output, opts)
     meta['groups'] = {'groups': [list(g) for g in split.groups],
                       'singletons': list(split.singletons),
                       'solved': [str(s) for s in tie_scenes]}
@@ -166,7 +167,7 @@ def import_set(plate: PlateInputs, output: Path,
     One shared intrinsic (``-g`` left at upstream's grouping default) in the
     radial-k3 model. Its K is ``camera``'s when one is given -- which is also
     what lets images with no EXIF focal import with an intrinsic at all, and
-    without one the group SfM cannot run -- and otherwise OpenMVG's, from EXIF
+    without one the groups' tie points cannot be triangulated -- and otherwise OpenMVG's, from EXIF
     and the sensor database. That K is where every view starts.
     """
     sfm_dir = layout.sfm_dir(output)
@@ -231,15 +232,16 @@ def camera_file_from_scene(sfm_json: Path) -> str:
             f'k1 {k[0]}\nk2 {k[1]}\nk3 {k[2]}\n')
 
 
-def reconstruct_groups(imported: Path, output: Path, opts: Options
+def reconstruct_groups(imported: Path, localized: Sequence[str],
+                       output: Path, opts: Options
                        ) -> Tuple[groups_mod.Groups, List[Path]]:
-    """Describe and match the hand-held set, split it into groups, and solve
-    each group's SfM.
+    """Describe and match the hand-held set, split it into groups, and
+    triangulate each group's tie points.
 
-    Returns the groups, as image *stems*, and the solves that succeeded -- the
-    tie scenes. A group that does not solve is dropped from the ties and the
-    run goes on: ties are evidence, and every view is already anchored to the
-    mesh on its own (Decision 5).
+    Returns the groups, as image *stems*, and the triangulations that
+    succeeded -- the tie scenes. A group that does not triangulate is dropped
+    from the ties and the run goes on: ties are evidence, and every view is
+    already anchored to the mesh on its own (Decision 5).
     """
     matches_dir = layout.matches_dir(output)
     if not layout.filtered_matches(output).exists():
@@ -265,35 +267,53 @@ def reconstruct_groups(imported: Path, output: Path, opts: Options
 
     solved = []
     for index, group in enumerate(split.groups):
-        members = {i for i, stem in stem_of.items() if stem in set(group)}
+        # Only a localized view has a pose to triangulate from.
+        members = {i for i, stem in stem_of.items()
+                   if stem in set(group) and stem in set(localized)}
+        if len(members) < 2:
+            logger.warning(f'group {index}: {len(members)} of its '
+                           f'{len(group)} views localized, so it contributes '
+                           f'no tie points')
+            continue
         pairs = [(a, b) for a, b in id_pairs if a in members and b in members]
         try:
-            solved.append(_solve_group(imported, members, pairs, index, output,
-                                       opts))
+            solved.append(_solve_group(imported, members, stem_of, pairs,
+                                       index, output))
         except ToolFailed as e:
-            logger.warning(f'group {index} ({len(group)} views) did not solve, '
-                           f'so it contributes no tie points: {e}')
+            logger.warning(f'group {index} ({len(members)} views) did not '
+                           f'triangulate, so it contributes no tie points: {e}')
     return split, solved
 
 
-def _solve_group(imported: Path, members: set, pairs: list, index: int,
-                 output: Path, opts: Options) -> Path:
-    """Solve one group's SfM, returning the ``sfm_data.bin`` OpenMVG wrote.
+def _solve_group(imported: Path, members: set, stem_of: Dict[int, str],
+                 pairs: list, index: int, output: Path) -> Path:
+    """Triangulate one group's matches from its views' mesh-only poses,
+    returning the ``sfm_data.bin`` OpenMVG wrote.
+
+    The poses are known, so nothing is solved from scratch. Incremental SfM was
+    tried first and is the wrong tool here: a plate is nearly flat and the
+    views look nearly straight down, which is the degenerate case for the
+    relative pose it starts from -- on PHerc0128 Cr04 it failed to initialize
+    on every pair. ``adjust`` re-triangulates each track again from the same
+    poses and only keeps its observations, so what this contributes is which
+    keypoints are one point.
 
     The imported scene is cut down to the group with its view ids unchanged,
-    and the group's pairs are re-matched into a matches file of their own:
-    ``openMVG_main_SfM`` reads every pair it is handed, and a pair naming a view
-    the scene does not hold is not something to rely on it skipping. The
+    and the group's pairs are re-matched into a matches file of their own: the
     regions are shared, so re-matching a group costs only its own pairs.
+    Reused while it is newer than every member's mesh-only calibration.
     """
     solved = layout.group_dir(output, index) / 'sfm_data.bin'
-    if solved.exists():
+    calibrations = [layout.view_calibration(output, stem_of[i])
+                    for i in members]
+    if solved.exists() and all(solved.stat().st_mtime_ns > c.stat().st_mtime_ns
+                               for c in calibrations):
         return solved
     group_dir = layout.group_dir(output, index)
     group_dir.mkdir(parents=True, exist_ok=True)
 
     scene = layout.group_scene(output, index)
-    _subset_scene(imported, members, scene)
+    _subset_scene(imported, members, scene, poses=calibrations)
     layout.group_pairs(output, index).write_text(
         ''.join(f'{a} {b}\n' for a, b in pairs))
 
@@ -303,15 +323,20 @@ def _solve_group(imported: Path, members: set, pairs: list, index: int,
                             method='FASTCASCADEHASHINGL2',
                             pairs_file=layout.group_pairs(output, index))
     openmvg.geometric_filter(scene, matches=putative, output=filtered)
-    return openmvg.mvg_sfm(scene, features_dir=layout.matches_dir(output),
-                           matches=filtered, output_dir=group_dir,
-                           engine='INCREMENTALV2')
+    openmvg.mvg_compute_known(scene, features_dir=layout.matches_dir(output),
+                              matches=filtered, output=solved, direct=True)
+    return solved
 
 
-def _subset_scene(imported: Path, members: set, out: Path) -> None:
+def _subset_scene(imported: Path, members: set, out: Path,
+                  poses: Sequence[Path] = ()) -> None:
     """``imported`` with only the views in ``members``, ids unchanged, and only
     the intrinsics they reference -- re-registered with cereal if the one that
-    registered their type was dropped (:mod:`pgs_recon.utils.sfm_json`)."""
+    registered their type was dropped (:mod:`pgs_recon.utils.sfm_json`).
+
+    ``poses`` are one-view calibrations whose pose each member takes, matched
+    by image filename; without them the scene has no extrinsics.
+    """
     data = json.loads(Path(imported).read_text())
     data['views'] = [v for v in data['views'] if v['key'] in members]
     used = {v['value']['ptr_wrapper']['data']['id_intrinsic']
@@ -322,7 +347,20 @@ def _subset_scene(imported: Path, members: set, out: Path) -> None:
     if not data['intrinsics']:
         sys.exit(f'{imported} gives these views no intrinsic, and SfM needs '
                  f'one. Pass --camera with a starting K.')
+    by_name = {}
+    for calibration in poses:
+        cal = json.loads(Path(calibration).read_text())
+        name = cal['views'][0]['value']['ptr_wrapper']['data']['filename']
+        by_name[Path(name).name] = cal['extrinsics'][0]['value']
     data['extrinsics'] = []
+    for v in data['views']:
+        d = v['value']['ptr_wrapper']['data']
+        pose = by_name.get(Path(d['filename']).name)
+        if pose is not None:
+            data['extrinsics'].append({'key': d['id_pose'], 'value': pose})
+    if poses and len(data['extrinsics']) != len(data['views']):
+        raise ValueError(f'{out}: {len(data["views"])} views but '
+                         f'{len(data["extrinsics"])} poses')
     data['structure'] = []
     data['control_points'] = []
     Path(out).write_text(json.dumps(data, indent=2))

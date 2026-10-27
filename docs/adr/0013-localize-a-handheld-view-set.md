@@ -116,28 +116,39 @@ registration: a floor of ~0.15 mm (1.81–2.53 px held-out at ~70 µm/px), the s
 bias in every view, and one viewpoint's coverage. A plate with no registered
 overhead view needs a manual seed per group. The tool names which path it took.
 
-### 3. Structure from the hand-held views first
+### 3. Structure from the hand-held views, triangulated from the mesh poses
 
 The strongest signal in the data is hand-held IR against hand-held IR: same
-camera, same band, same session. So the set is reconstructed on its own first,
-with the existing `openmvg.py` wrappers (`init_sfm_generic`, `compute_features`,
-`compute_matches`, `geometric_filter`, `mvg_sfm`), starting K from EXIF and the
-sensor database as the import already does.
+camera, same band, same session. So the set is matched on its own, with the
+existing `openmvg.py` wrappers (`init_sfm_generic`, `compute_features`,
+`compute_matches`, `geometric_filter`), starting K from EXIF and the sensor
+database as the import already does.
 
-The match graph is split into connected components *before* SfM and each is
-reconstructed separately -- incremental SfM keeps one reconstruction and would
-silently drop the rest. Views in no component are **singletons**, localized
-individually through Decision 2 alone.
+The match graph is split into connected components, and each component's
+tracks are triangulated from its views' **mesh-only poses**
+(`mvg_compute_known`, direct mode) -- not reconstructed from scratch. Views in
+no component are **singletons**, localized individually through Decision 2
+alone.
+
+*Amended after the first real plate.* This originally ran incremental SfM
+(`mvg_sfm`) per component, and the joint adjustment re-triangulated its tracks
+into the mesh's frame. On PHerc0128 Cr04 it never started: a plate is nearly
+flat and hand-held views of it look nearly straight down, which is the
+degenerate case for the relative pose incremental SfM initializes from, and
+every component failed with no tie points. Every view already has a pose from
+Decision 2 before this phase runs, so nothing needs solving -- the tracks need
+only intersecting. The adjustment still re-triangulates them and keeps only
+which keypoints are one point. On Cr04 that gave 8737 tracks from three views,
+none rejected.
 
 ### 4. K is solved in the mesh-anchored adjustment, once, across all groups
 
 One shared intrinsic -- focal, principal point, k1–k3 -- adjusted together with
 every pose, with the mesh points **fixed** and the tie points free. All groups go
 into one adjustment: they share no tie points but they share the camera, which
-pools every group's tilt variety into the one solve that needs it. A wrong K
-warps a group's internal shape in a way a similarity cannot undo, so the
-group-to-mesh similarity is only the initialization; K is freed in the
-adjustment that follows it.
+pools every group's tilt variety into the one solve that needs it. The tie
+points start where the mesh-only poses and the starting K triangulate them
+(Decision 3), and K is freed in the adjustment that follows.
 
 The two kinds of evidence constrain different parameters, and the design leans on
 that: distortion comes mainly from the tie points, which are dense at the frame
@@ -169,6 +180,33 @@ The stakes are asymmetric. A focal error absorbed into standoff projects the mes
 almost identically from near the solved pose, so it costs texture alignment only
 in proportion to relief. A distortion error displaces the frame edges regardless.
 
+*Amended after the first real plate (PHerc0128 Cr04, three near-nadir views,
+tilts of 1-3 degrees).* Two things were wrong:
+
+- **The flatness line was too low.** At 1% the curve passed with its ends at
+  1.03x and 1.05x its minimum, and the "observed" focal came with the principal
+  point moved 161 px and an overlapping pair worse than before the adjustment
+  (0.82 -> 2.02 px coherent shift). The line is now 25%, provisional, between
+  that plate and the synthetic tilted views' 30-38x.
+- **A flat curve threw away the distortion with the focal.** Focal and principal
+  point ride the tilt; radial distortion does not, since no pose can absorb it.
+  So a flat curve now holds f and the principal point at the starting K and
+  re-solves for distortion alone, and `intrinsic_emitted` says `distortion`.
+  On Cr04 that measured ~4 px of displacement at the frame corner. Taking it
+  out cut the radial error between each view and its render from +4.8 to
+  +9.5 px at the corner (mesh-only) to -2.3 to +2.3 px, and both pairs passed
+  (0.06 and 0.97 px). The untilted synthetic fixture recovers k1 at the held
+  focal's scale, with no camera moving more than a unit. `start` is now only
+  the fallback for a distortion-only solve that fails or is not a physical
+  camera.
+
+k2 and k3 are freed only when there are tie points. On a narrow lens the
+r^4 and r^6 terms are nearly collinear with r^2 over the frame -- Cr04's corner
+is at normalized radius 0.24 -- so their coefficients come out large
+(k2 = 2.6, k3 = -39 with ties) while describing an ordinary monotone curve.
+Anchors alone see them only through the mesh's error, so without ties only k1
+is adjusted.
+
 A ChArUco board shot with the same camera, lens and focus is **optional**: a
 check on the self-calibrated K, or its replacement where the curve is flat.
 Focus was fixed for the capture, so there is one K and no per-view focal term.
@@ -178,8 +216,9 @@ Focus was fixed for the capture, so there is one K and no per-view focal term.
 The hand-held images come from a different session than the mesh, with no record
 of handling in between. This design **assumes no fragment moved**: the plate is
 then the arrangement the mesh describes, up to a rigid motion of the whole plate
-that the poses absorb, and one similarity per group maps a group's hand-held
-reconstruction onto the mesh. Decision 4's joint adjustment rests on that.
+that the poses absorb, and a group's tie points, triangulated from mesh-only
+poses, describe the same surface the anchors do. Decision 4's joint adjustment
+rests on that.
 
 The assumption is cheap to check and silent when wrong -- tie points and mesh
 anchors pulling against each other converge somewhere plausible -- so it is

@@ -75,8 +75,8 @@ def surviving_pairs(output: Path) -> Path:
 
 
 def group_dir(output: Path, index: int) -> Path:
-    """One connected group's SfM solve. OpenMVG names the solve itself
-    (``sfm_data.bin``) inside it."""
+    """One connected group's tie points, triangulated from its views'
+    mesh-only poses (``sfm_data.bin``) inside it."""
     return sfm_dir(output) / f'group_{index:03d}'
 
 

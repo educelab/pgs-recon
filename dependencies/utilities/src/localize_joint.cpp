@@ -259,6 +259,7 @@ auto positionMap(const std::vector<std::string>& argv) -> int
     ("mesh", po::value<std::string>(), "the mesh to render. Its texture is unused: only positions are kept")
     ("output", po::value<std::string>(), "H x W x 3 float32 .npy of world positions, NaN where no surface was hit")
     ("sfm-transform", po::value<std::string>(), "4x4 .npy change of frame applied to the calibration's scene at load, as pgs-localize applies it to a sparse scene")
+    ("output-image", po::value<std::string>(), "also write the rendered texture, 8-bit grey, black where nothing textured was hit. With a calibration made for a virtual camera, this and --output are a reference image the mesh supplies on its own -- a virtual overhead")
     ("threads", po::value<int>()->default_value(0), "renderer threads; 0 uses all")
   ;
   // clang-format on
@@ -303,6 +304,13 @@ auto positionMap(const std::vector<std::string>& argv) -> int
     const auto out = fs::path(args["output"].as<std::string>());
     pgs::npy::writePositionMap(out, render.position);
     std::cout << "Wrote position map: " << out << "\n";
+    if (args.count("output-image")) {
+      const auto image = fs::path(args["output-image"].as<std::string>());
+      if (not cv::imwrite(image.string(), render.gray)) {
+        throw std::runtime_error("could not write " + image.string());
+      }
+      std::cout << "Wrote rendered image: " << image << "\n";
+    }
   } catch (const std::exception& e) {
     std::cerr << "ERROR: " << e.what() << "\n";
     return IO_ERROR;
@@ -707,10 +715,16 @@ constexpr double kLossPx = 2.0;
 /// mesh-only poses and the starting K, before it is not trusted as a tie.
 constexpr double kTieMaxPx = 4.0;
 
-/// The focal cost curve is "flat" when neither end of the sweep costs at least
-/// this much more, relatively, than its minimum. Provisional: nothing measured
-/// sets it yet (ADR 0013, Not settled).
-constexpr double kFlatRise = 0.01;
+/// The focal cost curve is "flat" when either end of the +-20% sweep costs less
+/// than this much more, relatively, than its minimum. Provisional, set between
+/// the two measurements there are: the synthetic tilted views' ends at 30-38x
+/// their minimum, and PHerc0128 Cr04's near-nadir hand-held views at 1.03x and
+/// 1.05x -- where a 1% line passed a focal that moved the principal point
+/// 161 px and made an overlapping pair worse (ADR 0013 Decision 4).
+constexpr double kFlatRise = 0.25;
+
+/// KParams indices, for holding parts of K in a solve.
+constexpr int kF = 0, kCx = 1, kCy = 2, kK2 = 4, kK3 = 5;
 
 /// `pinhole_radial_k3`, in the order openMVG's getParams() gives it.
 using KParams = std::array<double, 6>;  // f, cx, cy, k1, k2, k3
@@ -989,21 +1003,39 @@ auto ReadTies(const std::vector<std::string>& scenes,
   return tracks;
 }
 
+/// The KParams indices in @p a or @p b, sorted and once each.
+auto Held(std::vector<int> a, const std::vector<int>& b) -> std::vector<int>
+{
+  a.insert(a.end(), b.begin(), b.end());
+  std::sort(a.begin(), a.end());
+  a.erase(std::unique(a.begin(), a.end()), a.end());
+  return a;
+}
+
+/// The names of the KParams a solve holding @p held left free, as JSON.
+auto FreeJson(const std::vector<int>& held) -> std::string
+{
+  static const std::array<const char*, 6> names{"f",  "cx", "cy",
+                                                "k1", "k2", "k3"};
+  std::string out = "[";
+  for (int i = 0; i < 6; ++i) {
+    if (std::find(held.begin(), held.end(), i) == held.end()) {
+      out += std::string(out.size() > 1 ? ", " : "") + quote(names[i]);
+    }
+  }
+  return out + "]";
+}
+
 /**
  * @brief The joint adjustment: one K, every pose, anchors fixed, ties free.
  *
- * @param holdF hold the focal at this value (the cost curve), leaving the rest
- *        of K free unless @p fixK
- * @param fixK  hold all of K (a board-calibrated camera)
+ * @param held the parts of K (KParams indices) held at @p sol's values; all
+ *        six is a fixed K
  */
 auto Solve(const std::vector<ViewInput>& views,
            const std::vector<Track>& tracks, Solution sol,
-           const std::optional<double> holdF, const bool fixK,
-           const int threads) -> Solution
+           const std::vector<int>& held, const int threads) -> Solution
 {
-  if (holdF) {
-    sol.k[0] = *holdF;
-  }
   ceres::Problem problem;
   for (std::size_t i = 0; i < views.size(); ++i) {
     for (const auto& a : views[i].anchors) {
@@ -1022,10 +1054,10 @@ auto Solve(const std::vector<ViewInput>& views,
           sol.ties[t].data());
     }
   }
-  if (fixK) {
+  if (held.size() >= 6) {
     problem.SetParameterBlockConstant(sol.k.data());
-  } else if (holdF) {
-    problem.SetManifold(sol.k.data(), new ceres::SubsetManifold(6, {0}));
+  } else if (not held.empty()) {
+    problem.SetManifold(sol.k.data(), new ceres::SubsetManifold(6, held));
   }
 
   ceres::Solver::Options options;
@@ -1161,7 +1193,15 @@ auto adjust(const std::vector<std::string>& argv) -> int
   for (const auto& t : tracks) {
     start.ties.push_back(t.X);
   }
-  const auto sol = Solve(views, tracks, start, std::nullopt, fixK, threads);
+  // k2 and k3 are freed only with tie points, which are dense at the frame
+  // edges where they act. Anchors alone see distortion only through the
+  // mesh's own ~2 px of error, and on a narrow lens the r^4 and r^6 terms are
+  // nearly collinear with r^2 over the frame: PHerc0128 Cr04's corner is at
+  // r = 0.24, where they came back as k2 = 6.4, k3 = -84 (ADR 0013 Decision 4).
+  const std::vector<int> base =
+      fixK ? std::vector<int>{0, 1, 2, 3, 4, 5}
+           : (tracks.empty() ? std::vector<int>{kK2, kK3} : std::vector<int>{});
+  const auto sol = Solve(views, tracks, start, base, threads);
   std::cout << sol.summary.BriefReport() << "\n";
   if (not sol.summary.IsSolutionUsable()) {
     std::cerr << "ERROR: the joint adjustment did not converge\n";
@@ -1178,6 +1218,7 @@ auto adjust(const std::vector<std::string>& argv) -> int
   };
   report << "  \"intrinsic\": {\"start\": " << kJson(startK)
          << ", \"adjusted\": " << kJson(sol.k)
+         << ", \"free\": " << FreeJson(base)
          << ", \"fixed\": " << (fixK ? "true" : "false") << "},\n"
          << "  \"solve\": {\"initial_cost\": "
          << number(sol.summary.initial_cost)
@@ -1218,9 +1259,10 @@ auto adjust(const std::vector<std::string>& argv) -> int
   }
   std::vector<std::pair<double, double>> curve;
   for (int s = 0; s < steps; ++s) {
-    const auto f = lo + (hi - lo) * s / (steps - 1);
-    const auto held = Solve(views, tracks, sol, f, fixK, threads);
-    curve.emplace_back(f, held.summary.final_cost);
+    auto at = sol;
+    at.k[kF] = lo + (hi - lo) * s / (steps - 1);
+    const auto held = Solve(views, tracks, at, Held(base, {kF}), threads);
+    curve.emplace_back(at.k[kF], held.summary.final_cost);
   }
   const auto minIt = std::min_element(
       curve.begin(), curve.end(),
@@ -1248,30 +1290,62 @@ auto adjust(const std::vector<std::string>& argv) -> int
   // adjustment then drifts along the focal/standoff degeneracy to whatever K
   // it likes, and its residuals improve while every pose walks away from the
   // truth (measured on untilted synthetic views: f 1600 -> 11652, every camera
-  // 377 units off, anchors reprojecting *better*). So the joint K is emitted
-  // only when the curve says the views determine it, and otherwise every view
-  // keeps its mesh-only calibration at the starting K (Decision 4).
-  const bool trustK = fixK or observable;
-  if (trustK and not fixK) {
-    if (const auto complaint =
-            loc::ComplainAboutIntrinsic(*MakeK3(sol.k, width, height))) {
-      std::cerr << "ERROR: the joint adjustment produced a K that is not a "
-                   "physical camera: "
-                << *complaint << "\n";
-      return SOLVE_FAILED;
+  // 377 units off, anchors reprojecting *better*). The principal point rides
+  // the same tilt, trading against rotation. So when the curve is flat, both
+  // are held at the starting K and the set is re-solved for distortion alone,
+  // which does not need tilt: a radial error is not something a pose can
+  // absorb, on any view (Decision 4).
+  enum class Emit { Adjusted, Distortion, Start };
+  auto emit = (fixK or observable) ? Emit::Adjusted : Emit::Distortion;
+  auto chosen = sol;
+  if (emit == Emit::Distortion) {
+    chosen = Solve(views, tracks, start, Held(base, {kF, kCx, kCy}), threads);
+    std::cout << "These views do not determine the focal: f and the principal "
+                 "point are held at the starting K, and only distortion is "
+                 "adjusted. k = ("
+              << chosen.k[3] << ", " << chosen.k[4] << ", " << chosen.k[5]
+              << ")\n";
+    if (not chosen.summary.IsSolutionUsable()) {
+      emit = Emit::Start;
     }
   }
-  if (not trustK) {
-    std::cout << "WARNING: these views do not determine the focal, so the "
-                 "joint K is not emitted. Every view keeps its mesh-only "
-                 "calibration at the starting K. To do better, calibrate the "
-                 "camera on a board and pass it with --camera --fix-intrinsic, "
-                 "or add views tilted about different axes (ADR 0013 "
-                 "Decision 4)\n";
+  if (emit != Emit::Start and not fixK) {
+    if (const auto complaint =
+            loc::ComplainAboutIntrinsic(*MakeK3(chosen.k, width, height))) {
+      if (emit == Emit::Adjusted) {
+        std::cerr << "ERROR: the joint adjustment produced a K that is not a "
+                     "physical camera: "
+                  << *complaint << "\n";
+        return SOLVE_FAILED;
+      }
+      std::cout << "WARNING: the distortion-only solve is not a physical "
+                   "camera (" << *complaint << ")\n";
+      emit = Emit::Start;
+    }
   }
-  const KParams& emitK = trustK ? sol.k : startK;
+  if (emit != Emit::Adjusted) {
+    std::cout << "WARNING: these views do not determine the focal, so no "
+                 "adjusted focal is emitted"
+              << (emit == Emit::Start
+                      ? ", and every view keeps its mesh-only calibration at "
+                        "the starting K"
+                      : "")
+              << ". To do better, calibrate the camera on a board and pass it "
+                 "with --camera --fix-intrinsic, or add views tilted about "
+                 "different axes (ADR 0013 Decision 4)\n";
+  }
+  const bool trustK = emit != Emit::Start;
+  const KParams& emitK = trustK ? chosen.k : startK;
   report << "  \"intrinsic_emitted\": "
-         << (trustK ? "\"adjusted\"" : "\"start\"") << ",\n";
+         << (emit == Emit::Adjusted     ? "\"adjusted\""
+             : emit == Emit::Distortion ? "\"distortion\""
+                                        : "\"start\"");
+  if (emit == Emit::Distortion) {
+    report << ",\n  \"distortion_only\": {\"k\": " << kJson(chosen.k)
+           << ", \"free\": " << FreeJson(Held(base, {kF, kCx, kCy}))
+           << ", \"final_cost\": " << number(chosen.summary.final_cost) << "}";
+  }
+  report << ",\n";
 
   // --- per-view divergence (Decision 5), and emit -------------------------
   const auto adjusted = MakeK3(emitK, width, height);
@@ -1282,8 +1356,8 @@ auto adjust(const std::vector<std::string>& argv) -> int
       const auto& v = views[i];
       const auto meshParams = PoseToParams(v.meshPose);
       const auto meshRms = AnchorRms(v, v.meshK, meshParams);
-      const auto jointRms = AnchorRms(v, sol.k, sol.poses[i]);
-      const auto jointPose = ParamsToPose(sol.poses[i]);
+      const auto jointRms = AnchorRms(v, chosen.k, chosen.poses[i]);
+      const auto jointPose = ParamsToPose(chosen.poses[i]);
       const auto shift = (jointPose.center() - v.meshPose.center()).norm();
       const Eigen::AngleAxisd turn(jointPose.rotation() *
                                    v.meshPose.rotation().transpose());
@@ -1319,12 +1393,12 @@ auto adjust(const std::vector<std::string>& argv) -> int
       const auto id = static_cast<openMVG::IndexT>(i);
       scene.views[id] = std::make_shared<sfm::View>(
           views[i].image.string(), id, 0, id, width, height);
-      scene.poses[id] = trustK ? ParamsToPose(sol.poses[i])
+      scene.poses[id] = trustK ? ParamsToPose(chosen.poses[i])
                                : views[i].meshPose;
     }
     for (std::size_t t = 0; t < tracks.size(); ++t) {
       sfm::Landmark lm;
-      const auto& X = trustK ? sol.ties[t] : start.ties[t];
+      const auto& X = trustK ? chosen.ties[t] : start.ties[t];
       lm.X = Eigen::Vector3d(X[0], X[1], X[2]);
       for (const auto& [vi, x] : tracks[t].obs) {
         lm.obs[static_cast<openMVG::IndexT>(vi)] =

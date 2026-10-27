@@ -19,12 +19,14 @@ What each class guards:
   observable when the views' tilts make it so, uses tie points from a scene in
   a foreign frame, and leaves a fixed K alone.
 - :class:`TestAdjustUntilted` -- the control: views with no tilt do not
-  determine the focal, and the adjustment must say so and emit nothing it
-  could not measure. Without the check this guards, the solve walks every
-  camera hundreds of units away while its residuals *improve*.
+  determine the focal, and the adjustment must say so, hold the focal and
+  principal point, and emit only the distortion it could measure. Without the
+  check this guards, the solve walks every camera hundreds of units away while
+  its residuals *improve*.
 - :class:`TestPipeline` -- ``pgs-localize-set`` end to end on that plate: every
-  phase, from the position map through the group SfM and the joint adjustment
-  to one textured mesh per view, and a second run that redoes nothing.
+  phase, from the position map through the groups' tie points and the joint
+  adjustment to one textured mesh per view, and a second run that redoes
+  nothing.
 - :class:`TestSceneConventions` -- the scene's own renderer and projection
   agree, so a failure above is the tool's and not the fixture's.
 
@@ -385,14 +387,22 @@ class TestAdjustUntilted(_AdjustFixture):
     def test_unobservable_focal_emits_only_what_was_measured(self):
         report = self.adjust('flat')
         self.assertFalse(report['focal_curve']['observable'])
-        self.assertEqual(report['intrinsic_emitted'], 'start')
-        for i, v in enumerate(self.localized):
-            self.assertEqual(report['views'][i]['emitted'], 'mesh-only')
-            self.assertEqual((self.out / f'cal_{i}.json').read_bytes(),
-                             (v / 'cal.json').read_bytes())
+        # Focal and principal point stay where they started; distortion, which
+        # needs no tilt, is still measured.
+        self.assertEqual(report['intrinsic_emitted'], 'distortion')
         camera = dict(line.split(None, 1) for line in
                       (self.out / 'camera.txt').read_text().splitlines())
         self.assertEqual(float(camera['fx']), self.START['f'])
+        self.assertEqual((float(camera['cx']), float(camera['cy'])),
+                         (self.START['cx'], self.START['cy']))
+        # k1 in the held focal's normalized coordinates: the true k1 scaled by
+        # (1680 / 1600)^2, since a focal 5% long shrinks every radius by it.
+        scaled = self.TRUE_K['k'][0] * (self.START['f'] / self.TRUE_K['f']) ** 2
+        self.assertAlmostEqual(float(camera['k1']), scaled, delta=0.01)
+        # And no camera walks along the focal/standoff degeneracy.
+        for i, view in enumerate(report['views']):
+            self.assertEqual(view['emitted'], 'joint', f'view {i}')
+            self.assertLess(view['center_shift'], 1.0, f'view {i}')
 
 
 @requires_scene
@@ -474,7 +484,8 @@ class TestPipeline(_AdjustFixture):
     def test_the_manifest_records_every_phase(self):
         commands = ' '.join(self.meta['commands'].values())
         for marker in ('position-map', ' view ', ' adjust ',
-                       'openMVG_main_SfM ', 'pgs_recon.apps.retexture'):
+                       'openMVG_main_ComputeStructureFromKnownPoses ',
+                       'pgs_recon.apps.retexture'):
             self.assertIn(marker, commands)
         self.assertEqual(self.meta['joint']['status'], 'done')
         for stem, record in self.meta['views'].items():
