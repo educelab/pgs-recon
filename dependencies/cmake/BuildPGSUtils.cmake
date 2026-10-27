@@ -10,4 +10,5 @@ ExternalProject_Add(
         ${GLOBAL_CMAKE_ARGS}
         -DEigen3_DIR:PATH=${CMAKE_INSTALL_PREFIX}/share/eigen3/cmake/
         -DVCG_ROOT:PATH=${CMAKE_INSTALL_PREFIX}/include/vcg
+        -DPGS_BUILD_VIEWSET:BOOL=${PGS_BUILD_VIEWSET}
 )

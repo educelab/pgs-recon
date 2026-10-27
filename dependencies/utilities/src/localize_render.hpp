@@ -113,6 +113,17 @@ struct Render {
   /// The rendered texture, 8-bit greyscale at the camera's resolution. Black
   /// where no surface was hit or where the surface has no usable chart.
   cv::Mat gray;
+  /// CV_8UC1, 255 where @ref gray holds a sampled texel and 0 where it holds
+  /// the black fill: a miss, a face with no UVs, or a chart with no image. The
+  /// fill's edge against real texture is a high-contrast line no photograph
+  /// shows, so a caller detecting features on @ref gray masks with this (ADR
+  /// 0013 Decision 2). `pgs-localize` does not consume it, which keeps its
+  /// measured behaviour (ADR 0011) unchanged.
+  ///
+  /// Not yet covered: a texel that *is* sampled but holds an atlas's empty
+  /// colour -- a face OpenMVS gave UVs to but no view saw. That needs the
+  /// colour before the greyscale conversion `ReadMeshBundle` does.
+  cv::Mat textured;
   /// Per-pixel world XYZ, CV_32FC3, NaN where no surface was hit. NaN and not
   /// zero: a valid sample at the origin has to be distinguishable from a miss.
   cv::Mat position;

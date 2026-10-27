@@ -179,9 +179,11 @@ target_link_libraries(localize_describer
 )
 target_compile_features(localize_describer PUBLIC cxx_std_17)
 
-# localization utility
-add_executable(localize
-        src/localize.cpp
+# localization core: camera files, rendering, matching, solving and the sparse
+# backend. A library rather than sources compiled into pgs-localize, so that
+# pgs-localize-joint (ADR 0013) is built from the same code ADR 0011 measured
+# instead of a copy of it.
+add_library(localize_core STATIC
         src/localize_camera.hpp
         src/localize_camera.cpp
         src/localize_match.hpp
@@ -193,35 +195,63 @@ add_executable(localize
         src/localize_sparse.hpp
         src/localize_sparse.cpp
         src/localize_describer.hpp
-        src/Npy.hpp)
-target_include_directories(localize
+        src/RANSAC.hpp)
+target_include_directories(localize_core
     PUBLIC
         src/
         $<BUILD_INTERFACE:${libcore_SOURCE_DIR}/include>
+    PRIVATE
         $<BUILD_INTERFACE:${bvh_SOURCE_DIR}/src>
-        $<BUILD_INTERFACE:${indicators_SOURCE_DIR}/include>
 )
-target_link_libraries(localize
-    localize_describer
-    Boost::program_options
-    Eigen3::Eigen
-    opencv_core
-    opencv_imgcodecs
-    opencv_imgproc
-    opencv_video
-    OpenMVG::cereal
-    OpenMVG::openMVG_camera
-    OpenMVG::openMVG_features
-    OpenMVG::openMVG_geometry
-    OpenMVG::openMVG_matching
-    OpenMVG::openMVG_multiview
-    OpenMVG::openMVG_sfm
+target_link_libraries(localize_core
+    PUBLIC
+        localize_describer
+        Eigen3::Eigen
+        opencv_core
+        opencv_imgcodecs
+        opencv_imgproc
+        opencv_video
+        OpenMVG::cereal
+        OpenMVG::openMVG_camera
+        OpenMVG::openMVG_features
+        OpenMVG::openMVG_geometry
+        OpenMVG::openMVG_matching
+        OpenMVG::openMVG_multiview
+        OpenMVG::openMVG_sfm
 )
 # C++20, alone among the utilities: bvh v2 needs it (std::span, defaulted
 # comparison operators), and registration-toolkit's rt_core builds at the same
-# standard against the same pin.
-target_compile_features(localize PUBLIC cxx_std_20)
+# standard against the same pin. PUBLIC, so everything linking the core is
+# compiled at the standard the core was.
+target_compile_features(localize_core PUBLIC cxx_std_20)
+
+# localization utility
+add_executable(localize
+        src/localize.cpp
+        src/Npy.hpp)
+target_include_directories(localize
+    PUBLIC
+        $<BUILD_INTERFACE:${indicators_SOURCE_DIR}/include>
+)
+target_link_libraries(localize
+    localize_core
+    Boost::program_options
+)
 set_target_properties(localize PROPERTIES OUTPUT_NAME "pgs-localize")
+
+# hand-held view-set localization (ADR 0013). Optional, and off by default:
+# nothing else in this build or in pgs-recon depends on it.
+option(PGS_BUILD_VIEWSET "Build pgs-localize-joint (ADR 0013)" OFF)
+if(PGS_BUILD_VIEWSET)
+    # The same core pgs-localize links, and C++20 through it.
+    add_executable(localize_joint src/localize_joint.cpp src/Npy.hpp)
+    target_link_libraries(localize_joint
+        localize_core
+        Boost::program_options
+    )
+    set_target_properties(localize_joint PROPERTIES
+        OUTPUT_NAME "pgs-localize-joint")
+endif()
 
 # install
 include(GNUInstallDirs)
@@ -232,3 +262,6 @@ install(TARGETS
     gen_aruco_markers
     decimate
 )
+if(PGS_BUILD_VIEWSET)
+    install(TARGETS localize_joint)
+endif()

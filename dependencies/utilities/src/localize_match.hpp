@@ -122,8 +122,45 @@ auto DescribeImage(const cv::Mat& gray8, const cv::Mat& mask,
                    openMVG::features::EDESCRIBER_PRESET preset)
     -> std::unique_ptr<openMVG::features::Regions>;
 
+/// A reference image -- a render, or any image with a position map --
+/// normalized and described once, so it can be matched against many queries.
+struct ReferenceFeatures {
+  /// Locally normalized, 8-bit; Lucas-Kanade tracks from it.
+  cv::Mat norm;
+  std::unique_ptr<openMVG::features::Regions> regions;
+};
+
+/**
+ * @brief Normalize and describe a reference image once.
+ *
+ * @param mask optional 8-bit mask; features are kept where it is non-zero.
+ *        `Render::textured` is the one to pass when the render has untextured
+ *        regions (ADR 0013). Empty keeps every feature, which is what
+ *        CorrespondFromRender does.
+ */
+auto DescribeReference(const Render& reference, const MatchOptions& opts,
+                       const cv::Mat& mask = {}) -> ReferenceFeatures;
+
+/**
+ * @brief Match a described reference against a query and lift the survivors
+ *        through the reference's position map.
+ *
+ * The matching half of CorrespondFromRender, for a caller that matches one
+ * reference against several queries, or the same query at several scales,
+ * and should describe the reference only once.
+ */
+auto CorrespondFromReference(const Render& reference,
+                             const ReferenceFeatures& features,
+                             const cv::Mat& queryNorm,
+                             const openMVG::features::Regions& queryRegions,
+                             const MatchOptions& opts, MatchReport& report)
+    -> std::vector<Correspondence>;
+
 /**
  * @brief Match a render against a query and lift the survivors to 3D.
+ *
+ * DescribeReference then CorrespondFromReference, with no mask -- what
+ * `pgs-localize` measured in ADR 0011.
  *
  * @param render       the render, its position map, and its depth
  * @param queryNorm    the locally normalized query, 8-bit

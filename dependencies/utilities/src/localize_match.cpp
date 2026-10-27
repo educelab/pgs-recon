@@ -273,10 +273,30 @@ auto pgs::localize::CorrespondFromRender(
     const feat::Regions& queryRegions, const MatchOptions& opts,
     MatchReport& report) -> std::vector<Correspondence>
 {
-  const auto renderNorm =
-      LocalNormalize(ToGray01(render.gray), opts.normalizeSigma,
-                     opts.normalizeClip);
-  const auto renderRegions = DescribeImage(renderNorm, {}, opts.preset);
+  const auto features = DescribeReference(render, opts);
+  return CorrespondFromReference(render, features, queryNorm, queryRegions,
+                                 opts, report);
+}
+
+auto pgs::localize::DescribeReference(const Render& reference,
+                                      const MatchOptions& opts,
+                                      const cv::Mat& mask) -> ReferenceFeatures
+{
+  ReferenceFeatures out;
+  out.norm = LocalNormalize(ToGray01(reference.gray), opts.normalizeSigma,
+                            opts.normalizeClip);
+  out.regions = DescribeImage(out.norm, mask, opts.preset);
+  return out;
+}
+
+auto pgs::localize::CorrespondFromReference(
+    const Render& render, const ReferenceFeatures& features,
+    const cv::Mat& queryNorm, const feat::Regions& queryRegions,
+    const MatchOptions& opts, MatchReport& report)
+    -> std::vector<Correspondence>
+{
+  const auto& renderNorm = features.norm;
+  const auto& renderRegions = features.regions;
 
   report.detectedRender = renderRegions->RegionCount();
   report.detectedQuery = queryRegions.RegionCount();

@@ -249,6 +249,7 @@ auto pgs::localize::RenderMesh(const MeshBundle& bundle, const Camera& cam,
 
   Render out;
   out.gray = cv::Mat::zeros(rows, cols, CV_8UC1);
+  out.textured = cv::Mat::zeros(rows, cols, CV_8UC1);
   out.depth = cv::Mat(rows, cols, CV_32FC1, cv::Scalar(kNaN));
   out.position = cv::Mat(rows, cols, CV_32FC3, cv::Scalar(kNaN, kNaN, kNaN));
 
@@ -286,6 +287,7 @@ auto pgs::localize::RenderMesh(const MeshBundle& bundle, const Camera& cam,
     for (auto row = begin; row < end; ++row) {
       const auto v = static_cast<int>(row);
       auto* grayRow = out.gray.ptr<unsigned char>(v);
+      auto* texturedRow = out.textured.ptr<unsigned char>(v);
       auto* depthRow = out.depth.ptr<float>(v);
       auto* posRow = out.position.ptr<cv::Vec3f>(v);
       for (int u = 0; u < cols; ++u) {
@@ -336,6 +338,7 @@ auto pgs::localize::RenderMesh(const MeshBundle& bundle, const Camera& cam,
           continue;
         }
         grayRow[u] = SampleSurface(*img, bundle.uvMap, faceId, hit->u, hit->v);
+        texturedRow[u] = 255;
       }
     }
     hits += localHits;
@@ -459,6 +462,30 @@ auto pgs::localize::SelfTestRender(std::ostream& os) -> bool
                     std::to_string(render.hits) + " of 40000)");
     ok &= Check(os, render.missingCharts.empty(),
                 "every hit face resolved to a chart image");
+
+    // The texture mask. Every face here has UVs and a chart, so the mask must
+    // be exactly the hit set: 255 on the surface, 0 at a miss. Half the focal
+    // shrinks the plane to the centre of the frame, so the border misses.
+    {
+      Camera wide = cam;
+      wide.fx = wide.fy = 500.0;
+      const auto wideRender = RenderMesh(bundle, wide, 0);
+      std::size_t disagree = 0;
+      for (int v = 0; v < wide.height; ++v) {
+        for (int u = 0; u < wide.width; ++u) {
+          const bool hit =
+              std::isfinite(wideRender.position.at<cv::Vec3f>(v, u)[0]);
+          const bool textured = wideRender.textured.at<unsigned char>(v, u);
+          disagree += hit != textured;
+        }
+      }
+      ok &= Check(os,
+                  wideRender.hits > 0 and
+                      wideRender.hits < 200UL * 200UL and disagree == 0,
+                  "texture mask is set exactly where a textured surface was "
+                  "hit (" + std::to_string(wideRender.hits) + " hits, " +
+                      std::to_string(disagree) + " pixels disagree)");
+    }
 
     // The position map round-trip: project each world position back through
     // the camera it was rendered with and it must land on the pixel centre it
