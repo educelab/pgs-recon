@@ -194,6 +194,42 @@ def joint_report(output: Path) -> Path:
     return joint_dir(output) / 'report.json'
 
 
+# --- Combined texture (--combined-texture) ---------------------------------
+#
+# Everything in one directory: OpenMVS addresses its scene, mesh and output by
+# basename against one working directory (``toolchain.work_dir``).
+
+
+def combined_dir(output: Path) -> Path:
+    return output / 'combined'
+
+
+def combined_sources(output: Path) -> Path:
+    """8-bit copies of the views' images, which the merged scene reads."""
+    return combined_dir(output) / 'sources'
+
+
+def combined_sfm(output: Path) -> Path:
+    """Every textured view's calibration merged into one openMVG scene."""
+    return combined_dir(output) / 'combined_sfm.json'
+
+
+def combined_undistorted(output: Path) -> Path:
+    """``openMVG2openMVS``'s undistorted images, each with its
+    ``<stem>.mask.png`` beside it when the run has a mask."""
+    return combined_dir(output) / 'undistorted'
+
+
+def combined_scene(output: Path) -> Path:
+    return combined_dir(output) / 'combined.mvs'
+
+
+def combined_mesh(output: Path) -> Path:
+    """The deliverable: the mesh textured from every view at once, beside its
+    ``.mtl`` and atlas."""
+    return combined_dir(output) / 'combined.obj'
+
+
 # --- QA (Decision 6) --------------------------------------------------------
 
 

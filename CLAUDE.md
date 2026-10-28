@@ -269,6 +269,8 @@ the wrappers stay a complete library surface over each binary's flags.
   `recon_dir.py` (locate a finished run's SfM/mesh from its manifest),
   `ply.py` (one function: the face count in a PLY header, which is how `coarsen`
   sizes its target),
+  `mesh_staging.py` (`ensure_ply_mesh`: a mesh staged as the binary PLY
+  OpenMVS reads, for `pgs-retexture` and the view set's combined texture),
   `sfm_json.py` (OpenMVG SfM_Data JSON surgery: cereal polymorphic registration,
   extrinsic frame transforms),
   `visibility.py` (the pinhole projection `pgs-retexture`'s projective-UV path

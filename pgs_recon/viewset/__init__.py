@@ -17,13 +17,15 @@ Module map:
 - :mod:`.groups` -- the hand-held match graph split into connected groups and
   singletons (Decision 3).
 - :mod:`.manifest` -- provenance and per-view resume (Decision 7, 8).
+- :mod:`.combined` -- every view's calibration merged into one scene, for the
+  mesh ``--combined-texture`` textures from all of them.
 - :mod:`.tools` -- argv builders for ``pgs-localize-joint``, the C++ half.
 - :mod:`.pipeline` -- the phases, in order.
 - :mod:`.cli` -- ``pgs-localize-set``.
 - :mod:`.field` -- ``pgs-localize-field``, one view's misregistration field
   against a render of the reference (OpenCV).
 
-``layout``, ``inputs``, ``overhead``, ``groups`` and ``manifest`` are
-stdlib-only, like the
+``layout``, ``inputs``, ``overhead``, ``combined``, ``groups`` and
+``manifest`` are stdlib-only, like the
 planner core, so their tests run on a bare Python.
 """

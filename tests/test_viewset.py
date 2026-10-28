@@ -13,8 +13,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from pgs_recon.viewset import (groups, inputs, layout, manifest, overhead,
-                               tools)
+from pgs_recon.viewset import (combined, groups, inputs, layout, manifest,
+                               overhead, tools)
 from pgs_recon.viewset.inputs import (NoPath, Overhead, PlateInputs, Prior,
                                       Reference, RigCapture)
 
@@ -30,7 +30,10 @@ class TestLayout(unittest.TestCase):
                  layout.qa_report(OUT), layout.starting_camera(OUT),
                  layout.group_scene(OUT, 0), layout.group_pairs(OUT, 0),
                  layout.group_putative_matches(OUT, 0),
-                 layout.group_filtered_matches(OUT, 0)]
+                 layout.group_filtered_matches(OUT, 0),
+                 layout.combined_sources(OUT), layout.combined_sfm(OUT),
+                 layout.combined_undistorted(OUT), layout.combined_scene(OUT),
+                 layout.combined_mesh(OUT)]
         for stem in ('IMG_0001',):
             names += [layout.view_calibration(OUT, stem),
                       layout.view_adjusted_calibration(OUT, stem),
@@ -301,6 +304,70 @@ class TestVirtualOverhead(unittest.TestCase):
     def test_a_flat_footprint_is_refused(self):
         with self.assertRaisesRegex(ValueError, 'degenerate'):
             overhead.calibration(overhead.Bounds(0, 0, 0, 0, 1, 1), 'o.png')
+
+
+class TestMergeCalibrations(unittest.TestCase):
+    """The scene ``--combined-texture`` hands openMVG2openMVS."""
+
+    def write(self, d: Path, name: str, focal: float,
+              model: str = 'pinhole_radial_k3') -> Path:
+        cal = overhead.calibration(overhead.Bounds(0, 0, 0, 4, 3, 1),
+                                   f'{name}.tif', width=400)
+        intrinsic = cal['intrinsics'][0]['value']
+        intrinsic['polymorphic_name'] = model
+        intrinsic['ptr_wrapper']['data']['focal_length'] = focal
+        cal['extrinsics'][0]['value']['center'][0] = focal
+        path = d / f'{name}_calibration.json'
+        path.write_text(json.dumps(cal))
+        return path
+
+    def merge(self, models=('pinhole_radial_k3',) * 3):
+        with tempfile.TemporaryDirectory() as d:
+            cals = [self.write(Path(d), f'v{i}', 1000.0 + i, m)
+                    for i, m in enumerate(models)]
+            return combined.merge_calibrations(
+                cals, [f'v{i}.jpg' for i in range(len(cals))], Path('/src'))
+
+    def test_every_view_keeps_its_own_pose_and_intrinsic(self):
+        scene = self.merge()
+        self.assertEqual(scene['root_path'], '/src')
+        for key in range(3):
+            view = scene['views'][key]['value']['ptr_wrapper']['data']
+            self.assertEqual(view['filename'], f'v{key}.jpg')
+            self.assertEqual((view['id_view'], view['id_pose'],
+                              view['id_intrinsic']), (key, key, key))
+            intrinsic = scene['intrinsics'][key]['value']['ptr_wrapper']
+            self.assertEqual(intrinsic['data']['focal_length'], 1000.0 + key)
+            self.assertEqual(scene['extrinsics'][key]['value']['center'][0],
+                             1000.0 + key)
+
+    def test_cereal_ids_are_declared_once_each(self):
+        scene = self.merge()
+        pointers = ([v['value']['ptr_wrapper']['id'] for v in scene['views']]
+                    + [i['value']['ptr_wrapper']['id']
+                       for i in scene['intrinsics']])
+        self.assertEqual(pointers, [0x80000000 | i for i in range(1, 7)])
+        # The camera model is registered by name on its first use only.
+        first, *rest = [i['value'] for i in scene['intrinsics']]
+        self.assertEqual(first['polymorphic_name'], 'pinhole_radial_k3')
+        self.assertEqual(first['polymorphic_id'], 0x80000001)
+        for value in rest:
+            self.assertNotIn('polymorphic_name', value)
+            self.assertEqual(value['polymorphic_id'], 1)
+        self.assertEqual(list(scene)[0], 'sfm_data_version')
+
+    def test_mixed_camera_models_are_refused(self):
+        with self.assertRaisesRegex(ValueError, 'one camera model'):
+            self.merge(('pinhole_radial_k3', 'pinhole'))
+
+    def test_one_view_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'at least two'):
+            self.merge(('pinhole_radial_k3',))
+
+    def test_counts_must_match(self):
+        with self.assertRaisesRegex(ValueError, 'one each per view'):
+            combined.merge_calibrations([Path('a'), Path('b')], ['a.jpg'],
+                                        Path('/src'))
 
 
 class TestTools(unittest.TestCase):

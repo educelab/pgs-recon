@@ -17,12 +17,14 @@ import sys
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-from pgs_recon import openmvg, toolchain
+from pgs_recon import openmvg, openmvs, toolchain
 from pgs_recon.toolchain import cam_db, run as run_tool
 from pgs_recon.utility import ToolFailed
+from pgs_recon.utils.images import prepare_8bit_image
+from pgs_recon.utils.mesh_staging import ensure_ply_mesh
 from pgs_recon.utils.sfm_json import fix_polymorphic_registration
 from pgs_recon.viewset import groups as groups_mod
-from pgs_recon.viewset import layout, manifest, overhead, tools
+from pgs_recon.viewset import combined, layout, manifest, overhead, tools
 from pgs_recon.viewset.inputs import (Overhead, PlateInputs, Prior, Reference,
                                       Strategy)
 
@@ -49,6 +51,7 @@ class Options(NamedTuple):
     vignette_mask: bool = False     # make ``mask`` from the set's lens vignette
     threads: Optional[int] = None
     skip_texture: bool = False
+    combined_texture: bool = False  # also one mesh textured from every view
 
 
 def run(plate: PlateInputs, strategy: Strategy, output: Path,
@@ -95,6 +98,8 @@ def run(plate: PlateInputs, strategy: Strategy, output: Path,
              meta_path)
     if not opts.skip_texture:
         texture_views(plate, localized, output, meta, meta_path)
+        if opts.combined_texture:
+            texture_combined(plate, localized, output, opts, meta, meta_path)
 
 
 # --- Phase 0: the IR reference (Decision 2) ---------------------------------
@@ -634,6 +639,107 @@ def texture_views(plate: PlateInputs, stems: Sequence[str], output: Path,
         else:
             record['texture']['status'] = 'done'
         manifest.write(meta_path, meta)
+
+
+def texture_combined(plate: PlateInputs, stems: Sequence[str], output: Path,
+                     opts: Options, meta: Dict, meta_path: Path) -> None:
+    """One mesh textured from every localized view at once, by OpenMVS.
+
+    ``TextureMesh`` gives each face to the one view that sees it best and
+    levels the brightness steps between views; it never averages two views, so
+    a residual misregistration shows as a step at a seam rather than a ghost.
+    The run's mask, when it has one, keeps those pixels out here too -- without
+    it the lens vignette's dark corners texture the plate's margins.
+
+    Redone only when a calibration, an image, the mesh or the mask changed.
+    Failing does not fail the run: the per-view meshes are already written.
+    """
+    if len(stems) < 2:
+        logger.warning(f'Combined texture: {len(stems)} localized view(s), '
+                       f'and it needs at least two; skipping')
+        return
+    by_stem = {p.stem: p for p in plate.images}
+    calibrations = [layout.view_adjusted_calibration(output, s) for s in stems]
+    inputs = {f'calibration:{s}': manifest.fingerprint(c)
+              for s, c in zip(stems, calibrations)}
+    inputs.update({f'image:{s}': manifest.fingerprint(by_stem[s])
+                   for s in stems})
+    inputs['mesh'] = manifest.fingerprint(plate.mesh)
+    if opts.mask is not None:
+        inputs['mask'] = manifest.fingerprint(opts.mask)
+    reason = manifest.stale_reason(meta.get('combined'), inputs)
+    if reason is None:
+        logger.info('Combined texture: current, skipping')
+        return
+    logger.info(f'Combined texture: {len(stems)} views ({reason})')
+    meta['combined'] = {'inputs': inputs, 'status': 'running'}
+    manifest.write(meta_path, meta)
+
+    try:
+        _texture_combined(plate, stems, calibrations, by_stem, output, opts)
+    except (ToolFailed, OSError, ValueError) as e:
+        meta['combined']['status'] = 'failed'
+        logger.error(f'Combined texture failed: {e}')
+    else:
+        meta['combined']['status'] = 'done'
+        logger.info(f'Combined texture: {layout.combined_mesh(output)}')
+    manifest.write(meta_path, meta)
+
+
+def _texture_combined(plate: PlateInputs, stems: Sequence[str],
+                      calibrations: Sequence[Path], by_stem: Dict[str, Path],
+                      output: Path, opts: Options) -> None:
+    sources = layout.combined_sources(output)
+    # Undistortion reads pixels, so the scene reads 8-bit copies.
+    names = [prepare_8bit_image(by_stem[s], sources).name for s in stems]
+    sfm = layout.combined_sfm(output)
+    sfm.write_text(json.dumps(combined.merge_calibrations(
+        calibrations, names, sources.resolve()), indent=1))
+
+    scene = layout.combined_scene(output)
+    undistorted = layout.combined_undistorted(output)
+    openmvg.mvg_to_mvs(sfm, scene=scene, images_dir=undistorted,
+                       threads=opts.threads)
+    if opts.mask is not None:
+        _write_undistorted_masks(calibrations, stems, opts.mask, undistorted)
+
+    # Staged as combined_input.ply, the binary PLY TextureMesh reads reliably.
+    mesh = ensure_ply_mesh(plate.mesh, layout.combined_dir(output),
+                           out_stem='combined')
+    # Full resolution: on CR04 the atlas came out finer than the photos, so
+    # downsampling would be the only real loss. Seam leveling as
+    # pgs-retexture defaults it: global on, local off.
+    openmvs.mvs_texture(scene, mesh=mesh, output=layout.combined_mesh(output),
+                        export_type='obj', resolution_level=0,
+                        global_seam_leveling=1, local_seam_leveling=0,
+                        ignore_mask_label=(MASKED if opts.mask is not None
+                                           else None),
+                        max_threads=opts.threads)
+
+
+#: The value marking a masked pixel in ``--mask``: ``TextureMesh
+#: --ignore-mask-label`` takes no texture from it.
+MASKED = 0
+
+
+def _write_undistorted_masks(calibrations: Sequence[Path], stems: Sequence[str],
+                             mask: Path, undistorted: Path) -> None:
+    """``mask``, undistorted with each view's K, beside that view's undistorted
+    image -- where ``TextureMesh`` looks for it (``<stem>.mask.png``).
+
+    The mask is drawn on the original image, but OpenMVS reads the undistorted
+    one. The border undistortion leaves empty comes out masked too, which is
+    what ``TextureMesh`` would otherwise have estimated for itself.
+    """
+    # OpenCV only when asked for: the rest of the planner runs without it.
+    import cv2
+    from pgs_recon.viewset.field import undistort
+    for stem, calibration in zip(stems, calibrations):
+        warped = undistort(calibration, mask)
+        binary = ((warped > 127) * 255).astype('uint8')
+        target = undistorted / f'{stem}.mask.png'
+        if not cv2.imwrite(str(target), binary):
+            raise OSError(f'cannot write {target}')
 
 
 # --- Helpers ----------------------------------------------------------------

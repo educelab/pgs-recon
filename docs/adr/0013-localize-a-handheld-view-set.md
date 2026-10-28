@@ -299,6 +299,20 @@ graded. The review and fail lines (1 and 3 px) are provisional.
   projective UVs depend only on camera and mesh, so one OBJ per view serves every
   modality by swapping `map_Kd` (ADR 0002).
 
+*Amended: one mesh from every view, on request.* `--combined-texture` also
+textures the mesh once from all the localized views together: their deliverable
+calibrations merged into one openMVG scene, then `openMVG2openMVS` and
+`TextureMesh`, the path capture retexture already takes. `TextureMesh` gives each
+face to one view and levels the seams; it never averages two views, so a
+residual misregistration shows as a step at a seam, not a ghost. It is a
+resampled atlas, ADR 0002's objection, which is why it is an addition beside the
+per-view meshes and not a replacement. On CR04's seven views the atlas's texels
+came out finer than the photos' pixels (about 0.0030 against 0.0048 mesh units),
+so the loss is one resampling, and the papyrus showed no seams at full
+resolution. The run's mask is undistorted per view and handed to `TextureMesh` beside
+each image, because without it the lens vignette's corners textured the plate's
+margins.
+
 ### 8. An optional component, in this repository
 
 Nothing in `pgs-recon`'s pipeline changes: this runs after a finished

@@ -95,6 +95,11 @@ def _parser() -> configargparse.ArgumentParser:
 
     parser.add_argument('--skip-texture', action='store_true',
                         help='Stop after the calibrations.')
+    parser.add_argument('--combined-texture', action='store_true',
+                        help='Also texture one mesh from every localized view '
+                             'at once (OpenMVS TextureMesh, a resampled atlas), '
+                             'beside the per-view meshes. Keeps the --mask\'s '
+                             'pixels out of it.')
     parser.add_argument('--dry-run', action='store_true',
                         help='Resolve the inputs, say which reference and prior '
                              'would be used, and stop.')
@@ -151,6 +156,9 @@ def _main():
         sys.exit('--fix-intrinsic holds K at --camera; give one.')
     if args.vignette_mask and args.mask:
         sys.exit('--vignette-mask makes the --mask; give one or the other.')
+    if args.combined_texture and args.skip_texture:
+        sys.exit('--combined-texture is a texture; it cannot run with '
+                 '--skip-texture.')
 
     plate = _plate(args)
     if not plate.images:
@@ -173,7 +181,8 @@ def _main():
         mask=Path(args.mask) if args.mask else None,
         vignette_mask=args.vignette_mask,
         threads=args.threads,
-        skip_texture=args.skip_texture))
+        skip_texture=args.skip_texture,
+        combined_texture=args.combined_texture))
 
 
 if __name__ == '__main__':

@@ -347,7 +347,7 @@ def mvs_texture(scene: Path, mesh: Path, output: Path, export_type: str = None,
     ``export_type`` defaults to ``output``'s extension, which is what OpenMVS
     requires of the pair; pass it only to override. ``mesh`` must already live in
     the working directory -- a caller texturing an externally produced mesh
-    stages it there first (see retexture's ``ensure_ply_mesh``).
+    stages it there first (see ``utils.mesh_staging.ensure_ply_mesh``).
 
     Seam leveling and ``empty_color`` are left at OpenMVS defaults unless set.
     Passing ``*_seam_leveling=0`` disables the per-patch brightness normalization

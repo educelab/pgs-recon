@@ -554,7 +554,7 @@ class TestPipeline(_AdjustFixture):
 class TestPipelineVirtualOverhead(_AdjustFixture):
     """``pgs-localize-set`` with no registered overhead and no mask file: the
     overhead is rendered from the reference mesh, the mask from the views'
-    vignette."""
+    vignette -- and every view textures one mesh, through that mask."""
 
     POSES = TestAdjust.POSES
 
@@ -581,7 +581,7 @@ class TestPipelineVirtualOverhead(_AdjustFixture):
                 '--output', cls.set_dir, '--mesh', cls.mesh,
                 '--ir-reference-mesh', cls.mesh, '--virtual-overhead',
                 '--vignette-mask', '--camera', cls.start_cam,
-                '--skip-texture', '--threads', 2,
+                '--combined-texture', '--threads', 2,
                 '--path', toolchain.effective_prefix()]
         cls.first = run(argv)
         cls.second = run(argv)
@@ -614,10 +614,51 @@ class TestPipelineVirtualOverhead(_AdjustFixture):
         self.assertEqual(report['worst'], 'pass')
         self.assertTrue(any(s['grade'] == 'pass' for s in report['pairs']))
 
+    def test_every_view_textures_one_mesh(self):
+        self.assertEqual(self.meta['combined']['status'], 'done')
+        obj = self.set_dir / 'combined' / 'combined.obj'
+        text = obj.read_text()
+        self.assertIn('vt ', text)
+        self.assertEqual(text.count('\nv '),
+                         self.mesh.read_text().count('\nv '))
+        # The mask reached TextureMesh, undistorted, beside each image.
+        undistorted = self.set_dir / 'combined' / 'undistorted'
+        for name in self.names:
+            self.assertTrue(
+                (undistorted / f'{Path(name).stem}.mask.png').is_file(), name)
+        commands = ' '.join(self.meta['commands'].values())
+        self.assertIn('--ignore-mask-label 0', commands)
+
+    def test_the_combined_texture_is_the_views(self):
+        # Rendered back from a view's own calibration, the combined mesh is
+        # that view's image up to one uniform shift: the views agree, so there
+        # are no seams. The shift itself is not asserted. The renderer casts
+        # each pixel's ray through ``u + 0.5`` while OpenMVS writes texels at
+        # integer centres, so an OpenMVS texture renders back offset by up to
+        # half a pixel however right it is.
+        stem = Path(self.names[1]).stem
+        render = self.dir / 'combined_render.png'
+        run([binary('pgs-localize-joint'), 'position-map', '--calibration',
+             self.set_dir / 'views' / stem / f'{stem}_calibration.json',
+             '--mesh', self.set_dir / 'combined' / 'combined.obj',
+             '--output', self.dir / 'combined_render.npy',
+             '--output-image', render, '--threads', 2])
+        from pgs_recon.viewset.field import measure, undistort
+        query = undistort(
+            self.set_dir / 'views' / stem / f'{stem}_calibration.json',
+            self.dir / self.names[1])
+        field = measure(query, cv2.imread(str(render), cv2.IMREAD_GRAYSCALE))
+        self.assertGreater(field['tiles'], 10)
+        self.assertLess(field['residual_px']['median'], 0.25, field)
+        self.assertLess(abs(field['model']['radial_corner_px']), 0.5, field)
+        self.assertLess(max(abs(t) for t in field['model']['translation_px']),
+                        1.0, field)
+
     def test_a_second_run_rerenders_nothing(self):
         log = self.second.stdout + self.second.stderr
         self.assertIn('Virtual overhead exists, reusing', log)
         self.assertIn('Vignette mask exists, reusing', log)
+        self.assertIn('Combined texture: current, skipping', log)
         for name in self.names:
             self.assertIn(f'{Path(name).stem}: current, skipping', log)
 
