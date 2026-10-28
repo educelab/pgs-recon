@@ -531,6 +531,96 @@ class TestPipeline(_AdjustFixture):
         self.assertTrue(any(moved_name in (s['source'], s['target'])
                             and s['grade'] == 'fail' for s in report['pairs']))
 
+    def test_field_of_a_correct_calibration_is_flat(self):
+        # The image carries the true distortion; its emitted calibration must
+        # undistort it onto the render to well under a pixel, with nothing
+        # radial left over.
+        stem = Path(self.names[0]).stem
+        report = self.dir / 'field.json'
+        run([sys.executable, '-m', 'pgs_recon.viewset.field',
+             '--calibration',
+             self.set_dir / 'views' / stem / f'{stem}_calibration.json',
+             '--image', self.dir / self.names[0], '--mesh', self.mesh,
+             '--report', report, '--output', self.dir / 'field.png',
+             '--threads', 2, '--path', toolchain.effective_prefix()])
+        field = json.loads(report.read_text())
+        self.assertGreater(field['tiles'], 10)
+        self.assertLess(field['shift_px']['median'], 0.5, field)
+        self.assertLess(abs(field['model']['radial_corner_px']), 0.5, field)
+        self.assertTrue((self.dir / 'field.png').is_file())
+
+
+@requires_scene
+class TestPipelineVirtualOverhead(_AdjustFixture):
+    """``pgs-localize-set`` with no registered overhead and no mask file: the
+    overhead is rendered from the reference mesh, the mask from the views'
+    vignette."""
+
+    POSES = TestAdjust.POSES
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import configargparse  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest('needs configargparse')
+        super().setUpClass()
+        d = cls.dir
+        images = d / 'handheld'
+        images.mkdir()
+        for name in cls.names:
+            shutil.copy(d / name, images / name)
+        # What a copy to a non-Apple volume leaves beside each image.
+        (images / f'._{cls.names[0]}').write_bytes(b'\0' * 4096)
+        recon = d / 'recon'
+        recon.mkdir()
+        (recon / 'pgs-recon.json').write_text('{"stages": {}, "commands": {}}')
+        cls.set_dir = d / 'set'
+        argv = [sys.executable, '-m', 'pgs_recon.viewset.cli',
+                '--recon-dir', recon, '--images', images,
+                '--output', cls.set_dir, '--mesh', cls.mesh,
+                '--ir-reference-mesh', cls.mesh, '--virtual-overhead',
+                '--vignette-mask', '--camera', cls.start_cam,
+                '--skip-texture', '--threads', 2,
+                '--path', toolchain.effective_prefix()]
+        cls.first = run(argv)
+        cls.second = run(argv)
+        cls.meta = json.loads((cls.set_dir / 'pgs-localize-set.json')
+                              .read_text())
+
+    def test_every_view_is_localized_through_the_render(self):
+        self.assertEqual(self.meta['strategy']['prior'], 'virtual-overhead')
+        self.assertEqual(sorted(self.meta['views']),
+                         sorted(Path(n).stem for n in self.names))
+        for stem, record in self.meta['views'].items():
+            self.assertEqual(record['status'], 'done', stem)
+        reference = self.set_dir / 'reference'
+        for name in ('virtual_overhead_calibration.json',
+                     'virtual_overhead.png', 'virtual_overhead_position.npy',
+                     'vignette_mask.png'):
+            self.assertTrue((reference / name).is_file(), name)
+        self.assertFalse((reference / 'overhead_position.npy').exists())
+
+    def test_the_shared_k_is_recovered(self):
+        report = json.loads((self.set_dir / 'joint' / 'report.json')
+                            .read_text())
+        self.assertEqual(report['intrinsic_emitted'], 'adjusted')
+        k = report['intrinsic']['adjusted']
+        self.assertAlmostEqual(k['f'] / self.TRUE_K['f'], 1.0, delta=0.005)
+
+    def test_qa_grades_only_the_pairs(self):
+        report = json.loads((self.set_dir / 'qa' / 'report.json').read_text())
+        self.assertEqual(report['overhead'], [])
+        self.assertEqual(report['worst'], 'pass')
+        self.assertTrue(any(s['grade'] == 'pass' for s in report['pairs']))
+
+    def test_a_second_run_rerenders_nothing(self):
+        log = self.second.stdout + self.second.stderr
+        self.assertIn('Virtual overhead exists, reusing', log)
+        self.assertIn('Vignette mask exists, reusing', log)
+        for name in self.names:
+            self.assertIn(f'{Path(name).stem}: current, skipping', log)
+
 
 @requires_scene
 class TestSceneConventions(unittest.TestCase):

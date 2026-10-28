@@ -33,6 +33,11 @@ class Prior(Enum):
     """Where each view's starting pose comes from."""
     #: Matched against the overhead 940 image, lifted through its position map.
     OVERHEAD = 'overhead'
+    #: As ``OVERHEAD``, but the overhead is rendered here from the IR reference
+    #: mesh by a virtual camera straight above it (:mod:`.overhead`), for a
+    #: plate with no registered overhead capture. The prior is as good; what
+    #: is lost is the overhead QA comparison, which becomes circular.
+    VIRTUAL_OVERHEAD = 'virtual-overhead'
     #: Supplied per group by hand. Not implemented; named so a plate without
     #: an overhead view is refused with a reason rather than a traceback.
     MANUAL_SEED = 'manual-seed'
@@ -60,6 +65,9 @@ class PlateInputs(NamedTuple):
     ir_reference_mesh: Optional[Path] = None
     rig_ir_capture: Optional[RigCapture] = None
     overhead: Optional[Overhead] = None
+    #: Render the overhead from the IR reference mesh instead of reading one.
+    #: Only consulted when ``overhead`` is absent.
+    virtual_overhead: bool = False
 
 
 class Strategy(NamedTuple):
@@ -99,11 +107,17 @@ def choose(plate: PlateInputs) -> Strategy:
     else:
         raise NoPath('No IR reference: pass a prebuilt IR reference mesh, the '
                      'rig scan directory and its IR940 capture index, or a '
-                     'registered overhead view.')
+                     'registered overhead view. A virtual overhead is rendered '
+                     'from the reference mesh, so it cannot supply one.')
 
     if plate.overhead is not None:
         prior = Prior.OVERHEAD
         reasons.append(f'prior: overhead view {plate.overhead.calibration}')
+    elif plate.virtual_overhead:
+        prior = Prior.VIRTUAL_OVERHEAD
+        reasons.append('prior: virtual overhead rendered from the IR reference '
+                       'mesh. The overhead QA comparison would only compare '
+                       'the reference with itself, so it is not run')
     else:
         raise NoPath('No prior source: a registered overhead view is required. '
                      'Manual seeding (ADR 0013 Decision 2) is not implemented.')
@@ -114,11 +128,16 @@ def choose(plate: PlateInputs) -> Strategy:
 def collect_images(directory: Path) -> List[Path]:
     """The hand-held images in ``directory``, sorted, non-recursive.
 
+    Hidden files are skipped: macOS writes an AppleDouble ``._name.tif`` beside
+    every file it copies to a non-Apple volume, with an image's suffix and no
+    image in it.
+
     Refuses a set where two images share a stem: per-view artifacts are keyed by
     stem (:mod:`.layout`), so the second would overwrite the first's results.
     """
     images = sorted(p for p in Path(directory).iterdir()
-                    if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
+                    if p.is_file() and not p.name.startswith('.')
+                    and p.suffix.lower() in IMAGE_SUFFIXES)
     seen = {}
     for p in images:
         if p.stem in seen:

@@ -72,6 +72,11 @@ def _parser() -> configargparse.ArgumentParser:
                           help='Its pgs-localize one-view calibration .json.')
     overhead.add_argument('--overhead-image', default=None,
                           help='Its 940 nm band image.')
+    overhead.add_argument('--virtual-overhead', action='store_true',
+                          help='No registered overhead: render one from the IR '
+                               'reference mesh, from straight above (the mesh '
+                               'must be Z-up). Needs a reference mesh source; '
+                               'the overhead QA comparison is not run.')
 
     solve = parser.add_argument_group('solve')
     solve.add_argument('--camera', default=None,
@@ -84,6 +89,9 @@ def _parser() -> configargparse.ArgumentParser:
     solve.add_argument('--mask', default=None,
                        help='Image whose zero pixels are never matched (the '
                             'sample square).')
+    solve.add_argument('--vignette-mask', action='store_true',
+                       help='Make --mask from the lens vignette: the dark '
+                            'region at the corners of the set\'s first image.')
 
     parser.add_argument('--skip-texture', action='store_true',
                         help='Stop after the calibrations.')
@@ -108,6 +116,9 @@ def _plate(args) -> PlateInputs:
         sys.exit('--rig-scan-dir and --rig-ir-capture go together.')
     if (args.overhead_calibration is None) != (args.overhead_image is None):
         sys.exit('--overhead-calibration and --overhead-image go together.')
+    if args.virtual_overhead and args.overhead_calibration:
+        sys.exit('--virtual-overhead replaces --overhead-calibration and '
+                 '--overhead-image; give one or the other.')
 
     return PlateInputs(
         recon_dir=recon_dir,
@@ -122,6 +133,7 @@ def _plate(args) -> PlateInputs:
         overhead=(Overhead(Path(args.overhead_calibration),
                            Path(args.overhead_image))
                   if args.overhead_calibration else None),
+        virtual_overhead=args.virtual_overhead,
     )
 
 
@@ -137,6 +149,8 @@ def _main():
 
     if args.fix_intrinsic and not args.camera:
         sys.exit('--fix-intrinsic holds K at --camera; give one.')
+    if args.vignette_mask and args.mask:
+        sys.exit('--vignette-mask makes the --mask; give one or the other.')
 
     plate = _plate(args)
     if not plate.images:
@@ -157,6 +171,7 @@ def _main():
         fix_intrinsic=args.fix_intrinsic,
         focal_sweep=args.focal_sweep,
         mask=Path(args.mask) if args.mask else None,
+        vignette_mask=args.vignette_mask,
         threads=args.threads,
         skip_texture=args.skip_texture))
 

@@ -13,7 +13,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from pgs_recon.viewset import groups, inputs, layout, manifest, tools
+from pgs_recon.viewset import (groups, inputs, layout, manifest, overhead,
+                               tools)
 from pgs_recon.viewset.inputs import (NoPath, Overhead, PlateInputs, Prior,
                                       Reference, RigCapture)
 
@@ -91,6 +92,23 @@ class TestChoose(unittest.TestCase):
         with self.assertRaisesRegex(NoPath, 'Manual seeding'):
             inputs.choose(plate(rig_ir_capture=RIG))
 
+    def test_virtual_overhead_stands_in_for_a_missing_one(self):
+        s = inputs.choose(plate(ir_reference_mesh=Path('/r.obj'),
+                                virtual_overhead=True))
+        self.assertIs(s.reference, Reference.PROVIDED)
+        self.assertIs(s.prior, Prior.VIRTUAL_OVERHEAD)
+        self.assertTrue(any('not run' in r for r in s.reasons))
+
+    def test_a_registered_overhead_beats_a_virtual_one(self):
+        s = inputs.choose(plate(rig_ir_capture=RIG, overhead=OVERHEAD,
+                                virtual_overhead=True))
+        self.assertIs(s.prior, Prior.OVERHEAD)
+
+    def test_virtual_overhead_cannot_be_the_reference(self):
+        # It is rendered from the reference mesh, so it cannot supply one.
+        with self.assertRaisesRegex(NoPath, 'No IR reference'):
+            inputs.choose(plate(virtual_overhead=True))
+
 
 class TestCollectImages(unittest.TestCase):
     def test_sorted_images_only(self):
@@ -100,6 +118,14 @@ class TestCollectImages(unittest.TestCase):
             (Path(d) / 'sub').mkdir()
             got = [p.name for p in inputs.collect_images(Path(d))]
         self.assertEqual(got, ['a.tif', 'b.JPG'])
+
+    def test_hidden_files_are_skipped(self):
+        # macOS's AppleDouble files carry the image's suffix but no image.
+        with tempfile.TemporaryDirectory() as d:
+            for name in ('a.tif', '._a.tif', '.hidden.jpg'):
+                (Path(d) / name).touch()
+            got = [p.name for p in inputs.collect_images(Path(d))]
+        self.assertEqual(got, ['a.tif'])
 
     def test_shared_stem_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
@@ -209,6 +235,74 @@ class TestManifest(unittest.TestCase):
             self.assertNotEqual(before, manifest.fingerprint(p))
 
 
+def project(cal: dict, point) -> tuple:
+    """``point`` in ``cal``'s pixels, by its pinhole model (no distortion)."""
+    d = cal['intrinsics'][0]['value']['ptr_wrapper']['data']
+    pose = cal['extrinsics'][0]['value']
+    rel = [p - c for p, c in zip(point, pose['center'])]
+    x, y, z = (sum(r * v for r, v in zip(row, rel)) for row in pose['rotation'])
+    return (d['focal_length'] * x / z + d['principal_point'][0],
+            d['focal_length'] * y / z + d['principal_point'][1])
+
+
+class TestVirtualOverhead(unittest.TestCase):
+    BOUNDS = overhead.Bounds(-4.0, 1.0, -0.5, 6.0, 7.0, 0.5)
+
+    def test_bounds_read_only_the_vertices(self):
+        with tempfile.TemporaryDirectory() as d:
+            obj = Path(d) / 'm.obj'
+            obj.write_text('mtllib m.mtl\nv 1 2 3\nvt 9 9\nvn 0 0 1\n'
+                           'v -1 5 0.5\nv 0 -2 7\nf 1/1/1 2/1/1 3/1/1\n')
+            self.assertEqual(overhead.obj_bounds(obj),
+                             overhead.Bounds(-1, -2, 0.5, 1, 5, 7))
+
+    def test_a_mesh_without_vertices_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            obj = Path(d) / 'm.obj'
+            obj.write_text('mtllib m.mtl\n')
+            with self.assertRaisesRegex(ValueError, 'no vertices'):
+                overhead.obj_bounds(obj)
+
+    def test_the_box_fills_the_frame_less_the_margin(self):
+        cal = overhead.calibration(self.BOUNDS, 'o.png', width=1000)
+        view = cal['views'][0]['value']['ptr_wrapper']['data']
+        w, h = view['width'], view['height']
+        self.assertEqual(w, 1000)
+        self.assertEqual(h, 600)  # the box's 10 x 6 aspect
+        b = self.BOUNDS
+        x0, y0 = project(cal, (b.xmin, b.ymin, b.zmax))
+        x1, y1 = project(cal, (b.xmax, b.ymax, b.zmax))
+        border = w * (1 - 1 / overhead.MARGIN) / 2
+        self.assertAlmostEqual(min(x0, x1), border, places=6)
+        self.assertAlmostEqual(max(x0, x1), w - border, places=6)
+        self.assertAlmostEqual(min(y0, y1), h * (1 - 1 / overhead.MARGIN) / 2,
+                               places=6)
+
+    def test_looking_down_with_x_right_and_y_down_the_image(self):
+        # The canonical overhead orientation: world +x is image right, world
+        # +y is image *up*, and everything is in front of the camera.
+        cal = overhead.calibration(self.BOUNDS, 'o.png', width=1000)
+        b = self.BOUNDS
+        left = project(cal, (b.xmin, 4.0, 0.0))
+        right = project(cal, (b.xmax, 4.0, 0.0))
+        low = project(cal, (1.0, b.ymin, 0.0))
+        high = project(cal, (1.0, b.ymax, 0.0))
+        self.assertLess(left[0], right[0])
+        self.assertGreater(low[1], high[1])
+        pose = cal['extrinsics'][0]['value']
+        self.assertGreater(pose['center'][2], b.zmax)
+
+    def test_names_the_image_it_will_be_rendered_to(self):
+        cal = overhead.calibration(self.BOUNDS, 'virtual_overhead.png')
+        self.assertEqual(
+            cal['views'][0]['value']['ptr_wrapper']['data']['filename'],
+            'virtual_overhead.png')
+
+    def test_a_flat_footprint_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'degenerate'):
+            overhead.calibration(overhead.Bounds(0, 0, 0, 0, 1, 1), 'o.png')
+
+
 class TestTools(unittest.TestCase):
     """The argv each call hands ``pgs-localize-joint``."""
 
@@ -225,6 +319,12 @@ class TestTools(unittest.TestCase):
         self.assertEqual(argv, ['/p/bin/pgs-localize-joint', 'position-map',
                                 '--calibration', 'c.json', '--mesh', 'm.obj',
                                 '--output', 'p.npy'])
+
+    def test_position_map_can_also_write_the_render(self):
+        argv = self.call(tools.position_map, calibration=Path('c.json'),
+                         mesh=Path('m.obj'), output=Path('p.npy'),
+                         output_image=Path('o.png'))
+        self.assertEqual(argv[-2:], ['--output-image', 'o.png'])
 
     def test_view_carries_every_required_flag(self):
         argv = self.call(

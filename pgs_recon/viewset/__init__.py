@@ -11,13 +11,19 @@ Module map:
 - :mod:`.layout` -- what every artifact of a view-set run is called.
 - :mod:`.inputs` -- what a plate supplies, and which path (ADR 0013 Decision 2)
   that makes available.
+- :mod:`.overhead` -- the virtual overhead: a camera above the reference mesh,
+  for a plate with no registered overhead capture.
+- :mod:`.vignette` -- the lens vignette's mask (OpenCV).
 - :mod:`.groups` -- the hand-held match graph split into connected groups and
   singletons (Decision 3).
 - :mod:`.manifest` -- provenance and per-view resume (Decision 7, 8).
 - :mod:`.tools` -- argv builders for ``pgs-localize-joint``, the C++ half.
 - :mod:`.pipeline` -- the phases, in order.
 - :mod:`.cli` -- ``pgs-localize-set``.
+- :mod:`.field` -- ``pgs-localize-field``, one view's misregistration field
+  against a render of the reference (OpenCV).
 
-``layout``, ``inputs``, ``groups`` and ``manifest`` are stdlib-only, like the
+``layout``, ``inputs``, ``overhead``, ``groups`` and ``manifest`` are
+stdlib-only, like the
 planner core, so their tests run on a bare Python.
 """

@@ -22,8 +22,9 @@ from pgs_recon.toolchain import cam_db, run as run_tool
 from pgs_recon.utility import ToolFailed
 from pgs_recon.utils.sfm_json import fix_polymorphic_registration
 from pgs_recon.viewset import groups as groups_mod
-from pgs_recon.viewset import layout, manifest, tools
-from pgs_recon.viewset.inputs import PlateInputs, Reference, Strategy
+from pgs_recon.viewset import layout, manifest, overhead, tools
+from pgs_recon.viewset.inputs import (Overhead, PlateInputs, Prior, Reference,
+                                      Strategy)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class Options(NamedTuple):
     fix_intrinsic: bool = False     # hold K at ``camera`` (board-calibrated)
     focal_sweep: Optional[str] = None
     mask: Optional[Path] = None     # query pixels never to match (sample square)
+    vignette_mask: bool = False     # make ``mask`` from the set's lens vignette
     threads: Optional[int] = None
     skip_texture: bool = False
 
@@ -62,7 +64,14 @@ def run(plate: PlateInputs, strategy: Strategy, output: Path,
                         'reasons': list(strategy.reasons)}
 
     reference = build_ir_reference(plate, strategy, output)
-    position_map = render_overhead_position_map(plate, reference, output, opts)
+    if strategy.prior is Prior.VIRTUAL_OVERHEAD:
+        plate, position_map = render_virtual_overhead(plate, reference,
+                                                      output, opts)
+    else:
+        position_map = render_overhead_position_map(plate, reference, output,
+                                                     opts)
+    if opts.vignette_mask:
+        opts = opts._replace(mask=make_vignette_mask(plate, output))
     _check_provenance(meta, plate, reference)
     manifest.write(meta_path, meta)
 
@@ -82,7 +91,8 @@ def run(plate: PlateInputs, strategy: Strategy, output: Path,
     manifest.write(meta_path, meta)
 
     adjust_views(localized, tie_scenes, camera, output, opts, meta, meta_path)
-    qa_views(plate, reference, localized, output, opts, meta, meta_path)
+    qa_views(plate, strategy, reference, localized, output, opts, meta,
+             meta_path)
     if not opts.skip_texture:
         texture_views(plate, localized, output, meta, meta_path)
 
@@ -134,6 +144,52 @@ def render_overhead_position_map(plate: PlateInputs, reference: Path,
         tools.position_map(plate.overhead.calibration, reference, target,
                            sfm_transform=plate.sfm_transform,
                            threads=opts.threads)
+    return target
+
+
+def render_virtual_overhead(plate: PlateInputs, reference: Path,
+                            output: Path,
+                            opts: Options) -> Tuple[PlateInputs, Path]:
+    """The overhead, rendered from ``reference`` by a camera above it.
+
+    Returns the plate with that overhead in place of the absent one, so every
+    later phase reads it exactly as it would a registered capture, and the
+    position map, which the same render writes. Re-rendered whenever the
+    reference is newer than what is on disk.
+
+    The calibration is built in the reference mesh's own frame, so no
+    ``sfm_transform`` applies to it.
+    """
+    cal = layout.virtual_overhead_calibration(output)
+    image = layout.virtual_overhead_image(output)
+    position_map = layout.virtual_overhead_position_map(output)
+    made = (cal, image, position_map)
+    if all(p.exists() for p in made) and min(
+            p.stat().st_mtime_ns for p in made) > reference.stat().st_mtime_ns:
+        logger.info(f'Virtual overhead exists, reusing: {image}')
+    else:
+        bounds = overhead.obj_bounds(reference)
+        cal.parent.mkdir(parents=True, exist_ok=True)
+        cal.write_text(json.dumps(
+            overhead.calibration(bounds, image.name, root=cal.parent),
+            indent=1))
+        logger.info(f'Rendering a virtual overhead of {reference}: {image}')
+        tools.position_map(cal, reference, position_map, output_image=image,
+                           threads=opts.threads)
+    return plate._replace(overhead=Overhead(cal, image)), position_map
+
+
+def make_vignette_mask(plate: PlateInputs, output: Path) -> Path:
+    """The lens vignette's mask, made once from the set's first image."""
+    target = layout.vignette_mask(output)
+    if target.exists():
+        logger.info(f'Vignette mask exists, reusing: {target}')
+        return target
+    # OpenCV only when asked for: the rest of the planner runs without it.
+    from pgs_recon.viewset.vignette import write_vignette_mask
+    masked = write_vignette_mask(plate.images[0], target)
+    logger.info(f'Vignette mask from {plate.images[0].name}: '
+                f'{100 * masked:.1f}% masked -> {target}')
     return target
 
 
@@ -487,8 +543,8 @@ def _run_adjust(stems: Sequence[str], tie_scenes: Sequence[Path],
 # --- Phase 5: QA (Decision 6) -------------------------------------------------
 
 
-def qa_views(plate: PlateInputs, reference: Path, stems: Sequence[str],
-             output: Path, opts: Options, meta: Dict,
+def qa_views(plate: PlateInputs, strategy: Strategy, reference: Path,
+             stems: Sequence[str], output: Path, opts: Options, meta: Dict,
              meta_path: Path) -> None:
     """Measure every view's residual misregistration, and say what it found.
 
@@ -497,11 +553,15 @@ def qa_views(plate: PlateInputs, reference: Path, stems: Sequence[str],
     and recorded, and the views are still textured -- the QA renders and the
     report are what a person needs to decide, and withholding the textures
     would only hide what the report is about.
+
+    A virtual overhead is left out: it is a render of ``reference``, so
+    comparing with it only repeats the circular comparison.
     """
     inputs = {f'calibration:{s}': manifest.fingerprint(
         layout.view_adjusted_calibration(output, s)) for s in stems}
     inputs['mesh'] = manifest.fingerprint(plate.mesh)
     inputs['reference'] = manifest.fingerprint(reference)
+    graded = (plate.overhead if strategy.prior is Prior.OVERHEAD else None)
     report_path = layout.qa_report(output)
     reason = manifest.stale_reason(meta.get('qa'), inputs)
     if reason is None:
@@ -511,8 +571,8 @@ def qa_views(plate: PlateInputs, reference: Path, stems: Sequence[str],
         report_path.parent.mkdir(parents=True, exist_ok=True)
         tools.qa([layout.view_adjusted_calibration(output, s) for s in stems],
                  plate.mesh, report_path,
-                 overhead_calibration=plate.overhead.calibration,
-                 overhead_image=plate.overhead.image,
+                 overhead_calibration=graded.calibration if graded else None,
+                 overhead_image=graded.image if graded else None,
                  reference_mesh=reference, threads=opts.threads)
         meta['qa'] = {'inputs': inputs, 'status': 'done'}
         manifest.write(meta_path, meta)

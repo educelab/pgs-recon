@@ -48,6 +48,31 @@ def overhead_position_map(output: Path) -> Path:
     return reference_dir(output) / 'overhead_position.npy'
 
 
+def virtual_overhead_calibration(output: Path) -> Path:
+    """The virtual camera above the IR reference mesh (:mod:`.overhead`), when
+    the plate has no registered overhead capture."""
+    return reference_dir(output) / 'virtual_overhead_calibration.json'
+
+
+def virtual_overhead_image(output: Path) -> Path:
+    """The IR reference mesh rendered from :func:`virtual_overhead_calibration`:
+    the overhead image every view's prior is matched against."""
+    return reference_dir(output) / 'virtual_overhead.png'
+
+
+def virtual_overhead_position_map(output: Path) -> Path:
+    """World position per virtual-overhead pixel, written by the same render
+    as :func:`virtual_overhead_image`. Not :func:`overhead_position_map`, so a
+    run switched between the two never reuses the other's."""
+    return reference_dir(output) / 'virtual_overhead_position.npy'
+
+
+def vignette_mask(output: Path) -> Path:
+    """The lens vignette's mask, made from the set's first image
+    (:mod:`.vignette`)."""
+    return reference_dir(output) / 'vignette_mask.png'
+
+
 # --- Hand-held structure (Decision 3) --------------------------------------
 
 

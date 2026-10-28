@@ -10,8 +10,9 @@ together.
 The binary has three subcommands, one per thing that has to happen in-process
 with openMVG, OpenCV and the renderer:
 
-- ``position-map`` -- render the mesh from the overhead pose once, keeping only
-  the world position per pixel. Every view's overhead matches lift through it.
+- ``position-map`` -- render the mesh from the overhead pose once, keeping the
+  world position per pixel. Every view's overhead matches lift through it.
+  Optionally also the rendered texture: a virtual overhead.
 - ``view`` -- localize one hand-held image: overhead prior, then render-and-match
   against the IR reference mesh. Emits the one-view calibration and the inlier
   correspondences the adjustment consumes.
@@ -42,16 +43,22 @@ def _optional(*flags) -> list:
 
 
 def position_map(calibration: Path, mesh: Path, output: Path,
+                 output_image: Optional[Path] = None,
                  sfm_transform: Optional[Path] = None,
                  threads: Optional[int] = None) -> None:
-    """Render ``mesh`` from the pose in ``calibration``; write positions only.
+    """Render ``mesh`` from the pose in ``calibration``; write positions.
 
     ``output`` is a ``.npy`` of H x W x 3 float32, NaN where no surface was hit
     (the renderer's own convention, ``localize_render.hpp``).
+    ``output_image`` also writes the rendered texture, 8-bit grey: an undistorted
+    pinhole image of the mesh, which is what a virtual overhead is
+    (:mod:`.overhead`) and what a view is compared against
+    (:mod:`.field`).
     """
     command = [resolve_exe(BINARY), 'position-map',
                '--calibration', calibration, '--mesh', mesh, '--output', output]
-    command += _optional(('--sfm-transform', sfm_transform),
+    command += _optional(('--output-image', output_image),
+                         ('--sfm-transform', sfm_transform),
                          ('--threads', threads))
     run(command)
 

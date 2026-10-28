@@ -116,6 +116,17 @@ registration: a floor of ~0.15 mm (1.81–2.53 px held-out at ~70 µm/px), the s
 bias in every view, and one viewpoint's coverage. A plate with no registered
 overhead view needs a manual seed per group. The tool names which path it took.
 
+*Amended: a virtual overhead instead of a manual seed.* The prior needs only an
+image of the plate whose pixels have known world positions, and a render of the
+IR reference mesh from straight above is one. `--virtual-overhead` writes that
+camera from the mesh's bounding box and renders it in the same pass as its
+position map (`position-map --output-image`). CR04, which has no registered
+overhead, localized all three of its views through it. It costs one check: the
+overhead QA comparison would only compare the reference with itself, so it is
+not run, and the hand-held pairs are the only graded evidence. The manual seed
+remains unbuilt; a plate with neither an overhead nor a reference mesh is still
+refused.
+
 ### 3. Structure from the hand-held views, triangulated from the mesh poses
 
 The strongest signal in the data is hand-held IR against hand-held IR: same
