@@ -493,6 +493,201 @@ Two flags use this format:
   [registration-toolkit](https://github.com/educelab/registration-toolkit) reads
   as `rt_reorder_texture --camera-file`.
 
+### `pgs-localize-set`: registering a set of unregistered image patches to the 3D model
+`pgs-localize` places *one* extra photo into a finished reconstruction.
+`pgs-localize-set` does the same for a whole *set* of unregistered photos of one
+object (for example, several ~980 nm infrared shots of a papyrus plate taken
+with a different camera than the rig's), and then paints each photo onto the 3D
+mesh. The design and the measurements behind it are in
+[ADR 0013](docs/adr/0013-localize-a-handheld-view-set.md).
+
+#### A few terms first
+* **Mesh**: the 3D surface `pgs-recon` built, a set of triangles. A
+  **textured** mesh also has an image wrapped over it.
+* **Camera calibration**: everything needed to predict where a 3D point shows
+  up in a photo. It has two parts:
+  * the **pose**: where the camera was and which way it pointed.
+  * the **intrinsics**, written **K**: focal length and image center (both in
+    pixels), plus **lens distortion** (the bending that makes straight lines
+    curve near the edges of a photo).
+* **Localizing** a photo means solving for its calibration. Once a photo is
+  localized, every pixel in it can be traced to a point on the mesh, which is
+  what lets the photo be used as the mesh's texture.
+* **Reprojection error**, measured in pixels, is how far a point lands from
+  where it should. Less than about 1 px means the photo and the mesh line up
+  to within a pixel.
+
+#### What it does, step by step
+You run one command; it works through these phases in order:
+
+1. **Reference.** It picks a 3D model to match every photo against: the rig's
+   IR940 textured mesh, because 940 nm looks most like the unregistered infrared
+   photos.
+2. **Overhead.** It needs a picture of the whole plate from above whose pixels
+   each have a known 3D position. That is either the rig's registered overhead
+   940 nm image or, with `--virtual-overhead`, a render of the reference mesh
+   from above.
+3. **Localize each photo on its own.** Each photo is first matched against the
+   overhead to get a rough pose, then against a render of the mesh from that
+   rough pose to get an accurate one. Each photo's result depends on the mesh
+   only, not on the other photos.
+4. **Tie points.** Features that appear in two or more photos are matched and
+   located in 3D. Photos that share no features are split into separate groups.
+5. **Joint adjustment.** All photos came from the same camera, so it solves one
+   shared K (focal length, image center, and lens distortion) together with every
+   photo's pose. If the photos do not contain enough information to pin down
+   the focal length (common for a flat plate shot nearly straight down), it
+   keeps the starting focal length and image center and solves only the lens
+   distortion. It says which it did in `joint/report.json`
+   (`intrinsic_emitted`).
+6. **Quality check (QA).** It measures how well the photos line up with each
+   other and with the overhead.
+7. **Texture.** It makes one textured mesh per photo, and, with
+   `--combined-texture`, one mesh textured from all the photos at once.
+
+#### Before you start: build `pgs-localize-joint`
+The C++ half of this feature is optional and is **not** in the published Docker
+image. Build it with `PGS_BUILD_VIEWSET=ON`. The quickest way is inside the
+image, keeping the build directory on your machine (`~/pgs-build`) so later
+rebuilds are fast:
+
+```shell
+docker run --rm -v "$PWD":/src -v ~/pgs-build:/build -w /src ghcr.io/educelab/pgs-recon:edge \
+  bash -lc 'cmake -S dependencies/utilities -B /build -DCMAKE_BUILD_TYPE=Release -DPGS_BUILD_VIEWSET=ON && cmake --build /build -j'
+```
+
+(For a full superbuild, pass `-DPGS_BUILD_VIEWSET=ON` to the first `cmake`
+command under [Install from source](#install-from-source) instead.)
+
+#### What you need
+* A finished `pgs-recon` output directory for the object (`--recon-dir`). It is
+  only read, never changed.
+* A folder of the unregistered photos (`--images`), one file per photo. Each
+  file's name without its extension becomes that photo's name in the output, so
+  two files may not share one (`a.tif` and `a.png`). Hidden files such as
+  macOS's `._*` are ignored.
+* A reference mesh: either `--ir-reference-mesh` (an IR940 textured mesh you
+  already have), or `--rig-scan-dir` plus `--rig-ir-capture n` to build one from
+  the rig's scan.
+* An overhead: either `--overhead-calibration` plus `--overhead-image` (the
+  rig's registered overhead 940 nm view), or `--virtual-overhead`. The virtual
+  overhead looks straight down the mesh's Z axis, so the mesh must have Z
+  pointing up.
+* An empty output folder (`--output`) that is not the reconstruction.
+* Optional but recommended: `--camera`, a starting K in the
+  [camera file format](#camera-calibration-file-format) above (for example from
+  a checkerboard calibration). Without it, a starting K is guessed from the
+  photos' EXIF data.
+
+#### Running it
+A typical run inside the image, with the object's data mounted at `/data`, the
+photos and outputs at `/work`, and the binary you built at `/build`:
+
+```shell
+docker run --rm -v "$PWD":/src -v ~/pgs-build:/build -v /path/to/object:/data -v ~/pgs-test:/work \
+  ghcr.io/educelab/pgs-recon:edge bash -lc '
+    cp /build/pgs-localize-joint /usr/local/bin/ && pip install -q /src &&
+    pgs-localize-set \
+      --recon-dir /data/my-object_recon \
+      --ir-reference-mesh /data/my-object_recon/my-object_IR940.obj \
+      --virtual-overhead \
+      --vignette-mask \
+      --images /work/images \
+      --output /work/out \
+      --combined-texture'
+```
+
+Before a long run, add `--dry-run`: it checks the inputs, prints which
+reference and overhead it would use and why, and stops.
+
+If a run is interrupted, or you add photos or change an option, **run the same
+command again**. Every phase remembers what its inputs were and is redone only
+if they changed; everything else prints "current, skipping".
+
+#### Options you are likely to use
+* `--vignette-mask`: makes a mask of the dark corners some lenses produce (the
+  *vignette*), from the first photo, so no matching or texturing happens there.
+  Use `--mask <image>` instead to give your own: its black (zero) pixels are
+  ignored, for example to hide the sample label.
+* `--camera <file>` with `--fix-intrinsic`: trust the given K completely (for
+  example from a careful checkerboard calibration) and solve only the poses.
+* `--combined-texture`: also make one mesh textured from every photo together
+  (OpenMVS chooses the best photo for each triangle and evens out the
+  brightness at the boundaries). Unlike the per-photo meshes, which point
+  straight into the original photo, this one is a new texture image built by
+  resampling the photos.
+* `--skip-texture`: stop after the calibrations.
+* `--threads n`: limit the CPU threads used.
+
+`pgs-localize-set --help` lists every option.
+
+#### What comes out
+```
+out/
+├── pgs-localize-set.json        the run's record: what ran, on which inputs, and each photo's status
+├── reference/                   the overhead render, its position map, the vignette mask
+├── views/<photo>/
+│   ├── <photo>_calibration.json   the final calibration (input to pgs-retexture --calibration)
+│   ├── <photo>_camera.txt         the same, as a plain-text camera file
+│   ├── <photo>_mesh_calibration.json  the calibration from step 3, before the joint adjustment
+│   ├── <photo>_report.json        match counts and errors for this photo
+│   ├── <photo>_qa.png             the mesh rendered from the solved pose, to compare with the photo
+│   └── textured/<photo>.obj       the mesh textured from this photo
+├── joint/                       the shared K (camera.txt) and the adjustment's report
+├── qa/report.json               the quality check
+└── combined/combined.obj        with --combined-texture: the mesh textured from all photos
+```
+
+Open the `.obj` files in a 3D viewer such as MeshLab or Blender. Each one has
+its `.mtl` and texture image beside it.
+
+#### Is the result good?
+Start with `qa/report.json`. Its `worst` field is the overall grade. To grade
+a pair of photos, one is warped onto the other through the mesh, and the
+average leftover shift is measured, in pixels:
+
+| grade | shift | meaning |
+| --- | --- | --- |
+| `pass` | under 1 px | the two line up |
+| `review` | 1 to 3 px | look at it; low overlap between the photos can cause this |
+| `fail` | 3 px or more | something is wrong with at least one of the two |
+
+These thresholds are provisional. The report has three lists:
+* `pairs`: photos compared with each other. Graded.
+* `overhead`: each photo compared with the rig's overhead. Graded. Empty with
+  `--virtual-overhead`, which would compare the mesh with itself.
+* `circular`: each photo compared with the reference render it was matched to.
+  Reported but not graded, because a photo will always agree with what it was
+  fitted to.
+
+A failing grade is logged as an error, but the textures are still written, so
+you can look at what went wrong.
+
+To look at one photo in detail, `pgs-localize-field` measures the shift between
+the photo and the mesh rendered at its calibration, on a grid of small tiles,
+and draws it as arrows:
+
+```shell
+pgs-localize-field \
+  --calibration /work/out/views/<photo>/<photo>_calibration.json \
+  --image /work/images/<photo>.tif \
+  --mesh /data/my-object_recon/my-object_IR940.obj \
+  --mask /work/out/reference/vignette_mask.png \
+  --output /work/field.png --report /work/field.json
+```
+
+Arrows that all point the same way mean the pose is off. Arrows that point
+outward or inward from the center mean the focal length or lens distortion is
+off. Arrows that point in random directions are just noise from the mesh and
+texture.
+
+#### Known limitations
+* The renderer and OpenMVS disagree about where the center of a pixel is, by
+  half a pixel. The calibrations look unaffected, but the per-photo textures
+  and `pgs-localize-field` may show a shift of about 0.5 px that isn't real.
+* A set of photos all taken nearly straight down usually can't determine the
+  focal length (step 5). A good `--camera` matters most in that case.
+
 ## Install from source
 ### Install dependencies
 The Python scripts use executables provided by the OpenMVG and OpenMVS projects. 
