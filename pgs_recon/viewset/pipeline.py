@@ -144,11 +144,22 @@ def render_overhead_position_map(plate: PlateInputs, reference: Path,
                                  output: Path, opts: Options) -> Path:
     """World position per overhead pixel, rendered once for every view."""
     target = layout.overhead_position_map(output)
-    if not target.exists():
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tools.position_map(plate.overhead.calibration, reference, target,
-                           sfm_transform=plate.sfm_transform,
-                           threads=opts.threads)
+    record = layout.inputs_record(target)
+    inputs = {'reference': manifest.fingerprint(reference),
+              'overhead_calibration':
+                  manifest.fingerprint(plate.overhead.calibration)}
+    if plate.sfm_transform is not None:
+        inputs['sfm_transform'] = manifest.fingerprint(plate.sfm_transform)
+    reason = manifest.artifact_stale_reason((target,), record, inputs)
+    if reason is None:
+        logger.info(f'Overhead position map current, reusing: {target}')
+        return target
+    logger.info(f'Rendering the overhead position map ({reason}): {target}')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tools.position_map(plate.overhead.calibration, reference, target,
+                       sfm_transform=plate.sfm_transform,
+                       threads=opts.threads)
+    manifest.record_artifact(record, inputs)
     return target
 
 
@@ -160,7 +171,7 @@ def render_virtual_overhead(plate: PlateInputs, reference: Path,
     Returns the plate with that overhead in place of the absent one, so every
     later phase reads it exactly as it would a registered capture, and the
     position map, which the same render writes. Re-rendered whenever the
-    reference is newer than what is on disk.
+    reference is not the one it was rendered from.
 
     The calibration is built in the reference mesh's own frame, so no
     ``sfm_transform`` applies to it.
@@ -169,18 +180,22 @@ def render_virtual_overhead(plate: PlateInputs, reference: Path,
     image = layout.virtual_overhead_image(output)
     position_map = layout.virtual_overhead_position_map(output)
     made = (cal, image, position_map)
-    if all(p.exists() for p in made) and min(
-            p.stat().st_mtime_ns for p in made) > reference.stat().st_mtime_ns:
-        logger.info(f'Virtual overhead exists, reusing: {image}')
+    record = layout.inputs_record(image)
+    inputs = {'reference': manifest.fingerprint(reference)}
+    reason = manifest.artifact_stale_reason(made, record, inputs)
+    if reason is None:
+        logger.info(f'Virtual overhead current, reusing: {image}')
     else:
         bounds = overhead.obj_bounds(reference)
         cal.parent.mkdir(parents=True, exist_ok=True)
         cal.write_text(json.dumps(
             overhead.calibration(bounds, image.name, root=cal.parent),
             indent=1))
-        logger.info(f'Rendering a virtual overhead of {reference}: {image}')
+        logger.info(f'Rendering a virtual overhead of {reference} ({reason}): '
+                    f'{image}')
         tools.position_map(cal, reference, position_map, output_image=image,
                            threads=opts.threads)
+        manifest.record_artifact(record, inputs)
     return plate._replace(overhead=Overhead(cal, image)), position_map
 
 

@@ -56,6 +56,31 @@ def stale_reason(record: Optional[Mapping],
     return None
 
 
+def artifact_stale_reason(made, record_path: Path,
+                          inputs: Mapping[str, Mapping]) -> Optional[str]:
+    """Why a run-level artifact -- one render every view reads -- cannot be
+    reused, or ``None`` if it can.
+
+    ``made`` is every file the render writes; ``record_path`` is the sidecar
+    :func:`record_artifact` wrote beside them. Its existence alone says nothing:
+    a run pointed at another reference mesh keeps every path, and a reference
+    older than the render it replaces is the usual case, not the odd one.
+    """
+    missing = [Path(p) for p in made if not Path(p).exists()]
+    if missing:
+        return f'{missing[0].name} is missing'
+    if not Path(record_path).exists():
+        return 'no record of what it was made from'
+    return stale_reason(json.loads(Path(record_path).read_text()), inputs)
+
+
+def record_artifact(record_path: Path, inputs: Mapping[str, Mapping]) -> None:
+    """Record what a run-level artifact was made from, for
+    :func:`artifact_stale_reason`. Written after the artifact, so a render that
+    crashed leaves no record claiming it is current."""
+    write(record_path, {'status': 'done', 'inputs': dict(inputs)})
+
+
 def provenance_drift(recorded: Mapping, current: Mapping) -> Dict[str, str]:
     """Run-level inputs whose fingerprint changed since the manifest was written.
 

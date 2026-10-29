@@ -33,7 +33,9 @@ class TestLayout(unittest.TestCase):
                  layout.group_filtered_matches(OUT, 0),
                  layout.combined_sources(OUT), layout.combined_sfm(OUT),
                  layout.combined_undistorted(OUT), layout.combined_scene(OUT),
-                 layout.combined_mesh(OUT)]
+                 layout.combined_mesh(OUT),
+                 layout.inputs_record(layout.overhead_position_map(OUT)),
+                 layout.inputs_record(layout.virtual_overhead_image(OUT))]
         for stem in ('IMG_0001',):
             names += [layout.view_calibration(OUT, stem),
                       layout.view_adjusted_calibration(OUT, stem),
@@ -228,6 +230,28 @@ class TestManifest(unittest.TestCase):
             path.write_text(json.dumps({'format': 999}))
             with self.assertRaisesRegex(ValueError, 'format 999'):
                 manifest.load(path)
+
+    def test_artifact_follows_its_reference_not_its_age(self):
+        # A run pointed at another reference mesh keeps every output path, and
+        # that mesh is routinely older than the render it should replace.
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            render, record = d / 'overhead.png', d / 'overhead.png.inputs.json'
+            rgb, ir = d / 'final.obj', d / 'ir940.obj'
+            rgb.write_text('rgb')
+            ir.write_text('ir940')
+            used = {'reference': manifest.fingerprint(rgb)}
+            self.assertIn('missing', manifest.artifact_stale_reason(
+                (render,), record, used))
+            render.touch()
+            self.assertIn('no record', manifest.artifact_stale_reason(
+                (render,), record, used))
+            manifest.record_artifact(record, used)
+            self.assertIsNone(manifest.artifact_stale_reason(
+                (render,), record, used))
+            self.assertIn('reference changed', manifest.artifact_stale_reason(
+                (render,), record,
+                {'reference': manifest.fingerprint(ir)}))
 
     def test_fingerprint_sees_a_rewrite(self):
         with tempfile.TemporaryDirectory() as d:

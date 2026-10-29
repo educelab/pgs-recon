@@ -42,6 +42,12 @@ def starting_camera(output: Path) -> Path:
     return reference_dir(output) / 'starting_camera.txt'
 
 
+def inputs_record(artifact: Path) -> Path:
+    """What a run-level render was made from, beside it, so a run pointed at
+    another reference re-renders rather than reusing it."""
+    return artifact.with_name(artifact.name + '.inputs.json')
+
+
 def overhead_position_map(output: Path) -> Path:
     """World position per overhead pixel, rendered once from the overhead pose
     and reused to lift every view's overhead matches (Decision 2, item 2)."""
