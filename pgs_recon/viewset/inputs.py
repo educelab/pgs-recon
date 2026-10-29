@@ -130,13 +130,14 @@ def collect_images(directory: Path) -> List[Path]:
 
     Hidden files are skipped: macOS writes an AppleDouble ``._name.tif`` beside
     every file it copies to a non-Apple volume, with an image's suffix and no
-    image in it.
+    image in it. The name is checked before ``is_file()``: through a Docker
+    Desktop mount even a ``stat`` of one of those fails with ``EPERM``.
 
     Refuses a set where two images share a stem: per-view artifacts are keyed by
     stem (:mod:`.layout`), so the second would overwrite the first's results.
     """
     images = sorted(p for p in Path(directory).iterdir()
-                    if p.is_file() and not p.name.startswith('.')
+                    if not p.name.startswith('.') and p.is_file()
                     and p.suffix.lower() in IMAGE_SUFFIXES)
     seen = {}
     for p in images:
