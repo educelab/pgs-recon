@@ -561,23 +561,55 @@ command under [Install from source](#install-from-source) instead.)
 
 #### What you need
 * A finished `pgs-recon` output directory for the object (`--recon-dir`). It is
-  only read, never changed.
+  only read, never changed. The mesh to texture is found through the run's
+  manifest (`pgs-recon.json`). A *packaged* run, one whose directory holds
+  only the deliverables (`*_final.obj`, `*_IR940.obj`, a `metadata.json`
+  describing the dataset, and `intermediate.tar.gz`), has no such manifest, so
+  name the mesh yourself with `--mesh`. Any of the run's meshes works (`_final`,
+  `_centered`), since they share one frame.
 * A folder of the unregistered photos (`--images`), one file per photo. Each
   file's name without its extension becomes that photo's name in the output, so
   two files may not share one (`a.tif` and `a.png`). Hidden files such as
   macOS's `._*` are ignored.
 * A reference mesh: either `--ir-reference-mesh` (an IR940 textured mesh you
   already have), or `--rig-scan-dir` plus `--rig-ir-capture n` to build one from
-  the rig's scan.
+  the rig's scan. It must be the **IR940** mesh (`*_IR940.obj`, whose `.mtl`
+  names an `_IR940_…` texture), not `_final.obj` or `_centered.obj`: those are
+  textured in color, where ink and papyrus look nothing like they do at 940 nm,
+  and no photo will match them. The reference is what photos are *matched
+  against*; `--mesh` is what gets *textured*, and they need not be the same
+  file.
 * An overhead: either `--overhead-calibration` plus `--overhead-image` (the
   rig's registered overhead 940 nm view), or `--virtual-overhead`. The virtual
   overhead looks straight down the mesh's Z axis, so the mesh must have Z
   pointing up.
 * An empty output folder (`--output`) that is not the reconstruction.
-* Optional but recommended: `--camera`, a starting K in the
-  [camera file format](#camera-calibration-file-format) above (for example from
-  a checkerboard calibration). Without it, a starting K is guessed from the
-  photos' EXIF data.
+* `--camera`, a starting K in the
+  [camera file format](#camera-calibration-file-format) above. Without it, a
+  starting K is taken from the photos' EXIF focal length, and a run whose
+  photos have none (common for multispectral TIFFs) stops with `has no
+  intrinsic … Pass --camera with a starting K`. It only has to be a *starting*
+  K, so if you don't know the camera, write one by hand: width and height from
+  the image, `cx`/`cy` at its center, distortion zero, and a focal length from
+  the lens and sensor (focal length in mm ÷ pixel size in mm) or, failing
+  that, a guess such as 2.5 × the image width:
+
+  ```
+  fx 7680
+  fy 7680
+  cx 1536
+  cy 1028
+  width 3072
+  height 2056
+  k1 0
+  k2 0
+  k3 0
+  ```
+
+  The joint adjustment solves the lens distortion either way. Whether it can
+  also correct the focal length depends on how tilted the photos are; see
+  step 5 and `joint/report.json`. A checkerboard calibration with the same
+  camera, lens and focus, passed with `--fix-intrinsic`, is better than either.
 
 #### Running it
 A typical run inside the image, with the object's data mounted at `/data`, the
@@ -592,10 +624,15 @@ docker run --rm -v "$PWD":/src -v ~/pgs-build:/build -v /path/to/object:/data -v
       --ir-reference-mesh /data/my-object_recon/my-object_IR940.obj \
       --virtual-overhead \
       --vignette-mask \
+      --mesh /data/my-object_recon/my-object_final.obj \
+      --camera /work/start.cam \
       --images /work/images \
       --output /work/out \
       --combined-texture'
 ```
+
+Every path is as the *container* sees it: `/data/...` and `/work/...`, not the
+paths on your machine.
 
 Before a long run, add `--dry-run`: it checks the inputs, prints which
 reference and overhead it would use and why, and stops.
@@ -620,6 +657,18 @@ if they changed; everything else prints "current, skipping".
 * `--threads n`: limit the CPU threads used.
 
 `pgs-localize-set --help` lists every option.
+
+#### When a run fails
+| message | cause | fix |
+| --- | --- | --- |
+| `metadata.json is missing name/file_type; cannot locate the textured mesh` | `--recon-dir` is a packaged run, with no `pgs-recon` manifest | pass `--mesh` |
+| `PermissionError: … Operation not permitted: '…/._<name>.tif'` | macOS's `._*` files on a non-Apple drive (exFAT), which Docker Desktop cannot read; older versions stopped on them | update, or run `dot_clean -m <images folder>` on the Mac |
+| `sfm_data.json has no intrinsic … Pass --camera with a starting K` | the photos carry no EXIF focal length | pass `--camera` (see [What you need](#what-you-need)) |
+| `no scale of the query resected against the overhead image`, for every photo | almost always the wrong reference: a color mesh against infrared photos. Each scale's line shows it: a working run finds hundreds of `similarity` matches, a wrong reference finds fewer than ten | pass the `*_IR940.obj` mesh as `--ir-reference-mesh` |
+| the same, for one or two photos only | that photo is too far from straight down, or covers too little of the plate | rerun the failing `pgs-localize-joint view` command (it is in the log) with a wider `--prior-scales` ladder, which `pgs-localize-set` does not expose; failing that, a manual seed (ADR 0013 Decision 2) |
+
+The overhead render is redone whenever `--ir-reference-mesh` changes, so
+switching the reference does not need a fresh `--output`.
 
 #### What comes out
 ```
