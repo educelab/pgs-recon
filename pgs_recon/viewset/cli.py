@@ -47,7 +47,8 @@ def _parser() -> configargparse.ArgumentParser:
     plate.add_argument('--output', '-o', required=True,
                        help='Where this run writes. Not --recon-dir.')
     plate.add_argument('--mesh', default=None,
-                       help='Override the mesh to texture (default: the '
+                       help='Override the mesh to texture (default: '
+                            '--ir-reference-mesh if given, else the '
                             'reconstruction\'s, from its manifest). Must be in '
                             'the frame of the overhead calibration.')
     plate.add_argument('--sfm-transform', default=None,
@@ -114,8 +115,16 @@ def _parser() -> configargparse.ArgumentParser:
 def _plate(args) -> PlateInputs:
     recon_dir = Path(args.recon_dir)
     load_manifest(recon_dir)  # -r must be a pgs-recon output
-    mesh = (Path(args.mesh) if args.mesh
-            else resolve_textured_mesh(recon_dir).require())
+    # A provided reference is the frame every view is localized into (and the
+    # one a virtual overhead is rendered from), so it is the mesh to texture
+    # unless told otherwise; the manifest's mesh is only right when the
+    # reference was retextured from it.
+    if args.mesh:
+        mesh = Path(args.mesh)
+    elif args.ir_reference_mesh:
+        mesh = Path(args.ir_reference_mesh)
+    else:
+        mesh = resolve_textured_mesh(recon_dir).require()
 
     if (args.rig_scan_dir is None) != (args.rig_ir_capture is None):
         sys.exit('--rig-scan-dir and --rig-ir-capture go together.')

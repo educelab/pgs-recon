@@ -516,5 +516,37 @@ class TestImportSet(unittest.TestCase):
         self.assertEqual(self.run_import(plate)[1], 1)
 
 
+try:
+    from pgs_recon.viewset import cli
+except ImportError:  # configargparse
+    cli = None
+
+
+@unittest.skipIf(cli is None, 'needs configargparse')
+class TestPlateMesh(unittest.TestCase):
+    """Which mesh is textured when --mesh is not given."""
+
+    def plate(self, *extra):
+        args = cli._parser().parse_args(
+            ['-r', '/recon', '-i', '/images', '-o', '/out', *extra])
+        with mock.patch.object(cli, 'load_manifest'), \
+                mock.patch.object(cli, 'collect_images', return_value=()), \
+                mock.patch.object(cli, 'resolve_textured_mesh') as resolve:
+            resolve.return_value.require.return_value = Path('/recon/final.obj')
+            return cli._plate(args)
+
+    def test_the_reconstructions_mesh_by_default(self):
+        self.assertEqual(self.plate().mesh, Path('/recon/final.obj'))
+
+    def test_a_provided_reference_is_textured(self):
+        plate = self.plate('--ir-reference-mesh', '/recon/ir.obj')
+        self.assertEqual(plate.mesh, Path('/recon/ir.obj'))
+
+    def test_mesh_still_wins(self):
+        plate = self.plate('--ir-reference-mesh', '/recon/ir.obj',
+                           '--mesh', '/recon/centered.obj')
+        self.assertEqual(plate.mesh, Path('/recon/centered.obj'))
+
+
 if __name__ == '__main__':
     unittest.main()

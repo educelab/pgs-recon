@@ -561,12 +561,13 @@ command under [Install from source](#install-from-source) instead.)
 
 #### What you need
 * A finished `pgs-recon` output directory for the object (`--recon-dir`). It is
-  only read, never changed. The mesh to texture is found through the run's
-  manifest (`pgs-recon.json`). A *packaged* run, one whose directory holds
-  only the deliverables (`*_final.obj`, `*_IR940.obj`, a `metadata.json`
-  describing the dataset, and `intermediate.tar.gz`), has no such manifest, so
-  name the mesh yourself with `--mesh`. Any of the run's meshes works (`_final`,
-  `_centered`), since they share one frame.
+  only read, never changed. The mesh to texture is `--ir-reference-mesh` when
+  you give one, and otherwise the one found through the run's manifest
+  (`pgs-recon.json`). A *packaged* run, one whose directory holds only the
+  deliverables (`*_final.obj`, `*_IR940.obj`, a `metadata.json` describing the
+  dataset, and `intermediate.tar.gz`), has no such manifest, so without
+  `--ir-reference-mesh` name the mesh yourself with `--mesh`. Any of the run's
+  meshes works (`_final`, `_centered`, `_IR940`), since they share one frame.
 * A folder of the unregistered photos (`--images`), one file per photo. Each
   file's name without its extension becomes that photo's name in the output, so
   two files may not share one (`a.tif` and `a.png`). Hidden files such as
@@ -577,8 +578,8 @@ command under [Install from source](#install-from-source) instead.)
   names an `_IR940_…` texture), not `_final.obj` or `_centered.obj`: those are
   textured in color, where ink and papyrus look nothing like they do at 940 nm,
   and no photo will match them. The reference is what photos are *matched
-  against*; `--mesh` is what gets *textured*, and they need not be the same
-  file.
+  against*; `--mesh` is what gets *textured*. By default they are the same
+  file; pass `--mesh` to texture a different one in the same frame.
 * An overhead: either `--overhead-calibration` plus `--overhead-image` (the
   rig's registered overhead 940 nm view), or `--virtual-overhead`. The virtual
   overhead looks straight down the mesh's Z axis, so the mesh must have Z
@@ -624,7 +625,6 @@ docker run --rm -v "$PWD":/src -v ~/pgs-build:/build -v /path/to/object:/data -v
       --ir-reference-mesh /data/my-object_recon/my-object_IR940.obj \
       --virtual-overhead \
       --vignette-mask \
-      --mesh /data/my-object_recon/my-object_final.obj \
       --camera /work/start.cam \
       --images /work/images \
       --output /work/out \
@@ -661,7 +661,7 @@ if they changed; everything else prints "current, skipping".
 #### When a run fails
 | message | cause | fix |
 | --- | --- | --- |
-| `metadata.json is missing name/file_type; cannot locate the textured mesh` | `--recon-dir` is a packaged run, with no `pgs-recon` manifest | pass `--mesh` |
+| `metadata.json is missing name/file_type; cannot locate the textured mesh` | `--recon-dir` is a packaged run, with no `pgs-recon` manifest | pass `--ir-reference-mesh` or `--mesh` |
 | `PermissionError: … Operation not permitted: '…/._<name>.tif'` | macOS's `._*` files on a non-Apple drive (exFAT), which Docker Desktop cannot read; older versions stopped on them | update, or run `dot_clean -m <images folder>` on the Mac |
 | `sfm_data.json has no intrinsic … Pass --camera with a starting K` | the photos carry no EXIF focal length | pass `--camera` (see [What you need](#what-you-need)) |
 | `no scale of the query resected against the overhead image`, for every photo | almost always the wrong reference: a color mesh against infrared photos. Each scale's line shows it: a working run finds hundreds of `similarity` matches, a wrong reference finds fewer than ten | pass the `*_IR940.obj` mesh as `--ir-reference-mesh` |
