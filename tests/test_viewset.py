@@ -456,5 +456,65 @@ class TestTools(unittest.TestCase):
                          report=Path('r'))
 
 
+try:
+    from pgs_recon.viewset import pipeline
+except ImportError:  # its image helpers need numpy and friends
+    pipeline = None
+
+
+@unittest.skipIf(pipeline is None, 'pgs_recon.viewset.pipeline does not import')
+class TestImportSet(unittest.TestCase):
+    """The hand-held import follows the images, not its own existence: an output
+    root reused for another image set must not keep the old scene."""
+
+    def setUp(self):
+        self._d = tempfile.TemporaryDirectory()
+        self.root = Path(self._d.name)
+        self.images = self.root / 'images'
+        self.images.mkdir()
+        self.output = self.root / 'out'
+
+    def tearDown(self):
+        self._d.cleanup()
+
+    def plate(self, *names):
+        for name in names:
+            (self.images / name).write_text(name)
+        return mock.Mock(images=[self.images / n for n in names])
+
+    def run_import(self, plate):
+        def init(images_dir, output_dir, **kw):
+            (output_dir / 'sfm_data.json').write_text(json.dumps(
+                sorted(p.name for p in plate.images)))
+        with mock.patch.object(pipeline.openmvg, 'init_sfm_generic',
+                               side_effect=init) as call, \
+                mock.patch.object(pipeline, 'cam_db', return_value='db'):
+            imported = pipeline.import_set(plate, self.output)
+        return imported, call.call_count
+
+    def test_the_same_images_are_not_reimported(self):
+        plate = self.plate('a.tif', 'b.tif')
+        self.assertEqual(self.run_import(plate)[1], 1)
+        self.assertEqual(self.run_import(plate)[1], 0)
+
+    def test_another_image_set_is_reimported_from_a_clean_sfm_dir(self):
+        self.run_import(self.plate('a.tif', 'b.tif'))
+        stale = layout.filtered_matches(self.output)
+        stale.parent.mkdir(parents=True)
+        stale.write_text('old matches')
+        imported, calls = self.run_import(self.plate('c.tif', 'd.tif'))
+        self.assertEqual(calls, 1)
+        self.assertEqual(json.loads(imported.read_text()), ['c.tif', 'd.tif'])
+        self.assertFalse(stale.exists())
+
+    def test_a_scene_with_no_record_is_reimported(self):
+        # What a run from before the record existed left behind.
+        plate = self.plate('a.tif')
+        sfm = layout.sfm_dir(self.output)
+        sfm.mkdir(parents=True)
+        (sfm / 'sfm_data.json').write_text('[]')
+        self.assertEqual(self.run_import(plate)[1], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

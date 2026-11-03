@@ -13,6 +13,7 @@ Everything else stops the run.
 """
 import json
 import logging
+import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
@@ -245,15 +246,31 @@ def import_set(plate: PlateInputs, output: Path,
     what lets images with no EXIF focal import with an intrinsic at all, and
     without one the groups' tie points cannot be triangulated -- and otherwise OpenMVG's, from EXIF
     and the sensor database. That K is where every view starts.
+
+    Redone whenever the images or ``camera`` are not the ones it was imported
+    from. Its existence alone says nothing: an output root reused for another
+    image set keeps the old scene, and every view then finds no group to tie
+    into. Re-importing clears ``sfm/``, since the regions, matches and group
+    triangulations under it were all made from the scene it replaces.
     """
     sfm_dir = layout.sfm_dir(output)
     imported = sfm_dir / 'sfm_data.json'  # OpenMVG picks this name
-    if not imported.exists():
-        sfm_dir.mkdir(parents=True, exist_ok=True)
-        openmvg.init_sfm_generic(
-            _common_dir(plate.images), output_dir=sfm_dir, cam_db=cam_db(),
-            camera_model=CAMERA_MODEL_RADIAL3,
-            intrinsics=_k_matrix(camera) if camera is not None else None)
+    record = layout.inputs_record(imported)
+    inputs = {f'image:{p.stem}': manifest.fingerprint(p) for p in plate.images}
+    if camera is not None:
+        inputs['camera'] = manifest.fingerprint(camera)
+    reason = manifest.artifact_stale_reason((imported,), record, inputs)
+    if reason is None:
+        return imported
+    logger.info(f'Importing {len(plate.images)} hand-held images ({reason})')
+    if sfm_dir.exists():
+        shutil.rmtree(sfm_dir)
+    sfm_dir.mkdir(parents=True)
+    openmvg.init_sfm_generic(
+        _common_dir(plate.images), output_dir=sfm_dir, cam_db=cam_db(),
+        camera_model=CAMERA_MODEL_RADIAL3,
+        intrinsics=_k_matrix(camera) if camera is not None else None)
+    manifest.record_artifact(record, inputs)
     return imported
 
 
@@ -320,7 +337,10 @@ def reconstruct_groups(imported: Path, localized: Sequence[str],
     already anchored to the mesh on its own (Decision 5).
     """
     matches_dir = layout.matches_dir(output)
-    if not layout.filtered_matches(output).exists():
+    made = (layout.filtered_matches(output), layout.surviving_pairs(output))
+    record = layout.inputs_record(layout.filtered_matches(output))
+    inputs = {'scene': manifest.fingerprint(imported)}
+    if manifest.artifact_stale_reason(made, record, inputs) is not None:
         matches_dir.mkdir(parents=True, exist_ok=True)
         openmvg.compute_features(imported, output_dir=matches_dir,
                                  method='SIFT', preset='HIGH',
@@ -331,6 +351,7 @@ def reconstruct_groups(imported: Path, localized: Sequence[str],
                                  matches=layout.putative_matches(output),
                                  output=layout.filtered_matches(output),
                                  output_pairs=layout.surviving_pairs(output))
+        manifest.record_artifact(record, inputs)
 
     files = _view_files(imported)
     stem_of = {i: Path(name).stem for i, name in files.items()}
@@ -377,13 +398,15 @@ def _solve_group(imported: Path, members: set, stem_of: Dict[int, str],
     The imported scene is cut down to the group with its view ids unchanged,
     and the group's pairs are re-matched into a matches file of their own: the
     regions are shared, so re-matching a group costs only its own pairs.
-    Reused while it is newer than every member's mesh-only calibration.
+    Reused while it is newer than every member's mesh-only calibration and
+    than the set's matches it was cut from.
     """
     solved = layout.group_dir(output, index) / 'sfm_data.bin'
     calibrations = [layout.view_calibration(output, stem_of[i])
                     for i in members]
+    made_from = calibrations + [layout.filtered_matches(output)]
     if solved.exists() and all(solved.stat().st_mtime_ns > c.stat().st_mtime_ns
-                               for c in calibrations):
+                               for c in made_from):
         return solved
     group_dir = layout.group_dir(output, index)
     group_dir.mkdir(parents=True, exist_ok=True)
