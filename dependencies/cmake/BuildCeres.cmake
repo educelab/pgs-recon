@@ -4,7 +4,7 @@ if(BUILD_CERES)
       ceres
       DEPENDS eigen
       URL https://github.com/ceres-solver/ceres-solver/archive/refs/tags/2.2.0.tar.gz
-      URL_HASH SHA512=bf519fbcbd0ee2d4624be72cde061a09d191ee5e56dc33984669393799b885c2164efc99dcef71307f8b50a9ccad945882376ace3d9a44ba7e1f25c20511aabd
+      URL_HASH SHA512=d4cefe5851e25bd3c7b76352092d8d549eb371af2e35a325736554c54fe58a3523658697c3e2d65af660fe6895ae3d96fe31bd1875870474fc4b6fed3bbdfae9
       DOWNLOAD_NO_PROGRESS ON
       DOWNLOAD_EXTRACT_TIMESTAMP OFF
       CMAKE_CACHE_ARGS
