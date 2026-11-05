@@ -3,7 +3,7 @@ if(BUILD_CERES)
   ExternalProject_Add(
       ceres
       DEPENDS eigen
-      URL http://ceres-solver.org/ceres-solver-2.2.0.tar.gz
+      URL https://github.com/ceres-solver/ceres-solver/archive/refs/tags/2.2.0.tar.gz
       URL_HASH SHA512=bf519fbcbd0ee2d4624be72cde061a09d191ee5e56dc33984669393799b885c2164efc99dcef71307f8b50a9ccad945882376ace3d9a44ba7e1f25c20511aabd
       DOWNLOAD_NO_PROGRESS ON
       DOWNLOAD_EXTRACT_TIMESTAMP OFF
