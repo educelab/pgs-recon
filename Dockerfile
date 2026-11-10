@@ -75,6 +75,7 @@ RUN if [ "${USE_CUDA}" = "ON" ]; then  \
       -DCMAKE_BUILD_TYPE=Release \
       -DBUILD_JPEG=OFF \
       -DBUILD_CERES=ON \
+      -DPGS_BUILD_VIEWSET=ON \
       -DUSE_CUDA=${USE_CUDA} \
       -DCMAKE_CUDA_ARCHITECTURES='60;61;70;90' \
       -GNinja \
