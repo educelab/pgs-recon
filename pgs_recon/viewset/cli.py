@@ -134,10 +134,15 @@ def _plate(args) -> PlateInputs:
         sys.exit('--virtual-overhead replaces --overhead-calibration and '
                  '--overhead-image; give one or the other.')
 
+    try:
+        images = collect_images(Path(args.images))
+    except ValueError as e:
+        sys.exit(str(e))
+
     return PlateInputs(
         recon_dir=recon_dir,
         mesh=mesh,
-        images=collect_images(Path(args.images)),
+        images=images,
         sfm_transform=Path(args.sfm_transform) if args.sfm_transform else None,
         ir_reference_mesh=(Path(args.ir_reference_mesh)
                            if args.ir_reference_mesh else None),

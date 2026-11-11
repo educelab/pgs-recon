@@ -8,9 +8,11 @@ through a run by whichever input happened to be missing.
 
 Stdlib-only.
 """
+import io
+import struct
 from enum import Enum
 from pathlib import Path
-from typing import List, NamedTuple, Optional, Sequence
+from typing import BinaryIO, List, NamedTuple, Optional, Sequence
 
 #: Image extensions a hand-held set is collected from. Matches what
 #: ``openMVG_main_SfMInit_ImageListing`` will import.
@@ -135,6 +137,9 @@ def collect_images(directory: Path) -> List[Path]:
 
     Refuses a set where two images share a stem: per-view artifacts are keyed by
     stem (:mod:`.layout`), so the second would overwrite the first's results.
+
+    Refuses a set where any image carries an orientation tag other than 1 --
+    see :func:`check_orientation`.
     """
     images = sorted(p for p in Path(directory).iterdir()
                     if not p.name.startswith('.') and p.is_file()
@@ -145,4 +150,109 @@ def collect_images(directory: Path) -> List[Path]:
             raise ValueError(f'{p.name} and {seen[p.stem].name} share the stem '
                              f'{p.stem!r}; per-view outputs are keyed by stem')
         seen[p.stem] = p
+    check_orientation(images)
     return images
+
+
+def check_orientation(images: Sequence[Path]) -> None:
+    """Refuse images whose orientation tag asks a reader to rotate or flip.
+
+    The readers in a view-set run disagree about that tag. OpenCV applies it
+    -- for a palette TIFF even under ``IMREAD_UNCHANGED``, because libtiff's
+    RGBA path does the rotating -- so ``pgs-localize-joint`` solves the pose,
+    and its QA checks it, in the *displayed* frame. ``pgs-retexture`` reads
+    with imageio and copies the file as the texture, i.e. the *stored* frame.
+    A view with ``Orientation = 3`` therefore passes QA and is textured upside
+    down and displaced. Nothing downstream can see the mismatch, so it is
+    refused here, before anything reads a pixel.
+
+    The fix is to set the tag to 1 and leave the pixels alone: the stored
+    pixels are the sensor's frame, which the shared intrinsic is solved in,
+    and the solver does not care about in-plane rotation.
+    """
+    bad = []
+    for p in images:
+        value = image_orientation(p)
+        if value not in (None, 1):
+            bad.append(f'{p.name} (Orientation = {value})')
+    if bad:
+        raise ValueError(
+            'These images carry an orientation tag, which OpenCV applies and '
+            'the texturing step does not, so they would be registered in one '
+            'frame and textured in another: ' + ', '.join(bad) + '. Set the '
+            'tag to 1 without changing the pixels, e.g. '
+            '`exiftool -n -IFD0:Orientation=1 -overwrite_original <image>`, '
+            'and run again.')
+
+
+#: The TIFF/EXIF Orientation tag.
+_ORIENTATION = 274
+
+
+def image_orientation(path: Path) -> Optional[int]:
+    """The orientation tag of ``path``, or ``None`` if it has none.
+
+    Reads the TIFF IFD0 of a TIFF, or the EXIF block of a JPEG or PNG -- the
+    places OpenCV takes orientation from. A file that is not one of those, or
+    is too damaged to parse, is ``None``: it fails later, in the read, where
+    that error belongs.
+    """
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(8)
+            f.seek(0)
+            if head[:4] in (b'II*\x00', b'MM\x00*'):
+                return _tiff_orientation(f)
+            if head[:2] == b'\xff\xd8':
+                exif = _jpeg_exif(f)
+            elif head == b'\x89PNG\r\n\x1a\n':
+                exif = _png_exif(f)
+            else:
+                return None
+            return _tiff_orientation(io.BytesIO(exif)) if exif else None
+    except (OSError, struct.error, ValueError):
+        return None
+
+
+def _tiff_orientation(f: BinaryIO) -> Optional[int]:
+    """The Orientation entry of IFD0 in the TIFF stream ``f`` (offset 0)."""
+    order = {b'II': '<', b'MM': '>'}[f.read(2)]
+    magic, ifd = struct.unpack(order + 'HI', f.read(6))
+    if magic != 42:
+        return None
+    f.seek(ifd)
+    (count,) = struct.unpack(order + 'H', f.read(2))
+    for _ in range(count):
+        tag, kind, n, value = struct.unpack(order + 'HHI4s', f.read(12))
+        if tag == _ORIENTATION and n == 1 and kind == 3:  # one SHORT
+            return struct.unpack(order + 'H', value[:2])[0]
+    return None
+
+
+def _jpeg_exif(f: BinaryIO) -> Optional[bytes]:
+    """The TIFF stream inside a JPEG's ``Exif`` APP1 segment, if any."""
+    f.read(2)  # SOI
+    while True:
+        marker = f.read(2)
+        if len(marker) < 2 or marker[0] != 0xFF or marker[1] in (0xD9, 0xDA):
+            return None  # EOI or start of scan: no EXIF precedes the data
+        (length,) = struct.unpack('>H', f.read(2))
+        body = f.read(length - 2)
+        if marker[1] == 0xE1 and body.startswith(b'Exif\x00\x00'):
+            return body[6:]
+
+
+def _png_exif(f: BinaryIO) -> Optional[bytes]:
+    """The TIFF stream in a PNG's ``eXIf`` chunk, if it precedes the data."""
+    f.read(8)  # signature
+    while True:
+        header = f.read(8)
+        if len(header) < 8:
+            return None
+        length, kind = struct.unpack('>I4s', header)
+        if kind in (b'IDAT', b'IEND'):
+            return None
+        body = f.read(length)
+        f.read(4)  # CRC
+        if kind == b'eXIf':
+            return body

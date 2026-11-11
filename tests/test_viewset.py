@@ -139,6 +139,70 @@ class TestCollectImages(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'share the stem'):
                 inputs.collect_images(Path(d))
 
+    def test_a_rotated_image_is_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / 'a.tif').write_bytes(_tiff(1))
+            (Path(d) / 'b.tif').write_bytes(_tiff(3))
+            with self.assertRaisesRegex(ValueError,
+                                        r'b\.tif \(Orientation = 3\)'):
+                inputs.collect_images(Path(d))
+
+    def test_orientation_one_and_untagged_pass(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / 'a.tif').write_bytes(_tiff(1))
+            (Path(d) / 'b.tif').write_bytes(_tiff(None))
+            got = [p.name for p in inputs.collect_images(Path(d))]
+        self.assertEqual(got, ['a.tif', 'b.tif'])
+
+
+def _tiff(orientation, order='<'):
+    """A TIFF header and IFD0 with one SHORT Orientation entry, or none."""
+    import struct
+    entries = [] if orientation is None else [(274, 3, 1, orientation)]
+    out = (b'II' if order == '<' else b'MM') + struct.pack(order + 'HI', 42, 8)
+    out += struct.pack(order + 'H', len(entries) + 1)
+    for tag, kind, n, value in [(256, 3, 1, 4)] + entries:
+        out += struct.pack(order + 'HHIH2x', tag, kind, n, value)
+    return out + struct.pack(order + 'I', 0)
+
+
+class TestImageOrientation(unittest.TestCase):
+    def read(self, data, suffix):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / f'x{suffix}'
+            p.write_bytes(data)
+            return inputs.image_orientation(p)
+
+    def test_tiff_either_byte_order(self):
+        self.assertEqual(self.read(_tiff(3, '<'), '.tif'), 3)
+        self.assertEqual(self.read(_tiff(6, '>'), '.tif'), 6)
+        self.assertIsNone(self.read(_tiff(None), '.tif'))
+
+    def test_jpeg_exif(self):
+        import struct
+        exif = b'Exif\x00\x00' + _tiff(3, '>')
+        app0 = b'\xff\xe0' + struct.pack('>H', 2 + 5) + b'JFIF\x00'
+        app1 = b'\xff\xe1' + struct.pack('>H', 2 + len(exif)) + exif
+        self.assertEqual(self.read(b'\xff\xd8' + app0 + app1 + b'\xff\xda',
+                                   '.jpg'), 3)
+        self.assertIsNone(self.read(b'\xff\xd8' + app0 + b'\xff\xda', '.jpg'))
+
+    def test_png_exif(self):
+        import struct
+
+        def chunk(kind, body):
+            return struct.pack('>I', len(body)) + kind + body + b'\0' * 4
+        sig = b'\x89PNG\r\n\x1a\n'
+        ihdr = chunk(b'IHDR', b'\0' * 13)
+        self.assertEqual(self.read(sig + ihdr + chunk(b'eXIf', _tiff(8)) +
+                                   chunk(b'IDAT', b''), '.png'), 8)
+        self.assertIsNone(self.read(sig + ihdr + chunk(b'IDAT', b''), '.png'))
+
+    def test_unparseable_files_are_left_to_the_reader(self):
+        self.assertIsNone(self.read(b'', '.tif'))
+        self.assertIsNone(self.read(b'II*\x00\xff\xff\xff\x00', '.tif'))
+        self.assertIsNone(self.read(b'not an image', '.jpg'))
+
 
 class TestGroups(unittest.TestCase):
     def test_islands_and_singletons(self):
