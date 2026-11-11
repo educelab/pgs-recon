@@ -18,10 +18,14 @@ The compiled binaries are NOT part of this repo. They are built from `dependenci
 via a CMake superbuild that compiles OpenMVG, OpenMVS, VCG, CGAL, OpenCV, Eigen,
 Ceres, libjpeg, plus the in-tree `pgs-recon-utilities` (C++ tools in
 `dependencies/utilities/`, which produce `pgs-global-scaler`, `pgs-sfm-orient`,
-`pgs-generate-markers`, `pgs-decimate` and `pgs-localize`). `pgs-decimate` is the
-one that needs VCG, whose headers the superbuild already installs for OpenMVS;
-`BuildPGSUtils.cmake` passes `-DVCG_ROOT` the way `BuildOpenMVS.cmake` does.
-`pgs-localize` is the one C++20 target (bvh v2 needs `std::span`), which is why
+`pgs-generate-markers`, `pgs-decimate`, `pgs-localize` and `pgs-localize-joint`).
+`pgs-decimate` is the one that needs VCG, whose headers the superbuild already
+installs for OpenMVS; `BuildPGSUtils.cmake` passes `-DVCG_ROOT` the way
+`BuildOpenMVS.cmake` does. `pgs-localize-joint` is the one that needs an
+*installed* Ceres, which is why `BUILD_CERES` defaults ON: without it openMVG
+builds an internal copy that `find_package(Ceres)` cannot see.
+`pgs-localize` and `pgs-localize-joint` are the C++20 targets, through the
+`localize_core` library they share (bvh v2 needs `std::span`), which is why
 the one file that has to meet openMVG's bundled cereal -- it does not compile at
 C++20 -- is its own small C++17 library (ADR 0011). bvh and libcore arrive by
 `FetchContent` at configure time, so the utilities build needs network.
@@ -109,7 +113,9 @@ generation, scan inspection, quality checks, etc.) mapping to modules in
 `pgs_recon/apps/` and `pgs_recon/utils/`. Five more `pgs-*` commands are bare C++
 binaries with no Python wrapper at all — `pgs-global-scaler`, `pgs-sfm-orient`,
 `pgs-generate-markers`, `pgs-decimate` and `pgs-localize` — built from
-`dependencies/utilities/src/`.
+`dependencies/utilities/src/`. A sixth, `pgs-localize-joint`, is built the same
+way but is driven by `pgs-localize-set` through `pgs_recon/viewset/tools.py`
+(ADR 0013).
 
 `pgs-localize` puts a camera that was never in the reconstruction into the solved
 scene and emits the one-view calibration `pgs-retexture --calibration` consumes.

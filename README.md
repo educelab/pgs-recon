@@ -545,19 +545,20 @@ You run one command; it works through these phases in order:
 7. **Texture.** It makes one textured mesh per photo, and, with
    `--combined-texture`, one mesh textured from all the photos at once.
 
-#### Before you start: build `pgs-localize-joint`
-The C++ half of this feature is optional and is **not** in the published Docker
-image. Build it with `PGS_BUILD_VIEWSET=ON`. The quickest way is inside the
-image, keeping the build directory on your machine (`~/pgs-build`) so later
-rebuilds are fast:
+#### Before you start: check for `pgs-localize-joint`
+The C++ half of this feature, `pgs-localize-joint`, is built with the other C++
+tools, so any image or superbuild from this version on has it. An older image
+does not. To use one anyway, build the tools inside it, keeping the build
+directory on your machine (`~/pgs-build`) so later rebuilds are fast:
 
 ```shell
 docker run --rm -v "$PWD":/src -v ~/pgs-build:/build -w /src ghcr.io/educelab/pgs-recon:edge \
-  bash -lc 'cmake -S dependencies/utilities -B /build -DCMAKE_BUILD_TYPE=Release -DPGS_BUILD_VIEWSET=ON && cmake --build /build -j'
+  bash -lc 'cmake -S dependencies/utilities -B /build -DCMAKE_BUILD_TYPE=Release && cmake --build /build -j'
 ```
 
-(For a full superbuild, pass `-DPGS_BUILD_VIEWSET=ON` to the first `cmake`
-command under [Install from source](#install-from-source) instead.)
+It needs an installed Ceres. The superbuild builds one by default
+(`BUILD_CERES`); openMVG's internal copy, used when it finds no Ceres, is not
+enough.
 
 #### What you need
 * A finished `pgs-recon` output directory for the object (`--recon-dir`). It is
@@ -748,7 +749,7 @@ following dependencies:
 * GMP and MPFR
 * ExifTool
 * (Optional) NASM (Required by jpeg-turbo)
-* (Optional) Ceres Solver
+* (Optional) Ceres Solver (built by default; see `BUILD_CERES` below)
 * (Optional) CUDA Toolkit
 
 After the dependencies have been installed, configure and build the CMake 
@@ -821,6 +822,7 @@ BUILD_JPEG: If ON, builds libjpeg
 BUILD_JPEG_TURBO: If ON, builds libjpeg-turbo (depends BUILD_JPEG=ON)
 BUILD_OPENCV: If ON, builds OpenCV
 BUILD_CGAL: If ON, builds CGAL
+BUILD_CERES: If ON, builds Ceres (pgs-localize-joint needs it installed)
 ```
 
 ## Building a Docker image

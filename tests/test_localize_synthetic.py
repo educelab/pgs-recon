@@ -31,8 +31,8 @@ What each class guards:
   agree, so a failure above is the tool's and not the fixture's.
 
 Binaries are found the way the pipeline finds them (``toolchain``), so in the
-published image this tests the installed tools. ``pgs-localize-joint`` is only
-built with ``PGS_BUILD_VIEWSET=ON``; its tests skip without it.
+published image this tests the installed tools. Images older than
+``pgs-localize-joint`` do not carry it, and its tests skip there.
 """
 import json
 import shutil

@@ -1,4 +1,6 @@
-option(BUILD_CERES "Build Ceres" OFF)
+# On by default because pgs-localize-joint needs an installed Ceres. Turn it off
+# only when a system Ceres is installed; openMVG's internal copy is not enough.
+option(BUILD_CERES "Build Ceres" ON)
 if(BUILD_CERES)
   ExternalProject_Add(
       ceres

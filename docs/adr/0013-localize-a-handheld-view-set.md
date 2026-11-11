@@ -321,7 +321,7 @@ imports from the core, the core never imports it.
 
 | piece | form |
 |---|---|
-| C++ joint tool (provisional name `pgs-localize-joint`) | A new target in `dependencies/utilities/` behind a CMake option (provisional `PGS_BUILD_VIEWSET`), **default OFF**, so the superbuild and the published image are unchanged unless it is turned on |
+| C++ joint tool (provisional name `pgs-localize-joint`) | A new target in `dependencies/utilities/`, built unconditionally with the other C++ tools. *Amended:* it was first proposed behind a CMake option (`PGS_BUILD_VIEWSET`, default OFF) so the published image stayed unchanged; the option was dropped once the tool had to ship in the image. It needs an installed Ceres, so the superbuild now builds Ceres by default (`BUILD_CERES`) |
 | Python orchestrator (provisional `pgs-localize-set`) | Its own subpackage (provisional `pgs_recon/viewset/`), one console script, an optional pip extra if it needs dependencies. Uses `utils/recon_dir.py`, `sfm_json.py`, `images.py`, `visibility.py`, `openmvg.py` and `toolchain`; calls `pgs-retexture` as a subprocess, since apps may not import each other |
 | Resumability | Its own: a view whose calibration and report exist and match the recorded inputs is skipped. **Not** `StageTracker`, which is bound to `pgs-recon`'s `STAGES` tuple and `pipeline_shape`; generalizing it would change the core this component must not touch |
 
@@ -407,4 +407,5 @@ Each phase depends on the one before it unless noted.
   may not transfer to a shorter-focal, tilted camera; they are a starting point,
   to be re-measured.
 - **Provisional names** -- `pgs-localize-joint`, `pgs-localize-set`,
-  `pgs_recon/viewset/`, `PGS_BUILD_VIEWSET` -- until the code lands.
+  `pgs_recon/viewset/` -- until the code lands. (`PGS_BUILD_VIEWSET` was on
+  this list too, and was dropped rather than renamed.)

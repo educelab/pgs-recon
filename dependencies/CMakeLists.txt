@@ -64,9 +64,6 @@ if(DEFINED CMAKE_CUDA_ARCHITECTURES)
     )
 endif()
 
-# Optional components of pgs-recon-utilities
-option(PGS_BUILD_VIEWSET "Build pgs-localize-joint, hand-held view-set localization (ADR 0013)" OFF)
-
 ### Eigen ###
 include(BuildEigen)
 

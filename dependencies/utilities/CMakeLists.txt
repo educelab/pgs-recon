@@ -239,28 +239,26 @@ target_link_libraries(localize
 )
 set_target_properties(localize PROPERTIES OUTPUT_NAME "pgs-localize")
 
-# hand-held view-set localization (ADR 0013). Optional, and off by default:
-# nothing else in this build or in pgs-recon depends on it.
-option(PGS_BUILD_VIEWSET "Build pgs-localize-joint (ADR 0013)" OFF)
-if(PGS_BUILD_VIEWSET)
-    # The joint adjustment is its own Ceres problem rather than openMVG's
-    # bundle adjuster: anchors must stay fixed while tie points move, which
-    # openMVG's all-or-nothing structure option cannot express. Ceres is
-    # already installed for openMVG.
-    find_package(Ceres REQUIRED)
-    # The same core pgs-localize links, and C++20 through it.
-    add_executable(localize_joint
-        src/localize_joint.cpp
-        src/Npy.hpp
-        src/NpyArray.hpp)
-    target_link_libraries(localize_joint
-        localize_core
-        Boost::program_options
-        Ceres::ceres
-    )
-    set_target_properties(localize_joint PROPERTIES
-        OUTPUT_NAME "pgs-localize-joint")
-endif()
+# hand-held view-set localization (ADR 0013)
+# The joint adjustment is its own Ceres problem rather than openMVG's bundle
+# adjuster: anchors must stay fixed while tie points move, which openMVG's
+# all-or-nothing structure option cannot express. It needs an installed Ceres:
+# the superbuild's (BUILD_CERES, on by default) or the system's. openMVG's
+# internal copy, which it builds when it finds no Ceres, is not installed for
+# find_package.
+find_package(Ceres REQUIRED)
+# The same core pgs-localize links, and C++20 through it.
+add_executable(localize_joint
+    src/localize_joint.cpp
+    src/Npy.hpp
+    src/NpyArray.hpp)
+target_link_libraries(localize_joint
+    localize_core
+    Boost::program_options
+    Ceres::ceres
+)
+set_target_properties(localize_joint PROPERTIES
+    OUTPUT_NAME "pgs-localize-joint")
 
 # install
 include(GNUInstallDirs)
@@ -270,7 +268,5 @@ install(TARGETS
     sfm_orient
     gen_aruco_markers
     decimate
+    localize_joint
 )
-if(PGS_BUILD_VIEWSET)
-    install(TARGETS localize_joint)
-endif()

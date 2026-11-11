@@ -103,7 +103,7 @@ work.
 
 | piece | language | role |
 | --- | --- | --- |
-| `pgs-localize-joint` ([`localize_joint.cpp`](../dependencies/utilities/src/localize_joint.cpp)) | C++ | the math: rendering, matching, the joint solve, QA. Built only with `-DPGS_BUILD_VIEWSET=ON` (off by default) |
+| `pgs-localize-joint` ([`localize_joint.cpp`](../dependencies/utilities/src/localize_joint.cpp)) | C++ | the math: rendering, matching, the joint solve, QA. Built with the other C++ tools |
 | [`pgs_recon/viewset/`](../pgs_recon/viewset/) | Python | the orchestration: decides what runs, in what order, with which files. Its entry point is `pgs-localize-set` |
 | `pgs-localize-field` ([`viewset/field.py`](../pgs_recon/viewset/field.py)) | Python | a diagnostic that shows how far off one photo is, tile by tile |
 
@@ -262,8 +262,9 @@ because they need `numpy` and `configargparse`.
   calibration of the camera (passed with `--fix-intrinsic`) is the reliable fix.
 - There is a known ~0.57 px offset between the test renderer and OpenMVS, which
   place pixel centers differently. It's documented and left for a separate fix.
-- `pgs-localize-joint` is **not in the published Docker image**. It has to be
-  built with `-DPGS_BUILD_VIEWSET=ON` (see the README).
+- `pgs-localize-joint` is built with the other C++ tools, so images built from
+  this branch have it; older images do not. It needs an installed Ceres, which
+  is why the superbuild now builds Ceres by default (`BUILD_CERES`).
 
 ## 6. Where to read more
 
