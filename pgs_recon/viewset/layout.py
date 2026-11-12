@@ -73,10 +73,22 @@ def virtual_overhead_position_map(output: Path) -> Path:
     return reference_dir(output) / 'virtual_overhead_position.npy'
 
 
-def vignette_mask(output: Path) -> Path:
-    """The lens vignette's mask, made from the set's first image
-    (:mod:`.vignette`)."""
-    return reference_dir(output) / 'vignette_mask.png'
+def vignette_dir(output: Path) -> Path:
+    """The lens vignette's masks, one per lens setup the set was shot with
+    (:mod:`.vignette`). Not ``reference/vignette_mask.png``, the single mask
+    runs before it made from the first image, so no run reuses that one."""
+    return reference_dir(output) / 'vignette'
+
+
+def vignette_group_mask(output: Path, group: int) -> Path:
+    """The mask one lens setup's images voted for."""
+    return vignette_dir(output) / f'group_{group:03d}.png'
+
+
+def vignette_report(output: Path) -> Path:
+    """Which images are in which lens setup, and how well each image's own
+    vignette agreed with its group's mask."""
+    return vignette_dir(output) / 'groups.json'
 
 
 # --- Hand-held structure (Decision 3) --------------------------------------

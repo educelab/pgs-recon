@@ -313,6 +313,24 @@ resolution. The run's mask is undistorted per view and handed to `TextureMesh` b
 each image, because without it the lens vignette's corners textured the plate's
 margins.
 
+*Amended: the vignette mask is voted, per lens setup.* `--vignette-mask` used
+to make one mask from the set's first image: the dark region connected to its
+corners. On PHerc 2 Cr01 that image had dark papyrus touching its left edge, so
+the mask swallowed a band about 720 px wide down the left of every view (14.6%
+of the frame against the vignette's 2.5%); the strip ends were matched by
+nothing and textured by nothing. Every image now finds its own vignette, and a
+pixel is masked where at least 85% of the images shot with the same lens setup
+agree. The papyrus moves between shots and the vignette does not, so the vote
+removes it. Short of unanimity, so one overexposed shot cannot shrink the mask.
+Setups are told apart by image size and by how far the vignette reaches in
+along each corner's diagonal (median of the four differences, so one corner
+touched by papyrus does not move an image): on the same plate, the 1000 nm
+close-ups' vignette reaches about 55 px further than the hand-held shots', and
+voting the two together sized a mask for neither. Each image's own vignette is
+scored against its group's (`reference/vignette/groups.json`), and one that
+disagrees is logged. The mask is now one of each view's localization inputs:
+it was not, so a changed mask silently kept every pose made under the old one.
+
 ### 8. An optional component, in this repository
 
 Nothing in `pgs-recon`'s pipeline changes: this runs after a finished

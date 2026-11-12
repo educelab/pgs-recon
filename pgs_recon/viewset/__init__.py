@@ -13,7 +13,8 @@ Module map:
   that makes available.
 - :mod:`.overhead` -- the virtual overhead: a camera above the reference mesh,
   for a plate with no registered overhead capture.
-- :mod:`.vignette` -- the lens vignette's mask (OpenCV).
+- :mod:`.vignette` -- the lens vignette's masks, one voted per lens setup
+  (OpenCV).
 - :mod:`.groups` -- the hand-held match graph split into connected groups and
   singletons (Decision 3).
 - :mod:`.manifest` -- provenance and per-view resume (Decision 7, 8).

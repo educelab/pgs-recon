@@ -49,7 +49,7 @@ class Options(NamedTuple):
     fix_intrinsic: bool = False     # hold K at ``camera`` (board-calibrated)
     focal_sweep: Optional[str] = None
     mask: Optional[Path] = None     # query pixels never to match (sample square)
-    vignette_mask: bool = False     # make ``mask`` from the set's lens vignette
+    vignette_mask: bool = False     # vote a vignette mask per lens setup
     threads: Optional[int] = None
     skip_texture: bool = False
     combined_texture: bool = False  # also one mesh textured from every view
@@ -74,8 +74,7 @@ def run(plate: PlateInputs, strategy: Strategy, output: Path,
     else:
         position_map = render_overhead_position_map(plate, reference, output,
                                                      opts)
-    if opts.vignette_mask:
-        opts = opts._replace(mask=make_vignette_mask(plate, output))
+    masks = view_masks(plate, output, opts)
     _check_provenance(meta, plate, reference)
     manifest.write(meta_path, meta)
 
@@ -85,8 +84,8 @@ def run(plate: PlateInputs, strategy: Strategy, output: Path,
     # Each view is localized against the mesh alone, needing nothing from the
     # groups -- so it runs first, and a set's views are localized even while
     # the group solve below is unbuilt or fails.
-    localized = localize_views(plate, reference, position_map, camera, output,
-                               opts, meta, meta_path)
+    localized = localize_views(plate, reference, position_map, camera, masks,
+                               output, opts, meta, meta_path)
 
     split, tie_scenes = reconstruct_groups(imported, localized, output, opts)
     meta['groups'] = {'groups': [list(g) for g in split.groups],
@@ -100,7 +99,8 @@ def run(plate: PlateInputs, strategy: Strategy, output: Path,
     if not opts.skip_texture:
         texture_views(plate, localized, output, meta, meta_path)
         if opts.combined_texture:
-            texture_combined(plate, localized, output, opts, meta, meta_path)
+            texture_combined(plate, localized, masks, output, opts, meta,
+                             meta_path)
 
 
 # --- Phase 0: the IR reference (Decision 2) ---------------------------------
@@ -200,18 +200,89 @@ def render_virtual_overhead(plate: PlateInputs, reference: Path,
     return plate._replace(overhead=Overhead(cal, image)), position_map
 
 
-def make_vignette_mask(plate: PlateInputs, output: Path) -> Path:
-    """The lens vignette's mask, made once from the set's first image."""
-    target = layout.vignette_mask(output)
-    if target.exists():
-        logger.info(f'Vignette mask exists, reusing: {target}')
-        return target
+def view_masks(plate: PlateInputs, output: Path,
+               opts: Options) -> Dict[str, Path]:
+    """Each view's mask, by stem: ``--mask`` for every view, its lens setup's
+    voted vignette mask, or none at all."""
+    if opts.mask is not None:
+        return {p.stem: opts.mask for p in plate.images}
+    if opts.vignette_mask:
+        return make_vignette_masks(plate, output)
+    return {}
+
+
+def make_vignette_masks(plate: PlateInputs, output: Path) -> Dict[str, Path]:
+    """The lens vignette's masks, one per lens setup, each voted for by every
+    image shot with it (:mod:`.vignette`).
+
+    Remade whenever an image or a voting parameter changed -- never reused
+    just because a mask exists, which is how a mask made from one image used
+    to outlive that image's removal. A remade mask whose pixels did not change
+    is not rewritten, so views localized through it stay current.
+    """
     # OpenCV only when asked for: the rest of the planner runs without it.
-    from pgs_recon.viewset.vignette import write_vignette_mask
-    masked = write_vignette_mask(plate.images[0], target)
-    logger.info(f'Vignette mask from {plate.images[0].name}: '
-                f'{100 * masked:.1f}% masked -> {target}')
-    return target
+    from pgs_recon.viewset import vignette
+    report_path = layout.vignette_report(output)
+    record = layout.inputs_record(report_path)
+    inputs = {f'image:{p.stem}': manifest.fingerprint(p)
+              for p in plate.images}
+    inputs['parameters'] = {
+        'path': 'parameters', 'dark': vignette.DARK, 'grow': vignette.GROW,
+        'quorum': vignette.QUORUM, 'split': vignette.SPLIT,
+        'split_min_px': vignette.SPLIT_MIN_PX}
+    reason = manifest.artifact_stale_reason((report_path,), record, inputs)
+    if reason is None:
+        report = json.loads(report_path.read_text())
+        masks = {stem: report_path.parent / g['mask']
+                 for g in report['groups'] for stem in g['members']}
+        if all(m.exists() for m in masks.values()):
+            logger.info(f'Vignette masks current, reusing: {report_path}')
+            return masks
+        reason = 'a group mask is missing'
+
+    logger.info(f'Voting vignette masks over {len(plate.images)} images '
+                f'({reason})')
+    groups = vignette.vignette_masks(plate.images)
+    masks: Dict[str, Path] = {}
+    report = {'notes': 'One mask per lens setup. "agreement" is each image\'s '
+                       'own vignette against its group\'s mask '
+                       '(intersection-over-union); below '
+                       f'{vignette.AGREE} the image disagreed, and the vote '
+                       'decided for it.',
+              'groups': []}
+    for k, g in enumerate(groups):
+        target = layout.vignette_group_mask(output, k)
+        vignette.write_mask(g.mask, target)
+        stems = [p.stem for p in g.members]
+        masks.update({s: target for s in stems})
+        masked = float((g.mask == 0).mean())
+        disagreeing = {p.stem: a for p, a in g.agreement.items()
+                       if a < vignette.AGREE}
+        report['groups'].append({
+            'mask': target.name, 'members': stems,
+            'masked_fraction': round(masked, 4),
+            'corner_reach_px': g.reach,
+            'agreement': {p.stem: a for p, a in g.agreement.items()},
+            'disagreeing': sorted(disagreeing)})
+        logger.info(f'Vignette group {k}: {len(stems)} image(s), '
+                    f'{100 * masked:.1f}% masked, corner reach {g.reach} px '
+                    f'-> {target}')
+        if len(stems) < 3:
+            logger.warning(f'Vignette group {k} has {len(stems)} image(s); '
+                           f'too few to outvote dark scene at a corner: '
+                           f'{", ".join(stems)}')
+        for stem, a in sorted(disagreeing.items()):
+            logger.warning(f'Vignette group {k}: {stem}\'s own vignette '
+                           f'overlaps the group mask by only {a:.2f}; '
+                           f'something dark touches its corners, or it is '
+                           f'exposed differently. The vote decided for it.')
+    if len(groups) > 1:
+        logger.warning(f'The set looks like {len(groups)} lens setups '
+                       f'(different vignettes); each gets its own mask. See '
+                       f'{report_path}')
+    manifest.write(report_path, report)
+    manifest.record_artifact(record, inputs)
+    return masks
 
 
 def _check_provenance(meta: Dict, plate: PlateInputs, reference: Path) -> None:
@@ -469,20 +540,26 @@ def _subset_scene(imported: Path, members: set, out: Path,
 
 
 def localize_views(plate: PlateInputs, reference: Path, position_map: Path,
-                   camera: Path, output: Path, opts: Options, meta: Dict,
-                   meta_path: Path) -> List[str]:
+                   camera: Path, masks: Dict[str, Path], output: Path,
+                   opts: Options, meta: Dict, meta_path: Path) -> List[str]:
     """Localize every view against the mesh alone, resuming where possible.
 
     One view failing does not stop the others (Decision 6: a view that fails
     is reported and not emitted). Returns the stems that succeeded.
+
+    A view's mask is one of its inputs: no feature is taken under it, so a
+    changed mask is a changed localization.
     """
     done = []
     for image in plate.images:
         stem = image.stem
+        mask = masks.get(stem)
         inputs = {'image': manifest.fingerprint(image),
                   'reference': manifest.fingerprint(reference),
                   'position_map': manifest.fingerprint(position_map),
                   'camera': manifest.fingerprint(camera)}
+        if mask is not None:
+            inputs['mask'] = manifest.fingerprint(mask)
         record = meta['views'].get(stem)
         reason = manifest.stale_reason(record, inputs)
         if reason is None:
@@ -506,7 +583,7 @@ def localize_views(plate: PlateInputs, reference: Path, position_map: Path,
                 output_correspondences=layout.view_correspondences(output,
                                                                    stem),
                 report=layout.view_report(output, stem),
-                mask=opts.mask,
+                mask=mask,
                 output_camera=layout.view_camera(output, stem),
                 qa_render=layout.view_qa_render(output, stem),
                 threads=opts.threads)
@@ -679,17 +756,18 @@ def texture_views(plate: PlateInputs, stems: Sequence[str], output: Path,
         manifest.write(meta_path, meta)
 
 
-def texture_combined(plate: PlateInputs, stems: Sequence[str], output: Path,
-                     opts: Options, meta: Dict, meta_path: Path) -> None:
+def texture_combined(plate: PlateInputs, stems: Sequence[str],
+                     masks: Dict[str, Path], output: Path, opts: Options,
+                     meta: Dict, meta_path: Path) -> None:
     """One mesh textured from every localized view at once, by OpenMVS.
 
     ``TextureMesh`` gives each face to the one view that sees it best and
     levels the brightness steps between views; it never averages two views, so
     a residual misregistration shows as a step at a seam rather than a ghost.
-    The run's mask, when it has one, keeps those pixels out here too -- without
-    it the lens vignette's dark corners texture the plate's margins.
+    Each view's mask, when the run has them, keeps those pixels out here too --
+    without it the lens vignette's dark corners texture the plate's margins.
 
-    Redone only when a calibration, an image, the mesh or the mask changed.
+    Redone only when a calibration, an image, the mesh or a mask changed.
     Failing does not fail the run: the per-view meshes are already written.
     """
     if len(stems) < 2:
@@ -703,8 +781,8 @@ def texture_combined(plate: PlateInputs, stems: Sequence[str], output: Path,
     inputs.update({f'image:{s}': manifest.fingerprint(by_stem[s])
                    for s in stems})
     inputs['mesh'] = manifest.fingerprint(plate.mesh)
-    if opts.mask is not None:
-        inputs['mask'] = manifest.fingerprint(opts.mask)
+    inputs.update({f'mask:{s}': manifest.fingerprint(masks[s])
+                   for s in stems if s in masks})
     reason = manifest.stale_reason(meta.get('combined'), inputs)
     if reason is None:
         logger.info('Combined texture: current, skipping')
@@ -714,7 +792,8 @@ def texture_combined(plate: PlateInputs, stems: Sequence[str], output: Path,
     manifest.write(meta_path, meta)
 
     try:
-        _texture_combined(plate, stems, calibrations, by_stem, output, opts)
+        _texture_combined(plate, stems, calibrations, by_stem, masks, output,
+                          opts)
     except (ToolFailed, OSError, ValueError) as e:
         meta['combined']['status'] = 'failed'
         logger.error(f'Combined texture failed: {e}')
@@ -726,7 +805,8 @@ def texture_combined(plate: PlateInputs, stems: Sequence[str], output: Path,
 
 def _texture_combined(plate: PlateInputs, stems: Sequence[str],
                       calibrations: Sequence[Path], by_stem: Dict[str, Path],
-                      output: Path, opts: Options) -> None:
+                      masks: Dict[str, Path], output: Path,
+                      opts: Options) -> None:
     sources = layout.combined_sources(output)
     # Undistortion reads pixels, so the scene reads 8-bit copies.
     names = [prepare_8bit_image(by_stem[s], sources).name for s in stems]
@@ -738,8 +818,10 @@ def _texture_combined(plate: PlateInputs, stems: Sequence[str],
     undistorted = layout.combined_undistorted(output)
     openmvg.mvg_to_mvs(sfm, scene=scene, images_dir=undistorted,
                        threads=opts.threads)
-    if opts.mask is not None:
-        _write_undistorted_masks(calibrations, stems, opts.mask, undistorted)
+    masked = [(s, c, masks[s]) for s, c in zip(stems, calibrations)
+              if s in masks]
+    if masked:
+        _write_undistorted_masks(masked, undistorted)
 
     # Staged as combined_input.ply, the binary PLY TextureMesh reads reliably.
     mesh = ensure_ply_mesh(plate.mesh, layout.combined_dir(output),
@@ -750,8 +832,7 @@ def _texture_combined(plate: PlateInputs, stems: Sequence[str],
     openmvs.mvs_texture(scene, mesh=mesh, output=layout.combined_mesh(output),
                         export_type='obj', resolution_level=0,
                         global_seam_leveling=1, local_seam_leveling=0,
-                        ignore_mask_label=(MASKED if opts.mask is not None
-                                           else None),
+                        ignore_mask_label=MASKED if masked else None,
                         max_threads=opts.threads)
 
 
@@ -760,10 +841,11 @@ def _texture_combined(plate: PlateInputs, stems: Sequence[str],
 MASKED = 0
 
 
-def _write_undistorted_masks(calibrations: Sequence[Path], stems: Sequence[str],
-                             mask: Path, undistorted: Path) -> None:
-    """``mask``, undistorted with each view's K, beside that view's undistorted
-    image -- where ``TextureMesh`` looks for it (``<stem>.mask.png``).
+def _write_undistorted_masks(views: Sequence[Tuple[str, Path, Path]],
+                             undistorted: Path) -> None:
+    """Each view's mask, undistorted with its K, beside that view's
+    undistorted image -- where ``TextureMesh`` looks for it
+    (``<stem>.mask.png``). ``views`` is (stem, calibration, mask) triples.
 
     The mask is drawn on the original image, but OpenMVS reads the undistorted
     one. The border undistortion leaves empty comes out masked too, which is
@@ -772,7 +854,7 @@ def _write_undistorted_masks(calibrations: Sequence[Path], stems: Sequence[str],
     # OpenCV only when asked for: the rest of the planner runs without it.
     import cv2
     from pgs_recon.viewset.field import undistort
-    for stem, calibration in zip(stems, calibrations):
+    for stem, calibration, mask in views:
         warped = undistort(calibration, mask)
         binary = ((warped > 127) * 255).astype('uint8')
         target = undistorted / f'{stem}.mask.png'

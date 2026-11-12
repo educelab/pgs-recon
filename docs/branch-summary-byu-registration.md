@@ -197,8 +197,9 @@ only 1–3° from straight down ("near-nadir").
 Running Cr04 had needed one-off scripts. They became flags:
 - `--virtual-overhead`: render the overhead from the mesh when the plate has no
   real registered overhead photo.
-- `--vignette-mask`: build a mask of the lens's dark corners (vignette) from the
-  first photo.
+- `--vignette-mask`: build a mask of the lens's dark corners (vignette). Since
+  amended: every photo votes, one mask per lens setup (ADR 0013, Decision 7
+  amendment), after one dark first photo masked a quarter of every view.
 - `pgs-localize-field`: a diagnostic replacing two scripts.
 - macOS's hidden `._*` files are no longer mistaken for photos.
 

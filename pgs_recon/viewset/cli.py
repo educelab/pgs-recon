@@ -91,8 +91,9 @@ def _parser() -> configargparse.ArgumentParser:
                        help='Image whose zero pixels are never matched (the '
                             'sample square).')
     solve.add_argument('--vignette-mask', action='store_true',
-                       help='Make --mask from the lens vignette: the dark '
-                            'region at the corners of the set\'s first image.')
+                       help='Mask the lens vignette: the dark region at the '
+                            'image corners, voted on by every image shot with '
+                            'the same lens setup, one mask per setup.')
 
     parser.add_argument('--skip-texture', action='store_true',
                         help='Stop after the calibrations.')
