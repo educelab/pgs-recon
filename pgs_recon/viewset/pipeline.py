@@ -13,10 +13,13 @@ Everything else stops the run.
 """
 import json
 import logging
+import os
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import (Callable, Dict, List, NamedTuple, Optional, Sequence,
+                    Tuple)
 
 from pgs_recon import openmvg, openmvs, toolchain
 from pgs_recon.toolchain import cam_db, run as run_tool
@@ -51,6 +54,7 @@ class Options(NamedTuple):
     mask: Optional[Path] = None     # query pixels never to match (sample square)
     vignette_mask: bool = False     # vote a vignette mask per lens setup
     threads: Optional[int] = None
+    jobs: int = 1                   # views localized or textured at once
     skip_texture: bool = False
     combined_texture: bool = False  # also one mesh textured from every view
 
@@ -97,7 +101,8 @@ def run(plate: PlateInputs, strategy: Strategy, output: Path,
     qa_views(plate, strategy, reference, localized, output, opts, meta,
              meta_path)
     if not opts.skip_texture:
-        texture_views(plate, localized, output, meta, meta_path)
+        texture_views(plate, localized, output, meta, meta_path,
+                      jobs=opts.jobs)
         if opts.combined_texture:
             texture_combined(plate, localized, masks, output, opts, meta,
                              meta_path)
@@ -539,6 +544,74 @@ def _subset_scene(imported: Path, members: set, out: Path,
 # --- Phase 3: per-view localization (Decision 2) ----------------------------
 
 
+def describe_overhead(plate: PlateInputs, position_map: Path,
+                      output: Path) -> Optional[Path]:
+    """The overhead's features, described once for every view's prior.
+
+    Describing the whole-plate overhead is the most expensive single step of a
+    view, and the same for each. This is a cache, not a result: a view without
+    it describes the overhead identically, so it is none of a view's inputs,
+    and failing to make it costs time only -- ``None``, and each view
+    describes for itself. The binary is one of its inputs because how it
+    describes lives there.
+    """
+    target = layout.overhead_features(output)
+    record = layout.inputs_record(target)
+    try:
+        inputs = {'overhead_image': manifest.fingerprint(plate.overhead.image),
+                  'position_map': manifest.fingerprint(position_map),
+                  'binary': manifest.fingerprint(
+                      toolchain.resolve_exe(tools.BINARY))}
+        reason = manifest.artifact_stale_reason((target,), record, inputs)
+        if reason is None:
+            logger.info(f'Overhead features current, reusing: {target}')
+            return target
+        logger.info(f'Describing the overhead once for every view ({reason}): '
+                    f'{target}')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tools.overhead_features(plate.overhead.image, position_map, target)
+    except Exception as e:  # ToolFailed, or a missing binary
+        logger.warning(f'Could not describe the overhead once ({e}); each '
+                       f'view will describe it itself')
+        return None
+    manifest.record_artifact(record, inputs)
+    return target
+
+
+def _available_cpus() -> int:
+    """CPUs this process may run on: a Slurm allocation, not the node."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:  # macOS has no affinity
+        return os.cpu_count() or 1
+
+
+def _threads_per_job(opts: Options) -> Optional[int]:
+    """Each concurrent view's share of ``--threads``, so ``--jobs`` views
+    together use about what one view alone would. One job keeps
+    ``--threads`` as given, unset included."""
+    if opts.jobs <= 1:
+        return opts.threads
+    return max(1, (opts.threads or _available_cpus()) // opts.jobs)
+
+
+def _run_each(jobs: Dict[str, Callable[[], None]], workers: int,
+              finished: Callable[[str, Optional[BaseException]], None]) -> None:
+    """Run each job, up to ``workers`` at once, and call ``finished(stem,
+    error)`` as each ends -- ``error`` is ``None`` for a success.
+
+    Threads, because every job is a subprocess and the GIL is released while
+    it runs. ``finished`` always runs on *this* thread, so it may update and
+    write the manifest without a lock: the jobs themselves touch nothing
+    shared but the command log, which locks itself
+    (:class:`toolchain.Recorder`).
+    """
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(job): stem for stem, job in jobs.items()}
+        for future in as_completed(futures):
+            finished(futures[future], future.exception())
+
+
 def localize_views(plate: PlateInputs, reference: Path, position_map: Path,
                    camera: Path, masks: Dict[str, Path], output: Path,
                    opts: Options, meta: Dict, meta_path: Path) -> List[str]:
@@ -550,7 +623,8 @@ def localize_views(plate: PlateInputs, reference: Path, position_map: Path,
     A view's mask is one of its inputs: no feature is taken under it, so a
     changed mask is a changed localization.
     """
-    done = []
+    done = set()
+    todo = {}
     for image in plate.images:
         stem = image.stem
         mask = masks.get(stem)
@@ -560,42 +634,68 @@ def localize_views(plate: PlateInputs, reference: Path, position_map: Path,
                   'camera': manifest.fingerprint(camera)}
         if mask is not None:
             inputs['mask'] = manifest.fingerprint(mask)
-        record = meta['views'].get(stem)
-        reason = manifest.stale_reason(record, inputs)
+        reason = manifest.stale_reason(meta['views'].get(stem), inputs)
         if reason is None:
             logger.info(f'{stem}: current, skipping')
-            done.append(stem)
+            done.add(stem)
             continue
         logger.info(f'{stem}: localizing ({reason})')
-
         layout.view_dir(output, stem).mkdir(parents=True, exist_ok=True)
-        record = {'inputs': inputs, 'status': 'running'}
-        meta['views'][stem] = record
-        manifest.write(meta_path, meta)
-        try:
-            tools.localize_view(
-                image, reference,
-                overhead_image=plate.overhead.image,
-                overhead_calibration=plate.overhead.calibration,
-                overhead_position_map=position_map,
-                camera=camera,
-                output_calibration=layout.view_calibration(output, stem),
-                output_correspondences=layout.view_correspondences(output,
-                                                                   stem),
-                report=layout.view_report(output, stem),
-                mask=mask,
-                output_camera=layout.view_camera(output, stem),
-                qa_render=layout.view_qa_render(output, stem),
-                threads=opts.threads)
-        except Exception as e:  # ToolFailed, or a missing binary
-            record['status'] = 'failed'
-            record['error'] = str(e)
-            logger.error(f'{stem}: {e}')
-        else:
+        meta['views'][stem] = {'inputs': inputs, 'status': 'running'}
+        todo[stem] = (image, mask)
+    stems = [image.stem for image in plate.images]
+    if not todo:
+        return _in_plate_order(stems, done)
+    manifest.write(meta_path, meta)
+
+    # Only now, so a resume with every view current spends nothing on it.
+    features = describe_overhead(plate, position_map, output)
+    threads = _threads_per_job(opts)
+
+    def localize(stem: str, image: Path, mask: Optional[Path]) -> None:
+        tools.localize_view(
+            image, reference,
+            overhead_image=plate.overhead.image,
+            overhead_calibration=plate.overhead.calibration,
+            overhead_position_map=position_map,
+            camera=camera,
+            output_calibration=layout.view_calibration(output, stem),
+            output_correspondences=layout.view_correspondences(output, stem),
+            report=layout.view_report(output, stem),
+            mask=mask,
+            overhead_features=features,
+            output_camera=layout.view_camera(output, stem),
+            qa_render=layout.view_qa_render(output, stem),
+            threads=threads,
+            log=layout.view_log(output, stem))
+
+    def finished(stem: str, error: Optional[BaseException]) -> None:
+        record = meta['views'][stem]
+        if error is None:
             record['status'] = 'done'
-            done.append(stem)
+            done.add(stem)
+            logger.info(f'{stem}: localized')
+        elif isinstance(error, Exception):  # ToolFailed, or a missing binary
+            record['status'] = 'failed'
+            record['error'] = str(error)
+            logger.error(f'{stem}: {error} -- see {layout.view_log(output, stem)}')
+        else:  # KeyboardInterrupt and the like: stop the run
+            raise error
         manifest.write(meta_path, meta)
-    return done
+
+    if opts.jobs > 1:
+        logger.info(f'Localizing {len(todo)} views, {opts.jobs} at a time')
+    _run_each({stem: (lambda stem=stem, image=image, mask=mask:
+                      localize(stem, image, mask))
+               for stem, (image, mask) in todo.items()},
+              opts.jobs, finished)
+    return _in_plate_order(stems, done)
+
+
+def _in_plate_order(order: Sequence[str], chosen) -> List[str]:
+    """``chosen``, in ``order``'s order: views finish in any order when they
+    run side by side, and everything downstream reads them in the plate's."""
+    return [stem for stem in order if stem in chosen]
 
 
 # --- Phase 4: joint adjustment (Decision 4, 5) ------------------------------
@@ -719,15 +819,16 @@ def qa_views(plate: PlateInputs, strategy: Strategy, reference: Path,
 
 
 def texture_views(plate: PlateInputs, stems: Sequence[str], output: Path,
-                  meta: Dict, meta_path: Path) -> None:
+                  meta: Dict, meta_path: Path, jobs: int = 1) -> None:
     """One projective-UV mesh per view, through ``pgs-retexture --calibration``,
     redone only for a view whose calibration, image or mesh changed.
 
     The deliverable texture is the hand-held image itself, so the mesh is the
     reconstruction's, not the IR reference. One view failing to texture does
-    not stop the others.
+    not stop the others. ``jobs`` views are textured at once.
     """
     by_stem = {p.stem: p for p in plate.images}
+    todo = {}
     for stem in stems:
         calibration = layout.view_adjusted_calibration(output, stem)
         inputs = {'calibration': manifest.fingerprint(calibration),
@@ -739,21 +840,38 @@ def texture_views(plate: PlateInputs, stems: Sequence[str], output: Path,
             logger.info(f'{stem}: texture current, skipping')
             continue
         logger.info(f'{stem}: texturing ({reason})')
-        target = layout.view_textured_mesh(output, stem)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        layout.view_textured_mesh(output, stem).parent.mkdir(parents=True,
+                                                             exist_ok=True)
         record['texture'] = {'inputs': inputs, 'status': 'running'}
-        try:
-            run_tool(_retexture() + [
-                '-i', by_stem[stem], '--calibration', calibration,
-                '-r', plate.recon_dir, '--mesh', plate.mesh,
-                '--output-mesh', target,
-                '--working-dir', layout.view_dir(output, stem)])
-        except ToolFailed as e:
-            record['texture']['status'] = 'failed'
-            logger.error(f'{stem}: texturing failed: {e}')
+        todo[stem] = calibration
+    if not todo:
+        return
+    manifest.write(meta_path, meta)
+
+    def texture(stem: str, calibration: Path) -> None:
+        run_tool(_retexture() + [
+            '-i', by_stem[stem], '--calibration', calibration,
+            '-r', plate.recon_dir, '--mesh', plate.mesh,
+            '--output-mesh', layout.view_textured_mesh(output, stem),
+            '--working-dir', layout.view_dir(output, stem)],
+            log=layout.view_texture_log(output, stem))
+
+    def finished(stem: str, error: Optional[BaseException]) -> None:
+        record = meta['views'][stem]['texture']
+        if error is None:
+            record['status'] = 'done'
+        elif isinstance(error, ToolFailed):
+            record['status'] = 'failed'
+            logger.error(f'{stem}: texturing failed: {error} -- see '
+                         f'{layout.view_texture_log(output, stem)}')
         else:
-            record['texture']['status'] = 'done'
+            raise error
         manifest.write(meta_path, meta)
+
+    _run_each({stem: (lambda stem=stem, calibration=calibration:
+                      texture(stem, calibration))
+               for stem, calibration in todo.items()},
+              jobs, finished)
 
 
 def texture_combined(plate: PlateInputs, stems: Sequence[str],

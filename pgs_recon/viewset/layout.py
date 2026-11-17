@@ -54,6 +54,13 @@ def overhead_position_map(output: Path) -> Path:
     return reference_dir(output) / 'overhead_position.npy'
 
 
+def overhead_features(output: Path) -> Path:
+    """The overhead image's features, described once for every view's prior
+    rather than once per view. One name for a registered and a virtual
+    overhead: its inputs record names the position map it was made through."""
+    return reference_dir(output) / 'overhead_features.npy'
+
+
 def virtual_overhead_calibration(output: Path) -> Path:
     """The virtual camera above the IR reference mesh (:mod:`.overhead`), when
     the plate has no registered overhead capture."""
@@ -149,6 +156,18 @@ def group_filtered_matches(output: Path, index: int) -> Path:
 
 def view_dir(output: Path, stem: str) -> Path:
     return output / 'views' / stem
+
+
+def view_log(output: Path, stem: str) -> Path:
+    """What ``pgs-localize-joint view`` printed localizing ``stem``. A file
+    rather than the run's own output, because views run side by side."""
+    return view_dir(output, stem) / f'{stem}_view.log'
+
+
+def view_texture_log(output: Path, stem: str) -> Path:
+    """What ``pgs-retexture`` printed texturing ``stem``, for the same
+    reason as :func:`view_log`."""
+    return view_dir(output, stem) / f'{stem}_retexture.log'
 
 
 def view_calibration(output: Path, stem: str) -> Path:

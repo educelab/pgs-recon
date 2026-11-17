@@ -26,6 +26,7 @@
  */
 
 #include <cstddef>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -140,6 +141,26 @@ struct ReferenceFeatures {
  */
 auto DescribeReference(const Render& reference, const MatchOptions& opts,
                        const cv::Mat& mask = {}) -> ReferenceFeatures;
+
+/// Columns of a saved feature table: x, y, scale and orientation, then the
+/// descriptor's 128 bytes.
+inline constexpr int kFeatureColumns = 4 + 128;
+
+/**
+ * @brief Save a reference's described features, so another process can match
+ *        against them without describing the image again.
+ *
+ * An (N, 132) float32 `.npy`, one row per feature in kFeatureColumns' order.
+ * float32 holds a float and a byte exactly, so what LoadFeatures returns
+ * matches what was described bit for bit. Only the regions are kept, not the
+ * normalized image: that is for Lucas-Kanade, which a loaded set cannot use.
+ */
+void SaveFeatures(const std::filesystem::path& path,
+                  const ReferenceFeatures& features);
+
+/// Read what SaveFeatures wrote. The result's `norm` is empty, so it is for
+/// matching with `refineMatches` off.
+auto LoadFeatures(const std::filesystem::path& path) -> ReferenceFeatures;
 
 /**
  * @brief Match a described reference against a query and lift the survivors

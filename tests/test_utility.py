@@ -59,6 +59,15 @@ class TestRunCommand(unittest.TestCase):
         self.assertEqual(python('raise SystemExit(1)'),
                          ctx.exception.command)
 
+    def test_a_log_takes_the_childs_output(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / 'child.log'
+            run_command(python('import sys; print("out"); '
+                               'print("err", file=sys.stderr)'), log=log)
+            self.assertEqual(['err', 'out'], sorted(log.read_text().split()))
+
     def test_keyboard_interrupt_propagates(self):
         # The bare ``except`` this replaced swallowed Ctrl-C into an exit,
         # leaving a long run's interrupt indistinguishable from a tool failure.

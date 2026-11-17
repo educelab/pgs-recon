@@ -511,6 +511,11 @@ class TestRun(ToolchainCase):
             ['DensifyPointCloud', '-i', 'mvs/scene.mvs', '--archive-type', '-1'],
             cwd=None)
 
+    def test_a_log_is_forwarded(self):
+        run(['pgs-localize-joint'], log=self.tmp / 'view.log')
+        self.assertEqual(self.tmp / 'view.log',
+                         self.run_command.call_args.kwargs['log'])
+
     def test_the_working_directory_is_forwarded(self):
         run(['TextureMesh'], cwd=self.tmp)
         self.assertEqual(self.tmp, self.run_command.call_args.kwargs['cwd'])
@@ -578,6 +583,23 @@ class TestRecorder(unittest.TestCase):
         commands = {}
         Recorder(commands).note('Processing complete')
         self.assertEqual(['Processing complete'], list(commands.values()))
+
+    def test_concurrent_writers_lose_nothing(self):
+        # pgs-localize-set records views run side by side; every thread
+        # stamping the same microsecond is the case the lock exists for.
+        import threading
+        commands = {}
+        recorder = Recorder(commands)
+        with mock.patch('pgs_recon.toolchain.current_timestamp',
+                        return_value='same instant'):
+            threads = [threading.Thread(
+                target=lambda i=i: [recorder.command([f'view {i}'])
+                                    for _ in range(50)]) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(400, len(commands))
 
     def test_entries_accumulate_in_order(self):
         commands = {}

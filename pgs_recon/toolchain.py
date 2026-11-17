@@ -35,6 +35,7 @@ mean putting the tool *name* in the argv and resolving inside the runner. ADR
 0005 records why that seam is not built yet.
 """
 import os
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import MutableMapping, Optional, Sequence, Tuple, Union
@@ -296,14 +297,14 @@ class Recorder:
     binary invocations, but a run that cannot say how its scene was imported is
     no more reproducible for the distinction.
 
-    Not thread-safe: :meth:`_write`'s collision check is a read followed by a
-    write. Nothing runs stages concurrently today (``convert.py``'s pool is pure
-    image I/O and reaches no binary), so this is a note for whoever changes
-    that, not a live defect.
+    Thread-safe: ``pgs-localize-set`` runs views side by side, and
+    :meth:`_write`'s collision check is a read followed by a write, so it holds
+    a lock across both.
     """
 
     def __init__(self, commands: MutableMapping[str, str]):
         self._commands = commands
+        self._lock = threading.Lock()
 
     def command(self, command: Sequence) -> None:
         """Record an argv as a single readable line.
@@ -330,12 +331,13 @@ class Recorder:
         # drop the earlier one. Keys are only ever read by a human (see the
         # class docstring: consumers walk the values), so disambiguating one is
         # free.
-        stamp = key = current_timestamp()
-        n = 1
-        while key in self._commands:
-            n += 1
-            key = f'{stamp} ({n})'
-        self._commands[key] = entry
+        with self._lock:
+            stamp = key = current_timestamp()
+            n = 1
+            while key in self._commands:
+                n += 1
+                key = f'{stamp} ({n})'
+            self._commands[key] = entry
 
 
 def _argv_token(value) -> str:
@@ -357,7 +359,8 @@ def _argv_token(value) -> str:
 
 
 def run(command: Sequence, cwd: Optional[PathLike] = None,
-        recorder: Optional[Recorder] = None) -> None:
+        recorder: Optional[Recorder] = None,
+        log: Optional[PathLike] = None) -> None:
     """Record ``command``, then run it to completion.
 
     The single chokepoint every wrapper goes through, and so the single place
@@ -373,6 +376,9 @@ def run(command: Sequence, cwd: Optional[PathLike] = None,
     directory rather than to an output path. Their argv[0] comes from
     :func:`resolve_exe` and is absolute, which is what keeps ``cwd`` from
     changing which file gets executed.
+
+    ``log`` sends the child's output to a file rather than this process's
+    stdout, for binaries run side by side.
     """
     argv = [_argv_token(c) for c in command]
     rec = _recorder if recorder is None else recorder
@@ -380,4 +386,7 @@ def run(command: Sequence, cwd: Optional[PathLike] = None,
         rec.command(argv)
     # Called through the module global on purpose: patching
     # ``pgs_recon.toolchain.run_command`` is the test seam for argv assertions.
-    run_command(argv, cwd=cwd)
+    if log is None:
+        run_command(argv, cwd=cwd)
+    else:
+        run_command(argv, cwd=cwd, log=log)

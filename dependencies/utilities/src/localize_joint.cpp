@@ -3,12 +3,15 @@
  * @brief `pgs-localize-joint`: the in-process half of localizing a hand-held
  *        view set (ADR 0013).
  *
- * Three subcommands, one per thing that has to happen where openMVG, OpenCV and
+ * Five subcommands, one per thing that has to happen where openMVG, OpenCV and
  * the renderer live:
  *
  *   - **position-map**: render the mesh from the overhead view's pose once,
  *     keeping the world position per pixel. Every hand-held view's matches
  *     against the overhead image lift through it (Decision 2, item 2).
+ *   - **overhead-features**: describe the overhead image once, as `view`
+ *     would, so every view loads its features instead of describing a
+ *     whole-plate image again -- the most expensive single step of a view.
  *   - **view**: localize one hand-held image. Resect against the overhead
  *     image for a prior, then render-and-match against the IR reference mesh
  *     from that prior -- ADR 0011's chained mode with the overhead view in the
@@ -47,6 +50,9 @@
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
 
+#include <Eigen/Geometry>
+
+#include <opencv2/core/utility.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -318,6 +324,109 @@ auto positionMap(const std::vector<std::string>& argv) -> int
   return SUCCESS;
 }
 
+// --- the overhead, as the prior matches against it ----------------------------
+
+/**
+ * The prior's matching options, from the refinement's. The refinement is ADR
+ * 0011's render-and-match, so it takes that tool's measured defaults
+ * unchanged. The prior matches against a whole-plate image, so cascade hashing
+ * replaces brute force there: the overhead carries an order of magnitude more
+ * features than any render.
+ */
+auto PriorOptions(const loc::MatchOptions& refine) -> loc::MatchOptions
+{
+  auto prior = refine;
+  prior.matcher = openMVG::matching::CASCADE_HASHING_L2;
+  // No Lucas-Kanade on the prior: OpenCV's pyramidal LK needs both images the
+  // same size, which a render at the query's resolution always is and the
+  // overhead never is. Nor would it buy anything -- the prior only has to land
+  // inside render-and-match's basin (861 px, ADR 0011), and the refinement,
+  // whose sizes do match, keeps LK for the precision that is emitted. It is
+  // also what lets a view use features `overhead-features` saved.
+  prior.refineMatches = false;
+  return prior;
+}
+
+/**
+ * The overhead image and its position map, wrapped as a Render: an image and
+ * its position map is exactly what CorrespondFromReference lifts through, so
+ * the prior reuses the matcher ADR 0011 measured rather than a second one.
+ * `textured` marks the pixels that lift.
+ */
+auto ReadOverhead(const fs::path& image, const fs::path& positionMap)
+    -> loc::Render
+{
+  loc::Render overhead;
+  const auto raw = cv::imread(image.string(), cv::IMREAD_UNCHANGED);
+  if (raw.empty()) {
+    throw std::runtime_error("could not read " + image.string());
+  }
+  overhead.gray = loc::ToGray8(raw);
+  overhead.position = pgs::npy::readPositionMap(positionMap);
+  if (overhead.position.size() != overhead.gray.size()) {
+    throw std::runtime_error(
+        "the overhead position map is " +
+        std::to_string(overhead.position.cols) + "x" +
+        std::to_string(overhead.position.rows) + " but the image is " +
+        std::to_string(overhead.gray.cols) + "x" +
+        std::to_string(overhead.gray.rows) +
+        "; it was rendered for a different image");
+  }
+  cv::Mat finite;
+  cv::compare(overhead.position, overhead.position, finite, cv::CMP_EQ);
+  cv::extractChannel(finite, overhead.textured, 0);
+  return overhead;
+}
+
+/// Describe the overhead for the prior. Only pixels that lift can become
+/// correspondences; describing the rest costs time and adds nothing.
+auto DescribeOverhead(const loc::Render& overhead) -> loc::ReferenceFeatures
+{
+  return loc::DescribeReference(overhead, PriorOptions({}), overhead.textured);
+}
+
+// --- overhead-features -------------------------------------------------------
+
+auto overheadFeatures(const std::vector<std::string>& argv) -> int
+{
+  // clang-format off
+  po::options_description opts("overhead-features");
+  opts.add_options()
+    ("help,h", "print help message")
+    ("overhead-image", po::value<std::string>(), "the overhead view's 940 nm image, as `view` takes it")
+    ("overhead-position-map", po::value<std::string>(), "the overhead position map from `position-map`: features are kept only where it hit the surface")
+    ("output", po::value<std::string>(), "(N, 132) float32 .npy of the features, for `view --overhead-features`")
+  ;
+  // clang-format on
+  po::variables_map args;
+  if (const auto code = parseOrExit(
+          "overhead-features", opts, argv,
+          {"overhead-image", "overhead-position-map", "output"}, args);
+      code >= 0) {
+    return code;
+  }
+  if (not requireFiles(args, {"overhead-image", "overhead-position-map"})) {
+    return IO_ERROR;
+  }
+  try {
+    const auto overhead =
+        ReadOverhead(args["overhead-image"].as<std::string>(),
+                     args["overhead-position-map"].as<std::string>());
+    std::cout << "Describing the overhead image ("
+              << cv::countNonZero(overhead.textured) << " pixels on the mesh)"
+              << std::endl;
+    const auto features = DescribeOverhead(overhead);
+    const auto out = fs::path(args["output"].as<std::string>());
+    loc::SaveFeatures(out, features);
+    std::cout << "Wrote " << features.regions->RegionCount()
+              << " overhead features: " << out << "\n";
+  } catch (const std::exception& e) {
+    std::cerr << "ERROR: " << e.what() << "\n";
+    return IO_ERROR;
+  }
+  return SUCCESS;
+}
+
 // --- view --------------------------------------------------------------------
 
 /// One rung of the prior's scale ladder, as reported.
@@ -339,6 +448,7 @@ auto view(const std::vector<std::string>& argv) -> int
     ("overhead-image", po::value<std::string>(), "the overhead view's 940 nm image, matched against for the prior")
     ("overhead-calibration", po::value<std::string>(), "the overhead view's one-view calibration. Checked for size against the image and the position map")
     ("overhead-position-map", po::value<std::string>(), "the overhead position map from `position-map`")
+    ("overhead-features", po::value<std::string>(), "the overhead's features from `overhead-features`, made from this --overhead-image and --overhead-position-map. Unset describes the overhead here, identically -- and costs most of a view's time")
     ("camera", po::value<std::string>(), "starting K and distortion as a flat camera file (any pose in it is ignored). Required: a K resected from one near-planar view is degenerate (ADR 0011), and `adjust` refines this one jointly")
     ("output-calibration", po::value<std::string>(), "write the view's mesh-only one-view calibration here")
     ("output-correspondences", po::value<std::string>(), "write the inlier 2D<->3D correspondences here (.npy, N x 5 float64: x y X Y Z, x y in the query's own distorted pixels), the input to `adjust`")
@@ -364,7 +474,7 @@ auto view(const std::vector<std::string>& argv) -> int
   }
   if (not requireFiles(args, {"image", "mesh", "overhead-image",
                               "overhead-calibration", "overhead-position-map",
-                              "camera", "mask"})) {
+                              "overhead-features", "camera", "mask"})) {
     return IO_ERROR;
   }
   // No --sfm-transform here, deliberately: the position map was rendered in the
@@ -383,22 +493,11 @@ auto view(const std::vector<std::string>& argv) -> int
     return BAD_ARG;
   }
 
-  // Matching options. The refinement is ADR 0011's render-and-match, so it
-  // takes that tool's measured defaults unchanged. The prior matches against
-  // a whole-plate image, so cascade hashing replaces brute force there: the
-  // overhead carries an order of magnitude more features than any render.
   loc::MatchOptions refineOpts;
   if (args.count("seed")) {
     refineOpts.seed = args["seed"].as<unsigned int>();
   }
-  auto priorOpts = refineOpts;
-  priorOpts.matcher = openMVG::matching::CASCADE_HASHING_L2;
-  // No Lucas-Kanade on the prior: OpenCV's pyramidal LK needs both images the
-  // same size, which a render at the query's resolution always is and the
-  // overhead never is. Nor would it buy anything -- the prior only has to land
-  // inside render-and-match's basin (861 px, ADR 0011), and the refinement,
-  // whose sizes do match, keeps LK for the precision that is emitted.
-  priorOpts.refineMatches = false;
+  const auto priorOpts = PriorOptions(refineOpts);
   const auto solver = loc::ParseSolver("auto", true);
 
   // --- inputs ------------------------------------------------------------------
@@ -437,38 +536,16 @@ auto view(const std::vector<std::string>& argv) -> int
   std::cout << "Starting K:\n";
   loc::DescribeCamera(std::cout, camera);
 
-  // The overhead, wrapped as a Render: an image and its position map is
-  // exactly what CorrespondFromReference lifts through, so the prior reuses the
-  // matcher ADR 0011 measured rather than a second one.
   loc::Render overhead;
   try {
-    const auto overheadRaw =
-        cv::imread(path("overhead-image").string(), cv::IMREAD_UNCHANGED);
-    if (overheadRaw.empty()) {
-      throw std::runtime_error("could not read --overhead-image");
-    }
-    overhead.gray = loc::ToGray8(overheadRaw);
-    overhead.position = pgs::npy::readPositionMap(path("overhead-position-map"));
-    if (overhead.position.size() != overhead.gray.size()) {
-      throw std::runtime_error(
-          "the overhead position map is " +
-          std::to_string(overhead.position.cols) + "x" +
-          std::to_string(overhead.position.rows) + " but the image is " +
-          std::to_string(overhead.gray.cols) + "x" +
-          std::to_string(overhead.gray.rows) +
-          "; it was rendered for a different image");
-    }
+    overhead = ReadOverhead(path("overhead-image"),
+                            path("overhead-position-map"));
     const auto overheadCam =
         ReadCalibrationCamera(path("overhead-calibration"), std::nullopt);
     if (overheadCam.width != overhead.gray.cols or
         overheadCam.height != overhead.gray.rows) {
       throw std::runtime_error("--overhead-calibration is not this image's");
     }
-    // Only pixels that lift can become correspondences; describing the rest
-    // costs time and adds nothing.
-    cv::Mat finite;
-    cv::compare(overhead.position, overhead.position, finite, cv::CMP_EQ);
-    cv::extractChannel(finite, overhead.textured, 0);
   } catch (const std::exception& e) {
     std::cerr << "ERROR: " << e.what() << "\n";
     return IO_ERROR;
@@ -483,32 +560,71 @@ auto view(const std::vector<std::string>& argv) -> int
          << "  \"camera\": " << quote(path("camera").string()) << ",\n";
 
   // --- prior: the query against the overhead image, over a scale ladder --------
-  std::cout << "Describing the overhead image ("
-            << cv::countNonZero(overhead.textured) << " pixels on the mesh)"
-            << std::endl;
-  const auto overheadFeatures =
-      loc::DescribeReference(overhead, priorOpts, overhead.textured);
+  loc::ReferenceFeatures overheadFeatures;
+  if (args.count("overhead-features")) {
+    try {
+      overheadFeatures = loc::LoadFeatures(path("overhead-features"));
+    } catch (const std::exception& e) {
+      std::cerr << "ERROR: --overhead-features: " << e.what() << "\n";
+      return IO_ERROR;
+    }
+    // Cheap evidence it was made from this overhead: every feature must sit
+    // on a pixel that lifts. A different image's would not.
+    // Truncated, as openMVG's describer indexes its mask.
+    const auto& regions = *overheadFeatures.regions;
+    for (std::size_t i = 0; i < regions.RegionCount(); ++i) {
+      const auto at = regions.GetRegionPosition(i);
+      const auto x = static_cast<int>(at.x());
+      const auto y = static_cast<int>(at.y());
+      if (x < 0 or y < 0 or x >= overhead.gray.cols or
+          y >= overhead.gray.rows or
+          overhead.textured.at<unsigned char>(y, x) == 0) {
+        std::cerr << "ERROR: --overhead-features has a feature off this "
+                     "overhead's surface; it was made from another overhead\n";
+        return BAD_ARG;
+      }
+    }
+    std::cout << "Loaded the overhead's features: " << path("overhead-features")
+              << "\n";
+  } else {
+    std::cout << "Describing the overhead image ("
+              << cv::countNonZero(overhead.textured) << " pixels on the mesh)"
+              << std::endl;
+    overheadFeatures = DescribeOverhead(overhead);
+  }
   std::cout << "  " << overheadFeatures.regions->RegionCount()
             << " overhead features\n";
 
   const auto query01 = loc::ToGray01(queryRaw);
+  // The full-resolution query, normalized and described once. The ladder's
+  // scale 1 and the refinement both need exactly this: PriorOptions changes
+  // only how the prior matches, never how an image is described.
+  const auto queryNorm = loc::LocalNormalize(
+      query01, refineOpts.normalizeSigma, refineOpts.normalizeClip);
+  const auto queryRegions =
+      loc::DescribeImage(queryNorm, mask, refineOpts.preset);
+
   std::vector<ScaleTrial> trials;
   std::optional<loc::SolveResult> prior;
   double priorScale = 0.0;
   for (const auto s : scales) {
     ScaleTrial trial;
     trial.scale = s;
-    cv::Mat q01 = query01;
-    cv::Mat qMask = mask;
+    cv::Mat qNorm = queryNorm;
+    const openMVG::features::Regions* qRegions = queryRegions.get();
+    std::unique_ptr<openMVG::features::Regions> scaledRegions;
     if (s < 1.0) {
+      cv::Mat q01;
+      cv::Mat qMask;
       cv::resize(query01, q01, {}, s, s, cv::INTER_AREA);
       if (not mask.empty()) {
         cv::resize(mask, qMask, q01.size(), 0, 0, cv::INTER_NEAREST);
       }
+      qNorm = loc::LocalNormalize(q01, priorOpts.normalizeSigma,
+                                  priorOpts.normalizeClip);
+      scaledRegions = loc::DescribeImage(qNorm, qMask, priorOpts.preset);
+      qRegions = scaledRegions.get();
     }
-    const auto qNorm = loc::LocalNormalize(q01, priorOpts.normalizeSigma,
-                                           priorOpts.normalizeClip);
-    const auto qRegions = loc::DescribeImage(qNorm, qMask, priorOpts.preset);
     trial.queryFeatures = qRegions->RegionCount();
     auto corrs = loc::CorrespondFromReference(
         overhead, overheadFeatures, qNorm, *qRegions, priorOpts,
@@ -572,7 +688,6 @@ auto view(const std::vector<std::string>& argv) -> int
 
   loc::MeshBundle bundle;
   loc::Render render;
-  cv::Mat queryNorm;
   std::vector<loc::Correspondence> corrs;
   loc::MatchReport refineMatches;
   try {
@@ -581,16 +696,13 @@ auto view(const std::vector<std::string>& argv) -> int
       throw std::runtime_error("the mesh carries no usable texture");
     }
     render = loc::RenderMesh(bundle, priorCam, threads);
-    queryNorm = loc::LocalNormalize(query01, refineOpts.normalizeSigma,
-                                    refineOpts.normalizeClip);
-    const auto qRegions =
-        loc::DescribeImage(queryNorm, mask, refineOpts.preset);
     // The texture mask: no keypoint from the edge of an untextured region,
     // which exists in no photograph (ADR 0013 Decision 2).
     const auto renderFeatures =
         loc::DescribeReference(render, refineOpts, render.textured);
     corrs = loc::CorrespondFromReference(render, renderFeatures, queryNorm,
-                                         *qRegions, refineOpts, refineMatches);
+                                         *queryRegions, refineOpts,
+                                         refineMatches);
   } catch (const std::exception& e) {
     std::cerr << "ERROR: " << e.what() << "\n";
     return IO_ERROR;
@@ -1451,6 +1563,10 @@ constexpr std::size_t kQaMinTiles = 10;
 /// pixels. Nothing measured sets them yet (ADR 0013, Not settled).
 constexpr double kQaReviewPx = 1.0;
 constexpr double kQaFailPx = 3.0;
+/// The local normalization both images of a comparison get first: they are
+/// different exposures, possibly different bands.
+constexpr double kQaNormSigma = 15.0;
+constexpr double kQaNormClip = 3.0;
 
 /// One view as QA sees it: its solved camera and the image it was taken with.
 struct QaView {
@@ -1519,13 +1635,19 @@ auto OnIdealGrid(const QaView& v) -> cv::Mat
   const auto& c = v.camera;
   cv::Mat mapX(c.height, c.width, CV_32F);
   cv::Mat mapY(c.height, c.width, CV_32F);
-  for (int r = 0; r < c.height; ++r) {
-    for (int u = 0; u < c.width; ++u) {
-      const auto p = Distort(c, (u + 0.5 - c.cx) / c.fx, (r + 0.5 - c.cy) / c.fy);
-      mapX.at<float>(r, u) = static_cast<float>(p.x - 0.5);
-      mapY.at<float>(r, u) = static_cast<float>(p.y - 0.5);
+  // Each row is its own: nothing is shared, so rows run in parallel.
+  cv::parallel_for_(cv::Range(0, c.height), [&](const cv::Range& rows) {
+    for (int r = rows.start; r < rows.end; ++r) {
+      auto* xs = mapX.ptr<float>(r);
+      auto* ys = mapY.ptr<float>(r);
+      for (int u = 0; u < c.width; ++u) {
+        const auto p =
+            Distort(c, (u + 0.5 - c.cx) / c.fx, (r + 0.5 - c.cy) / c.fy);
+        xs[u] = static_cast<float>(p.x - 0.5);
+        ys[u] = static_cast<float>(p.y - 0.5);
+      }
     }
-  }
+  });
   cv::Mat out;
   cv::remap(v.gray01, out, mapX, mapY, cv::INTER_LINEAR, cv::BORDER_CONSTANT,
             cv::Scalar(std::numeric_limits<float>::quiet_NaN()));
@@ -1562,24 +1684,55 @@ struct Shift {
 auto MeasureShift(const cv::Mat& fixed01, const cv::Mat& moving01,
                   const cv::Mat& valid, Shift& out) -> void
 {
+  // Normalize only around the overlap, not the whole frame. Outside `valid`
+  // both images are zeroed, and a measured tile lies within one tile of
+  // `valid`'s bounds, so nothing farther than one tile plus the
+  // normalization's reach -- two chained blurs, each out to OpenCV's 4 sigma
+  // for a float image -- can change a measured tile. Cropping to that is the
+  // same arithmetic on fewer pixels: a pair overlapping a tenth of the frame
+  // normalizes a tenth of it.
+  const int reach =
+      2 * static_cast<int>(std::ceil(4.0 * kQaNormSigma)) + kQaTile;
+  const cv::Rect frame(0, 0, valid.cols, valid.rows);
+  const cv::Rect bounds = cv::boundingRect(valid);
+  if (bounds.empty()) {
+    return;
+  }
+  const cv::Rect roi =
+      cv::Rect(bounds.x - reach, bounds.y - reach, bounds.width + 2 * reach,
+               bounds.height + 2 * reach) &
+      frame;
+
   // NaN would poison the normalization's blurs; the mask says where it was.
-  cv::Mat a = fixed01.clone();
-  cv::Mat b = moving01.clone();
-  a.setTo(0.0, ~valid);
-  b.setTo(0.0, ~valid);
-  cv::Mat na;
-  cv::Mat nb;
-  loc::LocalNormalize(a, 15.0, 3.0).convertTo(na, CV_32F);
-  loc::LocalNormalize(b, 15.0, 3.0).convertTo(nb, CV_32F);
+  const cv::Mat outside = ~valid(roi);
+  cv::Mat a = fixed01(roi).clone();
+  cv::Mat b = moving01(roi).clone();
+  a.setTo(0.0, outside);
+  b.setTo(0.0, outside);
+  // Full-frame, so tiles keep their full-frame grid; zero outside the crop,
+  // where no tile is measured.
+  cv::Mat na(frame.size(), CV_32F, cv::Scalar(0));
+  cv::Mat nb(frame.size(), CV_32F, cv::Scalar(0));
+  cv::Mat naRoi = na(roi);
+  cv::Mat nbRoi = nb(roi);
+  loc::LocalNormalize(a, kQaNormSigma, kQaNormClip).convertTo(naRoi, CV_32F);
+  loc::LocalNormalize(b, kQaNormSigma, kQaNormClip).convertTo(nbRoi, CV_32F);
   cv::Mat window;
   cv::createHanningWindow(window, {kQaTile, kQaTile}, CV_32F);
 
-  std::vector<double> mags;
-  std::vector<double> dxs;
-  std::vector<double> dys;
+  std::vector<cv::Rect> tiles;
   for (int y = 0; y + kQaTile <= valid.rows; y += kQaTile) {
     for (int x = 0; x + kQaTile <= valid.cols; x += kQaTile) {
-      const cv::Rect tile(x, y, kQaTile, kQaTile);
+      tiles.emplace_back(x, y, kQaTile, kQaTile);
+    }
+  }
+  // One phase correlation per tile, each independent of the others, so they
+  // run in parallel into their own slots. The statistics below are order-free.
+  std::vector<std::optional<cv::Point2d>> found(tiles.size());
+  cv::parallel_for_(cv::Range(0, static_cast<int>(tiles.size())),
+                    [&](const cv::Range& range) {
+    for (int i = range.start; i < range.end; ++i) {
+      const auto& tile = tiles[i];
       if (cv::countNonZero(valid(tile)) <
           kQaTileValid * kQaTile * kQaTile) {
         continue;
@@ -1597,9 +1750,18 @@ auto MeasureShift(const cv::Mat& fixed01, const cv::Mat& moving01,
         continue;
       }
       // phaseCorrelate reports where `moving` sits relative to `fixed`.
-      mags.push_back(std::hypot(s.x, s.y));
-      dxs.push_back(s.x);
-      dys.push_back(s.y);
+      found[i] = s;
+    }
+  });
+
+  std::vector<double> mags;
+  std::vector<double> dxs;
+  std::vector<double> dys;
+  for (const auto& s : found) {
+    if (s) {
+      mags.push_back(std::hypot(s->x, s->y));
+      dxs.push_back(s->x);
+      dys.push_back(s->y);
     }
   }
   out.tiles = mags.size();
@@ -1635,41 +1797,78 @@ auto WarpInto(const QaView& source, const loc::Render& sourceRender,
   cv::Mat mapX(rows, cols, CV_32F, cv::Scalar(-1));
   cv::Mat mapY(rows, cols, CV_32F, cv::Scalar(-1));
   valid = cv::Mat::zeros(rows, cols, CV_8U);
-  for (int r = 0; r < rows; ++r) {
-    for (int u = 0; u < cols; ++u) {
-      const auto& p = targetRender.position.at<cv::Vec3f>(r, u);
-      if (not std::isfinite(p[0])) {
-        continue;
+  // Per target pixel, writing only that pixel: rows run in parallel.
+  cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+    for (int r = range.start; r < range.end; ++r) {
+      const auto* positions = targetRender.position.ptr<cv::Vec3f>(r);
+      auto* xs = mapX.ptr<float>(r);
+      auto* ys = mapY.ptr<float>(r);
+      auto* ok = valid.ptr<unsigned char>(r);
+      for (int u = 0; u < cols; ++u) {
+        const auto& p = positions[u];
+        if (not std::isfinite(p[0])) {
+          continue;
+        }
+        const Eigen::Vector3d xc =
+            c.R * Eigen::Vector3d(p[0], p[1], p[2]) + c.t;
+        if (xc[2] <= 0.0) {
+          continue;
+        }
+        const auto nx = xc[0] / xc[2];
+        const auto ny = xc[1] / xc[2];
+        // Occlusion, on the source's ideal grid where its depth lives.
+        const auto iu = static_cast<int>(std::floor(c.fx * nx + c.cx));
+        const auto iv = static_cast<int>(std::floor(c.fy * ny + c.cy));
+        if (iu < 0 or iv < 0 or iu >= c.width or iv >= c.height) {
+          continue;
+        }
+        const auto seen = sourceRender.depth.at<float>(iv, iu);
+        if (not std::isfinite(seen) or
+            std::abs(seen - xc[2]) > 0.005 * xc[2]) {
+          continue;
+        }
+        const auto d = Distort(c, nx, ny);
+        if (d.x < 0.5 or d.y < 0.5 or d.x > c.width - 1.5 or
+            d.y > c.height - 1.5) {
+          continue;
+        }
+        xs[u] = static_cast<float>(d.x - 0.5);
+        ys[u] = static_cast<float>(d.y - 0.5);
+        ok[u] = 255;
       }
-      const Eigen::Vector3d xc = c.R * Eigen::Vector3d(p[0], p[1], p[2]) + c.t;
-      if (xc[2] <= 0.0) {
-        continue;
-      }
-      const auto nx = xc[0] / xc[2];
-      const auto ny = xc[1] / xc[2];
-      // Occlusion, on the source's ideal grid where its depth lives.
-      const auto iu = static_cast<int>(std::floor(c.fx * nx + c.cx));
-      const auto iv = static_cast<int>(std::floor(c.fy * ny + c.cy));
-      if (iu < 0 or iv < 0 or iu >= c.width or iv >= c.height) {
-        continue;
-      }
-      const auto seen = sourceRender.depth.at<float>(iv, iu);
-      if (not std::isfinite(seen) or
-          std::abs(seen - xc[2]) > 0.005 * xc[2]) {
-        continue;
-      }
-      const auto d = Distort(c, nx, ny);
-      if (d.x < 0.5 or d.y < 0.5 or d.x > c.width - 1.5 or
-          d.y > c.height - 1.5) {
-        continue;
-      }
-      mapX.at<float>(r, u) = static_cast<float>(d.x - 0.5);
-      mapY.at<float>(r, u) = static_cast<float>(d.y - 0.5);
-      valid.at<unsigned char>(r, u) = 255;
     }
-  }
+  });
   cv::remap(source.gray01, warped, mapX, mapY, cv::INTER_LINEAR,
             cv::BORDER_CONSTANT, cv::Scalar(0));
+}
+
+/**
+ * @brief The world-space box around everything @p render's view saw, padded.
+ *
+ * Two views whose boxes miss each other cannot overlap, so QA skips the pair
+ * without warping it. The padding keeps that a safe test: a target point
+ * WarpInto counts as seen by the source passes the source's depth test, so it
+ * lies on the mesh within about one source pixel's footprint of a hit the
+ * source rendered, which may put it just outside the hits' own box. 1% of the
+ * diagonal is tens of pixels' footprint for any view this is run on.
+ */
+auto SurfaceBounds(const loc::Render& render) -> Eigen::AlignedBox3d
+{
+  Eigen::AlignedBox3d box;  // empty
+  for (int r = 0; r < render.position.rows; ++r) {
+    const auto* row = render.position.ptr<cv::Vec3f>(r);
+    for (int u = 0; u < render.position.cols; ++u) {
+      if (std::isfinite(row[u][0])) {
+        box.extend(Eigen::Vector3d(row[u][0], row[u][1], row[u][2]));
+      }
+    }
+  }
+  if (not box.isEmpty()) {
+    const auto pad = 0.01 * box.diagonal().norm();
+    box.min().array() -= pad;
+    box.max().array() += pad;
+  }
+  return box;
 }
 
 auto Grade(const Shift& s) -> std::string
@@ -1709,7 +1908,7 @@ auto qa(const std::vector<std::string>& argv) -> int
     ("overhead-image", po::value<std::string>(), "the overhead image to compare against; with --overhead-calibration")
     ("reference-mesh", po::value<std::string>(), "the IR reference mesh, for the circular comparison: reported, never graded")
     ("report", po::value<std::string>(), "write the JSON report here")
-    ("threads", po::value<int>()->default_value(0), "renderer threads; 0 uses all")
+    ("threads", po::value<int>()->default_value(0), "renderer and QA threads; 0 uses all")
   ;
   // clang-format on
   po::variables_map args;
@@ -1728,6 +1927,10 @@ auto qa(const std::vector<std::string>& argv) -> int
     return IO_ERROR;
   }
   const auto threads = static_cast<std::size_t>(args["threads"].as<int>());
+  if (threads > 0) {
+    // OpenCV's pool runs the warps and the tile correlations.
+    cv::setNumThreads(static_cast<int>(threads));
+  }
 
   std::vector<QaView> views;
   std::vector<loc::Render> renders;
@@ -1737,9 +1940,16 @@ auto qa(const std::vector<std::string>& argv) -> int
   std::vector<Shift> circular;
   try {
     const auto mesh = loc::ReadMeshBundle(args["mesh"].as<std::string>());
+    std::vector<Eigen::AlignedBox3d> bounds;
     for (const auto& c : args["calibration"].as<std::vector<std::string>>()) {
       views.push_back(ReadQaView(c, std::nullopt));
-      renders.push_back(loc::RenderMesh(mesh, views.back().camera, threads));
+      auto render = loc::RenderMesh(mesh, views.back().camera, threads);
+      // Only the geometry is compared against; the texture is held N times
+      // over otherwise.
+      render.gray.release();
+      render.textured.release();
+      bounds.push_back(SurfaceBounds(render));
+      renders.push_back(std::move(render));
       ideal.push_back(OnIdealGrid(views.back()));
     }
 
@@ -1748,6 +1958,11 @@ auto qa(const std::vector<std::string>& argv) -> int
     for (std::size_t j = 0; j < views.size(); ++j) {
       const auto surface = cv::countNonZero(renders[j].depth == renders[j].depth);
       for (std::size_t i = 0; i < j; ++i) {
+        // Two views whose surfaces' bounds are apart share no surface, so
+        // their overlap is zero and the warp would only prove it.
+        if (not bounds[i].intersects(bounds[j])) {
+          continue;
+        }
         Shift s;
         s.source = views[i].label;
         s.target = views[j].label;
@@ -1868,14 +2083,15 @@ auto qa(const std::vector<std::string>& argv) -> int
 auto main(int argc, char* argv[]) -> int
 {
   const std::map<std::string, int (*)(const std::vector<std::string>&)>
-      commands{{"position-map", positionMap}, {"view", view},
+      commands{{"position-map", positionMap},
+               {"overhead-features", overheadFeatures}, {"view", view},
                {"adjust", adjust}, {"qa", qa}};
 
   const std::string first = argc > 1 ? argv[1] : "";
   const auto it = commands.find(first);
   if (it == commands.end()) {
-    std::cout << "Usage: pgs-localize-joint <position-map|view|adjust|qa> "
-                 "[options]\n"
+    std::cout << "Usage: pgs-localize-joint "
+                 "<position-map|overhead-features|view|adjust|qa> [options]\n"
                  "       pgs-localize-joint <command> --help\n\n"
                  "Localize a hand-held view set against a solved scene "
                  "(ADR 0013).\n";

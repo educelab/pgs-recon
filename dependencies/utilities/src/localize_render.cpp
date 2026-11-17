@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -86,14 +87,23 @@ auto IntersectRay(Ray ray, const Bvh& bvh,
   return HitRecord{primId, ray.tmax, u, v};
 }
 
+}  // namespace
+
 /// The BVH plus its triangles, already permuted into `bvh.prim_ids` order so
-/// the traversal above can index them directly.
-struct BVHData {
+/// the traversal above can index them directly, and the mesh's bounds, which
+/// set every render's far clip.
+struct pgs::localize::RayIndex {
   Bvh bvh;
   std::vector<PrecomputedTri> precompTris;
+  Eigen::Vector3d lo;
+  Eigen::Vector3d hi;
 };
 
-auto BuildBVH(const Mesh& mesh, bvh::v2::ThreadPool& pool) -> BVHData
+namespace
+{
+
+auto BuildRayIndex(const Mesh& mesh, bvh::v2::ThreadPool& pool)
+    -> std::shared_ptr<const RayIndex>
 {
   std::vector<Triangle> tris;
   tris.reserve(mesh.num_faces());
@@ -127,7 +137,18 @@ auto BuildBVH(const Mesh& mesh, bvh::v2::ThreadPool& pool) -> BVHData
     }
   });
 
-  return BVHData{std::move(bvh), std::move(precompTris)};
+  auto index = std::make_shared<RayIndex>();
+  index->lo = Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
+  index->hi = -index->lo;
+  for (std::size_t i = 0; i < mesh.num_vertices(); ++i) {
+    const auto& v = mesh.vertex(i);
+    const Eigen::Vector3d p(v[0], v[1], v[2]);
+    index->lo = index->lo.cwiseMin(p);
+    index->hi = index->hi.cwiseMax(p);
+  }
+  index->bvh = std::move(bvh);
+  index->precompTris = std::move(precompTris);
+  return index;
 }
 
 /// Sample the atlas at a hit, as a greyscale byte.
@@ -228,6 +249,11 @@ auto pgs::localize::ReadMeshBundle(const fs::path& path) -> MeshBundle
     // which is moot after the local normalization the matcher runs.
     out.textures.push_back(ToGray8(img));
   }
+
+  // Indexed once here, not per render: a caller rendering this mesh from many
+  // cameras pays for one BVH build.
+  bvh::v2::ThreadPool pool;
+  out.rayIndex = BuildRayIndex(out.mesh, pool);
   return out;
 }
 
@@ -240,9 +266,10 @@ auto pgs::localize::RenderMesh(const MeshBundle& bundle, const Camera& cam,
   }
 
   bvh::v2::ThreadPool pool(threads);
-  const auto bvhData = BuildBVH(bundle.mesh, pool);
-  const auto& bvh = bvhData.bvh;
-  const auto& tris = bvhData.precompTris;
+  const auto index =
+      bundle.rayIndex ? bundle.rayIndex : BuildRayIndex(bundle.mesh, pool);
+  const auto& bvh = index->bvh;
+  const auto& tris = index->precompTris;
 
   const int cols = cam.width;
   const int rows = cam.height;
@@ -258,16 +285,8 @@ auto pgs::localize::RenderMesh(const MeshBundle& bundle, const Camera& cam,
 
   // Far clip from the camera-to-scene distance plus the mesh diagonal, so a
   // ray can always reach the far side of the mesh whatever the standoff.
-  Eigen::Vector3d bbMin = Eigen::Vector3d::Constant(
-      std::numeric_limits<double>::infinity());
-  Eigen::Vector3d bbMax = -bbMin;
-  for (std::size_t i = 0; i < bundle.mesh.num_vertices(); ++i) {
-    const auto& v = bundle.mesh.vertex(i);
-    for (int k = 0; k < 3; ++k) {
-      bbMin[k] = std::min(bbMin[k], v[k]);
-      bbMax[k] = std::max(bbMax[k], v[k]);
-    }
-  }
+  const auto& bbMin = index->lo;
+  const auto& bbMax = index->hi;
   const auto diag = (bbMax - bbMin).norm();
   const auto far = ((camCenter - 0.5 * (bbMin + bbMax)).norm() + diag) * 2.0;
 
@@ -462,6 +481,27 @@ auto pgs::localize::SelfTestRender(std::ostream& os) -> bool
                     std::to_string(render.hits) + " of 40000)");
     ok &= Check(os, render.missingCharts.empty(),
                 "every hit face resolved to a chart image");
+
+    // The ray index ReadMeshBundle built once must render exactly what one
+    // built for the call does: the cache is a saving, never a difference.
+    {
+      auto uncached = bundle;
+      uncached.rayIndex.reset();
+      const auto fresh = RenderMesh(uncached, cam, 0);
+      const auto same = [](const cv::Mat& a, const cv::Mat& b) {
+        // memcmp rather than ==: NaN marks a miss and never equals itself.
+        return a.size() == b.size() and a.type() == b.type() and
+               a.isContinuous() and b.isContinuous() and
+               std::memcmp(a.data, b.data, a.total() * a.elemSize()) == 0;
+      };
+      ok &= Check(os,
+                  bundle.rayIndex != nullptr and
+                      same(fresh.gray, render.gray) and
+                      same(fresh.position, render.position) and
+                      same(fresh.depth, render.depth),
+                  "a render through the bundle's cached ray index is "
+                  "bit-identical to one through an index built for the call");
+    }
 
     // The texture mask. Every face here has UVs and a chart, so the mask must
     // be exactly the hit set: 255 on the surface, 0 at a miss. Half the focal

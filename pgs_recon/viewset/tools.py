@@ -7,12 +7,14 @@ records it. This module is that binary's complete flag surface; when
 ``dependencies/utilities/src/localize_joint.cpp`` changes, the two are edited
 together.
 
-The binary has three subcommands, one per thing that has to happen in-process
+The binary has five subcommands, one per thing that has to happen in-process
 with openMVG, OpenCV and the renderer:
 
 - ``position-map`` -- render the mesh from the overhead pose once, keeping the
   world position per pixel. Every view's overhead matches lift through it.
   Optionally also the rendered texture: a virtual overhead.
+- ``overhead-features`` -- describe the overhead image once, exactly as
+  ``view`` would, so each view loads the features instead.
 - ``view`` -- localize one hand-held image: overhead prior, then render-and-match
   against the IR reference mesh. Emits the one-view calibration and the inlier
   correspondences the adjustment consumes.
@@ -63,17 +65,33 @@ def position_map(calibration: Path, mesh: Path, output: Path,
     run(command)
 
 
+def overhead_features(overhead_image: Path, overhead_position_map: Path,
+                      output: Path) -> None:
+    """Describe ``overhead_image`` where ``overhead_position_map`` hit the
+    surface; write the features as an (N, 132) float32 ``.npy``.
+
+    What ``view`` would describe itself, bit for bit: passing ``output`` to
+    :func:`localize_view` changes how long a view takes, never its result.
+    """
+    run([resolve_exe(BINARY), 'overhead-features',
+         '--overhead-image', overhead_image,
+         '--overhead-position-map', overhead_position_map,
+         '--output', output])
+
+
 def localize_view(image: Path, mesh: Path, overhead_image: Path,
                   overhead_calibration: Path, overhead_position_map: Path,
                   camera: Path, output_calibration: Path,
                   output_correspondences: Path, report: Path,
                   mask: Optional[Path] = None,
+                  overhead_features: Optional[Path] = None,
                   output_camera: Optional[Path] = None,
                   qa_render: Optional[Path] = None,
                   prior_scales: Optional[str] = None,
                   heldout_split: Optional[int] = None,
                   seed: Optional[int] = None,
-                  threads: Optional[int] = None) -> None:
+                  threads: Optional[int] = None,
+                  log: Optional[Path] = None) -> None:
     """Localize one hand-held ``image`` against the IR reference ``mesh``.
 
     ``camera`` supplies the starting K and distortion -- from EXIF, a board
@@ -85,7 +103,10 @@ def localize_view(image: Path, mesh: Path, overhead_image: Path,
     the mesh's frame, so every 3D point the view sees is too.
 
     ``mask`` blanks query pixels that must not match -- the sample square
-    (ADR 0013 Decision 5). ``prior_scales`` is the comma-separated ladder of
+    (ADR 0013 Decision 5). ``overhead_features`` is
+    :func:`overhead_features`' output for this overhead; without it the view
+    describes the overhead itself. ``log`` takes the binary's output instead
+    of this process's stdout. ``prior_scales`` is the comma-separated ladder of
     query downscales tried against the overhead (``"1,0.5,0.25,0.125"``).
     """
     command = [resolve_exe(BINARY), 'view',
@@ -98,13 +119,14 @@ def localize_view(image: Path, mesh: Path, overhead_image: Path,
                '--output-correspondences', output_correspondences,
                '--report', report]
     command += _optional(('--mask', mask),
+                         ('--overhead-features', overhead_features),
                          ('--output-camera', output_camera),
                          ('--qa-render', qa_render),
                          ('--prior-scales', prior_scales),
                          ('--heldout-split', heldout_split),
                          ('--seed', seed),
                          ('--threads', threads))
-    run(command)
+    run(command, log=log)
 
 
 def adjust(calibrations: Sequence[Path], correspondences: Sequence[Path],

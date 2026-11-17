@@ -3,8 +3,8 @@
 /**
  * @file
  * @brief Read and write the array-shaped `.npy` files `pgs-localize-joint`
- *        exchanges: an H x W x 3 float32 position map, and N x K float64
- *        tables of correspondences.
+ *        exchanges: an H x W x 3 float32 position map, N x K float64 tables of
+ *        correspondences, and an N x K float32 matrix of described features.
  *
  * Beside `Npy.hpp` rather than in it: that header is the 4x4 transform's, and
  * is deliberately narrow. This one is as narrow for its own shapes -- v1.0
@@ -196,6 +196,58 @@ inline auto readTable(const std::filesystem::path& path,
     throw BadNpy("truncated .npy data: " + path.string());
   }
   return rows;
+}
+
+/// Write a single-channel CV_32F matrix as an (N, K) float32 array.
+inline void writeFloatMatrix(const std::filesystem::path& path,
+                             const cv::Mat& matrix)
+{
+  if (matrix.type() != CV_32FC1) {
+    throw BadNpy("a float matrix is CV_32FC1");
+  }
+  std::ofstream file(path, std::ios::binary);
+  if (not file) {
+    throw BadNpy("cannot write: " + path.string());
+  }
+  detail::writeHeader(file, "<f4",
+                      "(" + std::to_string(matrix.rows) + ", " +
+                          std::to_string(matrix.cols) + ")");
+  for (int r = 0; r < matrix.rows; ++r) {
+    file.write(reinterpret_cast<const char*>(matrix.ptr<float>(r)),
+               static_cast<std::streamsize>(matrix.cols * 4));
+  }
+  if (not file) {
+    throw BadNpy("short write: " + path.string());
+  }
+}
+
+/// Read an (N, @p columns) float32 array as a CV_32FC1 matrix. An (0, K) array
+/// is valid and reads as an empty matrix.
+inline auto readFloatMatrix(const std::filesystem::path& path,
+                            const std::size_t columns) -> cv::Mat
+{
+  std::ifstream file(path, std::ios::binary);
+  if (not file) {
+    throw BadNpy("cannot read: " + path.string());
+  }
+  const auto header = detail::readHeader(file, path);
+  if (header.find("'<f4'") == std::string::npos) {
+    throw BadNpy("expected float32 ('<f4') in " + path.string());
+  }
+  const auto dims = detail::shapeOf(header, path);
+  if (dims.size() != 2 or dims[1] != columns) {
+    throw BadNpy("expected an (N, " + std::to_string(columns) +
+                 ") array in " + path.string() + ": " + header);
+  }
+  cv::Mat out(static_cast<int>(dims[0]), static_cast<int>(columns), CV_32FC1);
+  for (int r = 0; r < out.rows; ++r) {
+    file.read(reinterpret_cast<char*>(out.ptr<float>(r)),
+              static_cast<std::streamsize>(out.cols * 4));
+  }
+  if (not file) {
+    throw BadNpy("truncated .npy data: " + path.string());
+  }
+  return out;
 }
 
 }  // namespace pgs::npy

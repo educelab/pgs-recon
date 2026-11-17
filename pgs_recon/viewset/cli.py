@@ -106,6 +106,13 @@ def _parser() -> configargparse.ArgumentParser:
                         help='Resolve the inputs, say which reference and prior '
                              'would be used, and stop.')
     parser.add_argument('--threads', type=int, default=None)
+    parser.add_argument('--jobs', type=int, default=1,
+                        help='Views to localize, and then to texture, at once. '
+                             'Each is its own process holding the reference '
+                             'mesh and the overhead position map, so memory '
+                             'is what bounds it; --threads is shared out '
+                             'between them. Each view\'s output goes to a log '
+                             'in its own directory.')
     parser.add_argument('--path', type=str, default=None,
                         help=configargparse.SUPPRESS)
     parser.add_argument('--log-level', default='INFO', type=str.upper,
@@ -196,6 +203,7 @@ def _main():
         mask=Path(args.mask) if args.mask else None,
         vignette_mask=args.vignette_mask,
         threads=args.threads,
+        jobs=args.jobs,
         skip_texture=args.skip_texture,
         combined_texture=args.combined_texture))
 

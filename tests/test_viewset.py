@@ -24,7 +24,8 @@ OUT = Path('/sets/plate1')
 class TestLayout(unittest.TestCase):
     def test_everything_lands_under_the_output_root(self):
         names = [layout.manifest(OUT), layout.ir_reference_mesh(OUT),
-                 layout.overhead_position_map(OUT), layout.surviving_pairs(OUT),
+                 layout.overhead_position_map(OUT), layout.overhead_features(OUT),
+                 layout.surviving_pairs(OUT),
                  layout.group_dir(OUT, 3), layout.joint_scene(OUT),
                  layout.joint_camera(OUT), layout.joint_report(OUT),
                  layout.qa_report(OUT), layout.starting_camera(OUT),
@@ -497,6 +498,27 @@ class TestTools(unittest.TestCase):
             self.assertIn(flag, argv)
         self.assertNotIn('--mask', argv)
 
+    def test_overhead_features(self):
+        argv = self.call(tools.overhead_features,
+                         overhead_image=Path('o.tif'),
+                         overhead_position_map=Path('p.npy'),
+                         output=Path('f.npy'))
+        self.assertEqual(argv, ['/p/bin/pgs-localize-joint', 'overhead-features',
+                                '--overhead-image', 'o.tif',
+                                '--overhead-position-map', 'p.npy',
+                                '--output', 'f.npy'])
+
+    def test_view_takes_the_overheads_features(self):
+        argv = self.call(
+            tools.localize_view, image=Path('a.jpg'), mesh=Path('r.obj'),
+            overhead_image=Path('o.tif'), overhead_calibration=Path('o.json'),
+            overhead_position_map=Path('p.npy'),
+            output_calibration=Path('a_mesh_calibration.json'),
+            output_correspondences=Path('a.npy'), report=Path('a.json'),
+            camera=Path('k.txt'), overhead_features=Path('f.npy'))
+        i = argv.index('--overhead-features')
+        self.assertEqual(argv[i + 1], 'f.npy')
+
     def test_adjust_interleaves_each_views_triple(self):
         argv = self.call(
             tools.adjust, calibrations=[Path('a.json'), Path('b.json')],
@@ -578,6 +600,172 @@ class TestImportSet(unittest.TestCase):
         sfm.mkdir(parents=True)
         (sfm / 'sfm_data.json').write_text('[]')
         self.assertEqual(self.run_import(plate)[1], 1)
+
+
+@unittest.skipIf(pipeline is None, 'pgs_recon.viewset.pipeline does not import')
+class TestOverheadFeatures(unittest.TestCase):
+    """The overhead is described once per run, for every view that needs it,
+    and only when one does."""
+
+    def setUp(self):
+        self._d = tempfile.TemporaryDirectory()
+        d = self.dir = Path(self._d.name)
+        self.output = d / 'out'
+        self.files = {}
+        for name in ('o.png', 'o.json', 'reference.obj', 'position.npy',
+                     'camera.txt', 'pgs-localize-joint', 'a.png', 'b.png'):
+            self.files[name] = d / name
+            self.files[name].write_text(name)
+        self.plate = mock.Mock(
+            images=[self.files['a.png'], self.files['b.png']],
+            overhead=Overhead(self.files['o.json'], self.files['o.png']))
+        self.meta = {'views': {}}
+
+    def tearDown(self):
+        self._d.cleanup()
+
+    def localize(self, describe=None):
+        def write(overhead_image, overhead_position_map, output):
+            output.write_text('features')
+        with mock.patch.object(pipeline.toolchain, 'resolve_exe',
+                               return_value=self.files['pgs-localize-joint']), \
+                mock.patch.object(pipeline.tools, 'overhead_features',
+                                  side_effect=describe or write) as describer, \
+                mock.patch.object(pipeline.tools, 'localize_view') as view:
+            done = pipeline.localize_views(
+                self.plate, self.files['reference.obj'],
+                self.files['position.npy'], self.files['camera.txt'], {},
+                self.output, pipeline.Options(), self.meta,
+                self.dir / 'manifest.json')
+        return done, describer, view
+
+    def test_described_once_and_handed_to_every_view(self):
+        done, describer, view = self.localize()
+        self.assertEqual(done, ['a', 'b'])
+        self.assertEqual(describer.call_count, 1)
+        self.assertEqual(
+            [c.kwargs['overhead_features'] for c in view.call_args_list],
+            [layout.overhead_features(self.output)] * 2)
+
+    def test_reused_across_runs_and_not_described_with_every_view_current(self):
+        self.localize()
+        del self.meta['views']['b']
+        _, describer, view = self.localize()
+        self.assertEqual(describer.call_count, 0)
+        self.assertEqual(view.call_count, 1)
+        _, describer, view = self.localize()
+        self.assertEqual((describer.call_count, view.call_count), (0, 0))
+
+    def test_a_failed_describe_leaves_each_view_to_describe_itself(self):
+        def fail(*a, **kw):
+            raise pipeline.ToolFailed(['pgs-localize-joint'], 1)
+        with self.assertLogs(pipeline.logger, 'WARNING'):
+            done, _, view = self.localize(describe=fail)
+        self.assertEqual(done, ['a', 'b'])
+        self.assertEqual(
+            [c.kwargs['overhead_features'] for c in view.call_args_list],
+            [None, None])
+
+
+@unittest.skipIf(pipeline is None, 'pgs_recon.viewset.pipeline does not import')
+class TestViewsSideBySide(unittest.TestCase):
+    """``--jobs``: views localized and textured at once, recorded as if one
+    at a time."""
+
+    def setUp(self):
+        self._d = tempfile.TemporaryDirectory()
+        d = self.dir = Path(self._d.name)
+        self.output = d / 'out'
+        self.files = {}
+        for name in ('o.png', 'o.json', 'reference.obj', 'position.npy',
+                     'camera.txt', 'mesh.obj', 'a.png', 'b.png', 'c.png',
+                     'd.png'):
+            self.files[name] = d / name
+            self.files[name].write_text(name)
+        self.stems = ['a', 'b', 'c', 'd']
+        self.plate = mock.Mock(
+            images=[self.files[f'{s}.png'] for s in self.stems],
+            overhead=Overhead(self.files['o.json'], self.files['o.png']),
+            mesh=self.files['mesh.obj'], recon_dir=d)
+        self.meta = {'views': {}}
+        self.meta_path = d / 'manifest.json'
+
+    def tearDown(self):
+        self._d.cleanup()
+
+    def localize(self, view, jobs=4, threads=None):
+        with mock.patch.object(pipeline, 'describe_overhead',
+                               return_value=None), \
+                mock.patch.object(pipeline.tools, 'localize_view',
+                                  side_effect=view) as tool:
+            done = pipeline.localize_views(
+                self.plate, self.files['reference.obj'],
+                self.files['position.npy'], self.files['camera.txt'], {},
+                self.output, pipeline.Options(jobs=jobs, threads=threads),
+                self.meta, self.meta_path)
+        return done, tool
+
+    def test_views_overlap_and_return_in_the_plates_order(self):
+        import threading
+        import time
+        running, peak = set(), []
+        lock = threading.Lock()
+
+        def view(image, *a, **kw):
+            with lock:
+                running.add(image.stem)
+                peak.append(len(running))
+            # The first view finishes last.
+            time.sleep(0.2 if image.stem == 'a' else 0.05)
+            with lock:
+                running.discard(image.stem)
+
+        done, _ = self.localize(view)
+        self.assertEqual(self.stems, done)
+        self.assertGreater(max(peak), 1, 'the views ran one at a time')
+        self.assertEqual({'done'}, {self.meta['views'][s]['status']
+                                    for s in self.stems})
+        on_disk = json.loads(self.meta_path.read_text())
+        self.assertEqual('done', on_disk['views']['a']['status'])
+
+    def test_a_failed_view_does_not_stop_the_others(self):
+        def view(image, *a, **kw):
+            if image.stem == 'b':
+                raise pipeline.ToolFailed(['pgs-localize-joint'], 1)
+        done, _ = self.localize(view)
+        self.assertEqual(['a', 'c', 'd'], done)
+        self.assertEqual('failed', self.meta['views']['b']['status'])
+
+    def test_each_view_has_its_own_log_and_a_share_of_the_threads(self):
+        _, tool = self.localize(lambda *a, **kw: None, jobs=4, threads=16)
+        calls = {c.args[0].stem: c.kwargs for c in tool.call_args_list}
+        self.assertEqual({4}, {kw['threads'] for kw in calls.values()})
+        self.assertEqual(layout.view_log(self.output, 'c'), calls['c']['log'])
+
+    def test_one_job_keeps_threads_as_given(self):
+        _, tool = self.localize(lambda *a, **kw: None, jobs=1)
+        self.assertEqual({None}, {c.kwargs['threads']
+                                  for c in tool.call_args_list})
+
+    def test_texturing_side_by_side_records_each_view(self):
+        for stem in self.stems:
+            cal = layout.view_adjusted_calibration(self.output, stem)
+            cal.parent.mkdir(parents=True, exist_ok=True)
+            cal.write_text('{}')
+            self.meta['views'][stem] = {'status': 'done'}
+
+        def retexture(argv, log=None):
+            if '-i' in argv and Path(argv[argv.index('-i') + 1]).stem == 'c':
+                raise pipeline.ToolFailed(argv, 1)
+        with mock.patch.object(pipeline, 'run_tool',
+                               side_effect=retexture) as tool:
+            pipeline.texture_views(self.plate, self.stems, self.output,
+                                   self.meta, self.meta_path, jobs=3)
+        self.assertEqual(4, tool.call_count)
+        self.assertEqual(
+            {'a': 'done', 'b': 'done', 'c': 'failed', 'd': 'done'},
+            {s: self.meta['views'][s]['texture']['status']
+             for s in self.stems})
 
 
 try:

@@ -92,7 +92,8 @@ def make_overhead(d: Path, mesh: Path, texture, localize: Path,
 
 
 def localize_view(joint: Path, d: Path, mesh: Path, image: Path,
-                  camera: Path, out: Path, seed: int = 3) -> Path:
+                  camera: Path, out: Path, seed: int = 3,
+                  extra: tuple = ()) -> Path:
     """``pgs-localize-joint view`` with the fixture's overhead."""
     out.mkdir(parents=True, exist_ok=True)
     run([joint, 'view', '--image', image, '--mesh', mesh,
@@ -103,7 +104,8 @@ def localize_view(joint: Path, d: Path, mesh: Path, image: Path,
          '--output-calibration', out / 'cal.json',
          '--output-correspondences', out / 'corr.npy',
          '--output-camera', out / 'cam.txt', '--qa-render', out / 'qa.png',
-         '--report', out / 'report.json', '--seed', seed, '--threads', 2])
+         '--report', out / 'report.json', '--seed', seed, '--threads', 2,
+         *extra])
     return out
 
 
@@ -210,6 +212,37 @@ class TestLocalizeJoint(unittest.TestCase):
         both = hit & np.isfinite(truth[..., 0])
         err = np.linalg.norm(pos[both][:, :2] - truth[both][:, :2], axis=1)
         self.assertLess(np.median(err), 0.1)
+
+    def test_view_with_the_overheads_saved_features_is_the_same_view(self):
+        features = self.dir / 'overhead_features.npy'
+        run([self.joint, 'overhead-features',
+             '--overhead-image', self.dir / 'overhead.png',
+             '--overhead-position-map', self.dir / 'position.npy',
+             '--output', features])
+        table = np.load(features)
+        self.assertEqual((table.ndim, table.shape[1], table.dtype),
+                         (2, 132, np.float32))
+        plain = localize_view(self.joint, self.dir, self.mesh,
+                              self.dir / 'handheld.png',
+                              self.dir / 'handheld.cam', self.dir / 'plain')
+        cached = localize_view(self.joint, self.dir, self.mesh,
+                               self.dir / 'handheld.png',
+                               self.dir / 'handheld.cam', self.dir / 'cached',
+                               extra=['--overhead-features', features])
+        for name in ('cal.json', 'corr.npy', 'report.json'):
+            self.assertEqual((plain / name).read_bytes(),
+                             (cached / name).read_bytes(),
+                             f'{name} differs with the saved features')
+
+        # Another overhead's features are refused, not matched against.
+        table[:, 0] += 1e5
+        np.save(self.dir / 'other_features.npy', table)
+        with self.assertRaisesRegex(AssertionError, 'another overhead'):
+            localize_view(self.joint, self.dir, self.mesh,
+                          self.dir / 'handheld.png', self.dir / 'handheld.cam',
+                          self.dir / 'other',
+                          extra=['--overhead-features',
+                                 self.dir / 'other_features.npy'])
 
     def test_view_localizes_with_no_prior_pose(self):
         d = localize_view(self.joint, self.dir, self.mesh,

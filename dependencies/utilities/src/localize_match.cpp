@@ -9,11 +9,13 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/video/tracking.hpp>
 
+#include <openMVG/features/regions_factory.hpp>
 #include <openMVG/features/sift/SIFT_Anatomy_Image_Describer.hpp>
 #include <openMVG/image/image_container.hpp>
 #include <openMVG/matching/indMatch.hpp>
 #include <openMVG/matching/regions_matcher.hpp>
 
+#include "NpyArray.hpp"
 #include "RANSAC.hpp"
 
 namespace feat = openMVG::features;
@@ -289,6 +291,49 @@ auto pgs::localize::DescribeReference(const Render& reference,
   return out;
 }
 
+void pgs::localize::SaveFeatures(const std::filesystem::path& path,
+                                 const ReferenceFeatures& features)
+{
+  const auto* sift =
+      dynamic_cast<const feat::SIFT_Regions*>(features.regions.get());
+  if (sift == nullptr) {
+    throw std::runtime_error("only SIFT regions can be saved");
+  }
+  const auto& feats = sift->Features();
+  const auto& descs = sift->Descriptors();
+  cv::Mat table(static_cast<int>(feats.size()), kFeatureColumns, CV_32FC1);
+  for (int i = 0; i < table.rows; ++i) {
+    auto* row = table.ptr<float>(i);
+    const auto& f = feats[i];
+    row[0] = f.x();
+    row[1] = f.y();
+    row[2] = f.scale();
+    row[3] = f.orientation();
+    std::copy(descs[i].data(), descs[i].data() + 128, row + 4);
+  }
+  npy::writeFloatMatrix(path, table);
+}
+
+auto pgs::localize::LoadFeatures(const std::filesystem::path& path)
+    -> ReferenceFeatures
+{
+  const auto table = npy::readFloatMatrix(path, kFeatureColumns);
+  auto sift = std::make_unique<feat::SIFT_Regions>();
+  auto& feats = sift->Features();
+  auto& descs = sift->Descriptors();
+  feats.reserve(table.rows);
+  descs.resize(table.rows);
+  for (int i = 0; i < table.rows; ++i) {
+    const auto* row = table.ptr<float>(i);
+    feats.emplace_back(row[0], row[1], row[2], row[3]);
+    std::transform(row + 4, row + kFeatureColumns, descs[i].data(),
+                   [](float v) { return static_cast<unsigned char>(v); });
+  }
+  ReferenceFeatures out;
+  out.regions = std::move(sift);
+  return out;
+}
+
 auto pgs::localize::CorrespondFromReference(
     const Render& render, const ReferenceFeatures& features,
     const cv::Mat& queryNorm, const feat::Regions& queryRegions,
@@ -343,6 +388,11 @@ auto pgs::localize::CorrespondFromReference(
   // Lucas-Kanade, query side only: the render-side location is where the
   // position map is sampled, so moving it would move the 3D point too.
   if (opts.refineMatches) {
+    if (renderNorm.empty()) {
+      throw std::logic_error(
+          "Lucas-Kanade needs the reference's normalized image, which loaded "
+          "features do not carry");
+    }
     std::vector<cv::Point2f> from;
     std::vector<cv::Point2f> to;
     from.reserve(inliers.size());

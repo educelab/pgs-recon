@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -72,6 +73,11 @@ public:
   explicit BadMesh(const std::string& what) : std::runtime_error(what) {}
 };
 
+/// The ray-cast index over a mesh's triangles: the BVH, its triangles in BVH
+/// order, and the mesh's bounds. Opaque here because its types are the bvh
+/// library's, which only `localize_render.cpp` includes.
+struct RayIndex;
+
 /**
  * @brief A mesh and everything needed to sample its texture.
  *
@@ -86,6 +92,12 @@ struct MeshBundle {
   UVMap uvMap;
   std::vector<cv::Mat> textures;
   std::vector<std::filesystem::path> texturePaths;
+  /// Built once, by ReadMeshBundle, from @ref mesh, so every render of this
+  /// bundle reuses one BVH instead of building its own -- `qa` renders the
+  /// same mesh once per view. Shared by copies. Its triangles are a snapshot:
+  /// a caller that edits @ref mesh afterwards must reset this. Empty (a bundle
+  /// filled by hand) makes RenderMesh build one for that call.
+  std::shared_ptr<const RayIndex> rayIndex;
 
   /// The image for chart @p i, or nullptr when there is none. The one place
   /// "out of range or empty means no texture" is decided.

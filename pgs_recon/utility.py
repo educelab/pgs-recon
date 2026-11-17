@@ -54,14 +54,22 @@ class ToolFailed(Exception):
         return self.returncode
 
 
-def run_command(cmd: List[str], cwd=None):
+def run_command(cmd: List[str], cwd=None, log=None):
     """Run an external binary to completion, raising ``ToolFailed`` on failure.
+
+    ``log`` is a file for the child's stdout and stderr, together, instead of
+    this process's -- what keeps binaries run side by side from interleaving.
 
     Deliberately no bare ``except``: ``KeyboardInterrupt`` propagates so Ctrl-C
     still aborts a run promptly, rather than being reported as a tool failure.
     """
     try:
-        subprocess.run(cmd, check=True, cwd=cwd)
+        if log is None:
+            subprocess.run(cmd, check=True, cwd=cwd)
+        else:
+            with open(log, 'w') as out:
+                subprocess.run(cmd, check=True, cwd=cwd, stdout=out,
+                               stderr=subprocess.STDOUT)
     except OSError as e:
         raise ToolFailed(cmd, None, detail=f'failed to start ({e})') from e
     except subprocess.CalledProcessError as e:
