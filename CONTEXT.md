@@ -8,7 +8,7 @@ cause mistakes; it is not a description of the code.
 
 **Capture**:
 One slot in a scan's per-position image stack — the `{capture}` index in the
-`{prefix}_{camera}_{position}_{capture}` filename, described by the matching
+`{prefix}{camera}_{position}_{capture}` filename, described by the matching
 `scan.capture_settings` entry (its lights, exposure, gain, participating cameras,
 and a free-text `name`). Every capture spans the same capture positions, but each
 declares its own subset of cameras, so two captures need not contain the same
@@ -20,12 +20,48 @@ its index; the `name` is a label, not a key.
 _Avoid_: capture group, cap, band, pass, exposure
 
 **Capture position**:
-A physical rig pose, identified by the position index in the
-`{prefix}_{camera}_{position}_{capture}` filename. The same capture position is
-shared across all cameras and all captures of a scan, so it is the key that
-aligns an image from one set to a solved view in another. Distinct from a
+A rig pose at which every capture was taken, identified by the position index
+in the `{prefix}{camera}_{position}_{capture}` filename (the prefix carries its
+own separator). The same capture position is shared across all cameras and all
+captures of a scan, so it is the key that aligns an image from one set to a
+solved view in another. What the index counts depends on the **schema
+version**: in v1 it counts *recorded* poses, and two planned poses that read
+back alike are one capture position (the second's images replace the first's);
+from v2 it counts *planned* poses. Its place in the scan's grid is therefore
+not its index in v1, only its coordinates. Distinct from a
 **capture**, with which it shares a word: a capture spans every capture position.
 _Avoid_: shot, frame, station
+
+**Image set**:
+Any directory of images pgs-recon reconstructs from. Most carry no description
+of themselves, and their cameras and poses come from EXIF and the solve alone; a
+**PGS dataset** is the kind that describes its own rig, captures and capture
+positions.
+_Avoid_: dataset (unqualified), image dir
+
+**PGS dataset**:
+An image set written by pgs-scan or PGS Spectral (or derived from one): one
+directory holding a `metadata.json` and the images it lists. The metadata, never
+the directory name, says how to read it: the file prefix, the format, its
+captures, cameras and capture positions. A PGS dataset may hold others inside it
+(PGS Spectral's `raw/` and `processed/<stage>/`), each a PGS dataset of its own.
+_Avoid_: scan dir (for the concept), scan dataset, capture set, acquisition
+
+**Schema version**:
+The `"MAJOR.MINOR"` a PGS dataset's `metadata.json` declares (`schema_version`,
+else PGS Spectral's older `metadata_version`, else `1.0`). A newer minor only
+adds; a different major may change what any key, the layout or the filename
+pattern means, so a major this project has no reader for is refused rather
+than guessed at.
+_Avoid_: metadata version, format version
+
+**Derived dataset**:
+A PGS dataset made from another one by processing its images (developing,
+flat-fielding, exporting, converting) rather than by scanning. It keeps the
+source's structure and schema version, gets its own identity, and records what
+made it and from what in a `processing` block. Contrast a *derived* **capture**,
+which is a slot inside one dataset.
+_Avoid_: processed scan, output dataset
 
 **Camera**:
 One of the fixed physical cameras in the rig (the `{camera}` index). Each camera

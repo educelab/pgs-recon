@@ -18,6 +18,7 @@ with these files, they win.
 ## Active Tracks
 
 - [py312-noble_20261118](./tracks/py312-noble_20261118/index.md): Python 3.12 and Ubuntu 24.04; retire Apptainer definitions
+- [pgs-dataset-loader_20261118](./tracks/pgs-dataset-loader_20261118/index.md): Read PGS datasets through one versioned loader
 
 <!-- Auto-populated by /conductor:new-track -->
 

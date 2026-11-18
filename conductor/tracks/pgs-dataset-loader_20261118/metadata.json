@@ -1,0 +1,10 @@
+{
+  "id": "pgs-dataset-loader_20261118",
+  "title": "Read PGS datasets through one versioned loader",
+  "type": "feature",
+  "status": "pending",
+  "created": "2026-11-18T16:08:11Z",
+  "updated": "2026-11-18T16:08:11Z",
+  "phases": { "total": 4, "completed": 0 },
+  "tasks": { "total": 25, "completed": 0 }
+}
