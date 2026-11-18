@@ -823,9 +823,6 @@ auto view(const std::vector<std::string>& argv) -> int
 /// odd survivor and the tie points that triangulated badly.
 constexpr double kLossPx = 2.0;
 
-/// How far a tie point may reproject from its observations, under the
-/// mesh-only poses and the starting K, before it is not trusted as a tie.
-constexpr double kTieMaxPx = 4.0;
 
 /// The focal cost curve is "flat" when either end of the +-20% sweep costs less
 /// than this much more, relatively, than its minimum. Provisional, set between
@@ -1005,35 +1002,23 @@ auto AnchorRms(const ViewInput& view, const KParams& k, const PoseParams& pose)
 }
 
 /**
- * @brief Read the groups' tie scenes and triangulate their tracks into the
- *        mesh's frame.
+ * @brief Read the groups' tie scenes: which keypoints, in which of these
+ *        views, are one point.
  *
- * A group's SfM solve is in its own arbitrary frame, so its structure is not
- * used as it stands: each track is re-triangulated from the views' mesh-only
- * poses and the starting K, which puts it in the frame the anchors are in. A
- * track survives only if it is seen by two or more of the views being adjusted,
- * has parallax, lies in front of every camera, and reprojects within
- * kTieMaxPx everywhere.
+ * A group's structure is in whatever frame its solve left it in, so only the
+ * observations are kept; Triangulate() places each track in the mesh's frame.
+ * Observations in views not being adjusted are dropped, and a track left with
+ * fewer than two is counted in @p tooFew and not returned.
  */
-auto ReadTies(const std::vector<std::string>& scenes,
-              const std::vector<ViewInput>& views, const KParams& startK,
-              std::ostream& report) -> std::vector<Track>
+auto ReadTracks(const std::vector<std::string>& scenes,
+                const std::vector<ViewInput>& views, std::size_t& seen,
+                std::size_t& tooFew) -> std::vector<Track>
 {
   std::map<std::string, std::size_t> byName;
   for (std::size_t i = 0; i < views.size(); ++i) {
     byName[views[i].filename] = i;
   }
-  const auto intrinsic = MakeK3(startK, views.front().width,
-                                views.front().height);
-  std::vector<PoseParams> poses;
-  for (const auto& v : views) {
-    poses.push_back(PoseToParams(v.meshPose));
-  }
-
   std::vector<Track> tracks;
-  std::size_t seen = 0;
-  std::size_t tooFew = 0;
-  std::size_t rejected = 0;
   for (const auto& path : scenes) {
     sfm::SfM_Data scene;
     if (not sfm::Load(scene, path,
@@ -1059,60 +1044,88 @@ auto ReadTies(const std::vector<std::string>& scenes,
         ++tooFew;
         continue;
       }
-      // Least-squares intersection of the rays: sum (I - d d^T)(X - C) = 0.
-      Eigen::Matrix3d A = Eigen::Matrix3d::Zero();
-      Eigen::Vector3d b = Eigen::Vector3d::Zero();
-      for (const auto& [vi, x] : track.obs) {
-        const auto& pose = views[vi].meshPose;
-        const auto n = intrinsic->ima2cam(
-            intrinsic->get_ud_pixel(openMVG::Vec2(x[0], x[1])));
-        const Eigen::Vector3d d =
-            (pose.rotation().transpose() * Eigen::Vector3d(n[0], n[1], 1.0))
-                .normalized();
-        const Eigen::Matrix3d P = Eigen::Matrix3d::Identity() - d * d.transpose();
-        A += P;
-        b += P * pose.center();
-      }
-      if (A.eigenvalues().real().minCoeff() < 1e-6) {
-        ++rejected;  // no parallax
-        continue;
-      }
-      const Eigen::Vector3d X = A.ldlt().solve(b);
-      track.X = {X[0], X[1], X[2]};
-      bool ok = true;
-      for (const auto& [vi, x] : track.obs) {
-        const auto& pose = views[vi].meshPose;
-        if ((pose.rotation() * (X - pose.center()))[2] <= 0.0) {
-          ok = false;
-          break;
-        }
-        double r[2];
-        TieCost{x[0], x[1]}(startK.data(), poses[vi].data(), track.X.data(), r);
-        if (std::hypot(r[0], r[1]) > kTieMaxPx) {
-          ok = false;
-          break;
-        }
-      }
-      if (not ok) {
-        ++rejected;
-        continue;
-      }
       tracks.push_back(std::move(track));
     }
   }
-  std::size_t observations = 0;
-  for (const auto& t : tracks) {
-    observations += t.obs.size();
-  }
-  std::cout << "Tie points: " << tracks.size() << " of " << seen
-            << " tracks (" << tooFew << " seen by fewer than two of these "
-            << "views, " << rejected << " rejected), " << observations
-            << " observations\n";
-  report << "  \"ties\": {\"scenes\": " << scenes.size()
-         << ", \"tracks_read\": " << seen << ", \"too_few_views\": " << tooFew
-         << ", \"rejected\": " << rejected << ", \"used\": " << tracks.size()
-         << ", \"observations\": " << observations << "},\n";
   return tracks;
+}
+
+/**
+ * @brief Each track intersected from @p poses under @p k, kept only if it has
+ *        parallax, lies in front of every camera that sees it, and reprojects
+ *        within @p maxPx in every one of them.
+ *
+ * The cut is only as strict as the poses it is measured under are right. Under
+ * the mesh-only poses it measures the very misregistration the ties are there
+ * to remove: on PHerc118 Cr07 a 4 px cut there kept none of the 1384 tracks
+ * between the two views QA found 10.5 px apart, and 71% of those observed near
+ * the frame corners, where the starting K's missing distortion lands. So adjust
+ * cuts twice -- loosely under the mesh-only poses, strictly under the first
+ * solve's.
+ */
+auto Triangulate(const std::vector<Track>& tracks,
+                 const std::vector<ViewInput>& views, const KParams& k,
+                 const std::vector<PoseParams>& poses, const double maxPx,
+                 std::size_t& rejected) -> std::vector<Track>
+{
+  const auto intrinsic = MakeK3(k, views.front().width, views.front().height);
+  std::vector<geo::Pose3> pose3;
+  for (const auto& p : poses) {
+    pose3.push_back(ParamsToPose(p));
+  }
+  std::vector<Track> kept;
+  for (const auto& in : tracks) {
+    // Least-squares intersection of the rays: sum (I - d d^T)(X - C) = 0.
+    Eigen::Matrix3d A = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d b = Eigen::Vector3d::Zero();
+    for (const auto& [vi, x] : in.obs) {
+      const auto& pose = pose3[vi];
+      const auto n = intrinsic->ima2cam(
+          intrinsic->get_ud_pixel(openMVG::Vec2(x[0], x[1])));
+      const Eigen::Vector3d d =
+          (pose.rotation().transpose() * Eigen::Vector3d(n[0], n[1], 1.0))
+              .normalized();
+      const Eigen::Matrix3d P = Eigen::Matrix3d::Identity() - d * d.transpose();
+      A += P;
+      b += P * pose.center();
+    }
+    if (A.eigenvalues().real().minCoeff() < 1e-6) {
+      ++rejected;  // no parallax
+      continue;
+    }
+    const Eigen::Vector3d X = A.ldlt().solve(b);
+    Track track = in;
+    track.X = {X[0], X[1], X[2]};
+    bool ok = true;
+    for (const auto& [vi, x] : track.obs) {
+      const auto& pose = pose3[vi];
+      if ((pose.rotation() * (X - pose.center()))[2] <= 0.0) {
+        ok = false;
+        break;
+      }
+      double r[2];
+      TieCost{x[0], x[1]}(k.data(), poses[vi].data(), track.X.data(), r);
+      if (std::hypot(r[0], r[1]) > maxPx) {
+        ok = false;
+        break;
+      }
+    }
+    if (not ok) {
+      ++rejected;
+      continue;
+    }
+    kept.push_back(std::move(track));
+  }
+  return kept;
+}
+
+auto CountObservations(const std::vector<Track>& tracks) -> std::size_t
+{
+  std::size_t n = 0;
+  for (const auto& t : tracks) {
+    n += t.obs.size();
+  }
+  return n;
 }
 
 /// The KParams indices in @p a or @p b, sorted and once each.
@@ -1202,6 +1215,8 @@ auto adjust(const std::vector<std::string>& argv) -> int
     ("camera", po::value<std::string>(), "starting K and distortion. Default: the K the first calibration was solved with")
     ("fix-intrinsic", po::bool_switch(), "hold K at --camera (a board-calibrated camera)")
     ("focal-sweep", po::value<std::string>(), "lo:hi:steps, in pixels, for the focal cost curve. The curve always runs; unset sweeps 0.8x to 1.2x the adjusted focal in 9 steps")
+    ("tie-max-px", po::value<double>()->default_value(16.0, "16"), "first cut: how far a tie may reproject, under the mesh-only poses and the starting K, and still enter the first solve. Loose, because those poses carry the misregistration the ties are there to correct")
+    ("tie-final-px", po::value<double>()->default_value(4.0, "4"), "second cut: every track is re-triangulated under the first solve's poses and distortion, and kept only within this")
     ("divergence-px", po::value<double>()->default_value(1.0, "1"), "a view whose anchors reproject this much worse under the joint solve than under its own mesh-only one is divergent: its mesh-only calibration is emitted instead (ADR 0013 Decision 5). Provisional; nothing measured sets it yet")
     ("threads", po::value<int>()->default_value(0), "solver threads; 0 uses 1")
   ;
@@ -1236,6 +1251,13 @@ auto adjust(const std::vector<std::string>& argv) -> int
   }
   const auto threads = args["threads"].as<int>();
   const auto divergencePx = args["divergence-px"].as<double>();
+  const auto tieMaxPx = args["tie-max-px"].as<double>();
+  const auto tieFinalPx = args["tie-final-px"].as<double>();
+  if (not(tieFinalPx > 0.0 and tieMaxPx >= tieFinalPx)) {
+    std::cerr << "ERROR: --tie-max-px and --tie-final-px need "
+                 "0 < final <= max\n";
+    return BAD_ARG;
+  }
 
   std::ostringstream report;
   report << "{\n  \"tool\": \"pgs-localize-joint adjust\",\n";
@@ -1284,24 +1306,106 @@ auto adjust(const std::vector<std::string>& argv) -> int
   std::cout << views.size() << " views, " << anchors << " mesh anchors; "
             << "starting f " << startK[0] << "\n";
 
-  std::vector<Track> tracks;
+  // --- tie points, cut twice ---------------------------------------------
+  std::vector<Track> read;
+  std::size_t seen = 0;
+  std::size_t tooFew = 0;
   try {
     const auto scenes =
         args.count("tie-scene")
             ? args["tie-scene"].as<std::vector<std::string>>()
             : std::vector<std::string>{};
-    tracks = ReadTies(scenes, views, startK, report);
+    read = ReadTracks(scenes, views, seen, tooFew);
+    report << "  \"ties\": {\"scenes\": " << scenes.size()
+           << ", \"tracks_read\": " << seen
+           << ", \"too_few_views\": " << tooFew;
   } catch (const std::exception& e) {
     std::cerr << "ERROR: " << e.what() << "\n";
     return IO_ERROR;
   }
+  // Each view starts where its mesh-only solve left it -- unless the starting
+  // focal is not the one it was solved at. A near-nadir view absorbs focal
+  // into standoff (Decision 4), so its pose is right only for its own focal:
+  // under another, the tracks it sees triangulate nowhere near each other and
+  // the first cut rejects them. On PHerc118 Cr07, solved at 5080, a starting
+  // focal of 45000 kept none of 86426 tracks and the set was adjusted with no
+  // ties. So the camera is moved along its optical axis until its anchors'
+  // median depth has scaled with the focal: the plate then fills the frame as
+  // it did, which is what the mesh-only solve measured.
+  std::vector<PoseParams> meshPoses;
+  for (const auto& v : views) {
+    auto pose = v.meshPose;
+    const double scale = startK[kF] / v.meshK[kF];
+    if (std::abs(scale - 1.0) > 1e-3 and not v.anchors.empty()) {
+      std::vector<double> depths;
+      for (const auto& a : v.anchors) {
+        depths.push_back(
+            (pose.rotation() *
+             (Eigen::Vector3d(a.X[0], a.X[1], a.X[2]) - pose.center()))[2]);
+      }
+      std::nth_element(depths.begin(), depths.begin() + depths.size() / 2,
+                       depths.end());
+      const double depth = depths[depths.size() / 2];
+      const Eigen::Vector3d axis =
+          pose.rotation().transpose() * Eigen::Vector3d::UnitZ();
+      pose = geo::Pose3(pose.rotation(),
+                        pose.center() + (1.0 - scale) * depth * axis);
+    }
+    meshPoses.push_back(PoseToParams(pose));
+  }
+  std::size_t looseRejected = 0;
+  auto tracks =
+      Triangulate(read, views, startK, meshPoses, tieMaxPx, looseRejected);
+  std::cout << "Tie points, first cut (" << tieMaxPx << " px, mesh-only "
+            << "poses): " << tracks.size() << " of " << seen << " tracks ("
+            << tooFew << " seen by fewer than two of these views, "
+            << looseRejected << " rejected)\n";
+  report << ", \"first_cut\": {\"max_px\": " << number(tieMaxPx)
+         << ", \"rejected\": " << looseRejected
+         << ", \"used\": " << tracks.size() << "}";
+
+  // The first solve exists only to say where the views and the lens are well
+  // enough to cut the ties strictly. It holds f and the principal point: free,
+  // they drift along the focal/standoff degeneracy on near-nadir views
+  // (Decision 4), and a cut measured under a drifted solve would say nothing.
+  // Distortion is free, being what puts the frame edges -- where every overlap
+  // is -- in the right place.
+  std::size_t rejected = looseRejected;
+  if (not tracks.empty()) {
+    Solution first;
+    first.k = startK;
+    first.poses = meshPoses;
+    for (const auto& t : tracks) {
+      first.ties.push_back(t.X);
+    }
+    const auto held = fixK ? std::vector<int>{0, 1, 2, 3, 4, 5}
+                           : std::vector<int>{kF, kCx, kCy};
+    const auto firstSol = Solve(views, tracks, first, held, threads);
+    if (firstSol.summary.IsSolutionUsable()) {
+      rejected = 0;
+      tracks = Triangulate(read, views, firstSol.k, firstSol.poses, tieFinalPx,
+                           rejected);
+      std::cout << "Tie points, second cut (" << tieFinalPx << " px, after a "
+                << "first solve): " << tracks.size() << " of " << seen
+                << " tracks (" << rejected << " rejected)\n";
+      report << ", \"second_cut\": {\"max_px\": " << number(tieFinalPx)
+             << ", \"rejected\": " << rejected
+             << ", \"used\": " << tracks.size() << "}";
+    } else {
+      std::cout << "WARNING: the first tie solve did not converge, so the "
+                   "ties stay at the first cut\n";
+    }
+  }
+  std::cout << "Tie points: " << tracks.size() << " used, "
+            << CountObservations(tracks) << " observations\n";
+  report << ", \"rejected\": " << rejected
+         << ", \"used\": " << tracks.size()
+         << ", \"observations\": " << CountObservations(tracks) << "},\n";
 
   // --- the joint solve ---------------------------------------------------
   Solution start;
   start.k = startK;
-  for (const auto& v : views) {
-    start.poses.push_back(PoseToParams(v.meshPose));
-  }
+  start.poses = meshPoses;
   for (const auto& t : tracks) {
     start.ties.push_back(t.X);
   }

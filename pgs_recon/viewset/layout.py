@@ -131,12 +131,12 @@ def group_dir(output: Path, index: int) -> Path:
 
 
 def group_scene(output: Path, index: int) -> Path:
-    """The imported scene cut down to one group's views, ids unchanged."""
+    """The imported scene cut down to one group's views, renumbered from 0."""
     return group_dir(output, index) / 'group_scene.json'
 
 
 def group_pairs(output: Path, index: int) -> Path:
-    """The surviving pairs between one group's views."""
+    """The surviving pairs between one group's views, in its scene's ids."""
     return group_dir(output, index) / 'pairs.txt'
 
 

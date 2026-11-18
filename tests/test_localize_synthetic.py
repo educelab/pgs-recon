@@ -437,6 +437,28 @@ class TestAdjustUntilted(_AdjustFixture):
             self.assertEqual(view['emitted'], 'joint', f'view {i}')
             self.assertLess(view['center_shift'], 1.0, f'view {i}')
 
+    def test_a_far_starting_focal_keeps_the_ties(self):
+        # The views were solved at 1680. Held at three times that, a pose taken
+        # as it stands puts each camera a third of the way to where that focal
+        # needs it, its tracks triangulate apart, and the first cut kept none of
+        # them (PHerc118 Cr07, 5080 -> 45000). Each camera is moved back along
+        # its axis first, so the ties survive and the views end at the standoff
+        # the held focal implies.
+        far = self.views[0]._replace(f=3 * self.START['f'], cx=self.START['cx'],
+                                     cy=self.START['cy'], k=(0.0, 0.0, 0.0))
+        cam = self.dir / 'far.cam'
+        cam.write_text(scene.camera_file(far, with_pose=False))
+        report = self.adjust('far', '--camera', cam, '--fix-intrinsic',
+                             '--divergence-px', 1000,
+                             '--tie-scene', self.dir / 'tie_scene.json')
+        self.assertGreater(report['ties']['first_cut']['used'], 100)
+        self.assertGreater(report['ties']['used'], 100)
+        for i, view in enumerate(self.views):
+            height = calibration_center(self.out / f'cal_{i}.json')[2]
+            self.assertAlmostEqual(height / view.C[2],
+                                   3 * self.START['f'] / self.TRUE_K['f'],
+                                   delta=0.1, msg=f'view {i}')
+
 
 @requires_scene
 class TestPipeline(_AdjustFixture):

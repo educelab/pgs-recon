@@ -401,6 +401,16 @@ def camera_file_from_scene(sfm_json: Path) -> str:
             f'k1 {k[0]}\nk2 {k[1]}\nk3 {k[2]}\n')
 
 
+#: How far, in pixels, OpenMVG lets a group's track reproject under the views'
+#: mesh-only poses before it drops it. Upstream's 4 cut the ties by the very
+#: misregistration they exist to correct: on PHerc118 Cr07 it kept none of the
+#: 1384 tracks between the two views QA found 10.5 px apart. ``adjust`` makes
+#: the strict cut itself, once a first solve has moved the views (its
+#: ``--tie-final-px``); this only has to match its first, loose one
+#: (``--tie-max-px``).
+TIE_TRIANGULATION_PX = 16.0
+
+
 def reconstruct_groups(imported: Path, localized: Sequence[str],
                        output: Path, opts: Options
                        ) -> Tuple[groups_mod.Groups, List[Path]]:
@@ -471,9 +481,12 @@ def _solve_group(imported: Path, members: set, stem_of: Dict[int, str],
     poses and only keeps its observations, so what this contributes is which
     keypoints are one point.
 
-    The imported scene is cut down to the group with its view ids unchanged,
-    and the group's pairs are re-matched into a matches file of their own: the
+    The imported scene is cut down to the group, its views renumbered from 0
+    (:func:`_subset_scene` says why), and the group's pairs, translated to
+    those numbers, are re-matched into a matches file of their own: the
     regions are shared, so re-matching a group costs only its own pairs.
+    ``adjust`` finds a tie scene's views by image filename, so the numbers
+    are this scene's alone.
     Reused while it is newer than every member's mesh-only calibration and
     than the set's matches it was cut from.
     """
@@ -488,9 +501,9 @@ def _solve_group(imported: Path, members: set, stem_of: Dict[int, str],
     group_dir.mkdir(parents=True, exist_ok=True)
 
     scene = layout.group_scene(output, index)
-    _subset_scene(imported, members, scene, poses=calibrations)
+    renumbered = _subset_scene(imported, members, scene, poses=calibrations)
     layout.group_pairs(output, index).write_text(
-        ''.join(f'{a} {b}\n' for a, b in pairs))
+        ''.join(f'{renumbered[a]} {renumbered[b]}\n' for a, b in pairs))
 
     putative = layout.group_putative_matches(output, index)
     filtered = layout.group_filtered_matches(output, index)
@@ -499,21 +512,38 @@ def _solve_group(imported: Path, members: set, stem_of: Dict[int, str],
                             pairs_file=layout.group_pairs(output, index))
     openmvg.geometric_filter(scene, matches=putative, output=filtered)
     openmvg.mvg_compute_known(scene, features_dir=layout.matches_dir(output),
-                              matches=filtered, output=solved, direct=True)
+                              matches=filtered, output=solved, direct=True,
+                              residual_threshold=TIE_TRIANGULATION_PX)
     return solved
 
 
 def _subset_scene(imported: Path, members: set, out: Path,
-                  poses: Sequence[Path] = ()) -> None:
-    """``imported`` with only the views in ``members``, ids unchanged, and only
-    the intrinsics they reference -- re-registered with cereal if the one that
+                  poses: Sequence[Path] = ()) -> Dict[int, int]:
+    """``imported`` with only the views in ``members``, and only the
+    intrinsics they reference -- re-registered with cereal if the one that
     registered their type was dropped (:mod:`pgs_recon.utils.sfm_json`).
+    Returns each member's new view id, keyed by its id in ``imported``.
+
+    The views are renumbered ``0..n-1``, in their original order, with each
+    view's pose id following its view id. OpenMVG's pair-file reader refuses
+    any id not below the scene's view count, so a group with a gap in its ids
+    -- a view in the middle of the set that did not localize -- could not be
+    matched at all: on PHerc118 Cr07, three of 35 views failed, the group's
+    matching was refused, and the whole set was adjusted with no tie points.
 
     ``poses`` are one-view calibrations whose pose each member takes, matched
     by image filename; without them the scene has no extrinsics.
     """
     data = json.loads(Path(imported).read_text())
-    data['views'] = [v for v in data['views'] if v['key'] in members]
+    data['views'] = sorted((v for v in data['views'] if v['key'] in members),
+                           key=lambda v: v['key'])
+    renumbered = {}
+    for new, v in enumerate(data['views']):
+        renumbered[v['key']] = new
+        v['key'] = new
+        d = v['value']['ptr_wrapper']['data']
+        d['id_view'] = new
+        d['id_pose'] = new
     used = {v['value']['ptr_wrapper']['data']['id_intrinsic']
             for v in data['views']}
     all_intrinsics = data.get('intrinsics', [])
@@ -539,6 +569,7 @@ def _subset_scene(imported: Path, members: set, out: Path,
     data['structure'] = []
     data['control_points'] = []
     Path(out).write_text(json.dumps(data, indent=2))
+    return renumbered
 
 
 # --- Phase 3: per-view localization (Decision 2) ----------------------------

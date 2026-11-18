@@ -152,6 +152,54 @@ only intersecting. The adjustment still re-triangulates them and keeps only
 which keypoints are one point. On Cr04 that gave 8737 tracks from three views,
 none rejected.
 
+*Amended after PHerc118 Cr07 (35 views, 32 localized).* Two things cost every
+tie point there, and neither said so above a warning:
+
+- **The group scene kept the set's view ids.** OpenMVG's pair-file reader
+  refuses any id not below the scene's view count, so once three views in the
+  middle of the set failed to localize, the group's matching was refused, the
+  group was dropped, and the set was adjusted with no ties. The group scene is
+  now renumbered from 0 and its pairs translated; `adjust` matches tie views
+  by filename, so the numbers are the scene's alone.
+- **The tracks were cut at 4 px under the mesh-only poses** -- by OpenMVG's
+  default residual threshold, and again in `adjust`. Those poses carry the
+  very misregistration the ties are there to remove, and the starting K has
+  none of the distortion that displaces the frame edges, where every overlap
+  is. On Cr07 the cut kept none of 1384 tracks between the two views QA found
+  10.5 px apart, and 71% of tracks observed near the corners against 95% near
+  the centre. Both cuts are now loose (16 px, `--tie-max-px`); `adjust`
+  solves once with f and the principal point held, re-triangulates every
+  track under that solve's poses and distortion, and cuts at 4 px
+  (`--tie-final-px`) before the joint solve proper.
+
+With both fixed, Cr07's ties reached the adjustment (86414 of 86426) and
+changed nothing: pair QA went from 32 failing pairs to 40. The starting focal
+was a guess, 5080 px, with no EXIF and no specs to replace it, and the focal
+curve was flat with ties as without, so every view stayed at it. A ladder of
+*held* focals, each adjusted with the ties and graded by pair QA (the
+independent check, Decision 6), found what the cost could not:
+
+| focal (px) | pass | review | fail | median shift | p90 |
+|---|---|---|---|---|---|
+| 5080 | 26 | 21 | 47 | 3.16 | 8.34 |
+| 13000 | 51 | 31 | 12 | 0.87 | 3.24 |
+| 18000 | 66 | 23 | 5 | 0.67 | 2.44 |
+| 24000 | 57 | 35 | 2 | 0.68 | 1.92 |
+| 32000 | 44 | 47 | 3 | 1.09 | 2.51 |
+| 45000 | 39 | 49 | 6 | 1.25 | 2.79 |
+
+The adjustment's own cost moved by under 1% across 13000-45000. Pair QA has
+a minimum, between 18000 and 24000, and at it the doubling the combined
+texture showed is under a pixel for the median pair. So on a set this
+nadir, a flat cost curve does not mean the focal is unobservable -- only that
+the cost is the wrong instrument for it.
+
+That ladder needed one more change. A held focal far from the one the views
+were solved at left every pose at the wrong standoff, its tracks triangulated
+apart, and the first cut kept none of them (at 45000, 0 of 86426). `adjust` now
+moves each camera along its optical axis until its anchors' median depth scales
+with the focal, before any cut.
+
 ### 4. K is solved in the mesh-anchored adjustment, once, across all groups
 
 One shared intrinsic -- focal, principal point, k1–k3 -- adjusted together with

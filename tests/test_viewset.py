@@ -800,5 +800,74 @@ class TestPlateMesh(unittest.TestCase):
         self.assertEqual(plate.mesh, Path('/recon/centered.obj'))
 
 
+@unittest.skipIf(pipeline is None, 'pgs_recon.viewset.pipeline does not import')
+class TestGroupScene(unittest.TestCase):
+    """The scene and pair file one group's tie points are matched from."""
+
+    def solve(self, members):
+        write = TestMergeCalibrations().write
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            cals = []
+            for i in range(5):
+                path = layout.view_calibration(out, f'v{i}')
+                path.parent.mkdir(parents=True, exist_ok=True)
+                cals.append(write(path.parent, f'v{i}', 1000.0 + i))
+                cals[-1].rename(path)
+            imported = out / 'imported.json'
+            imported.write_text(json.dumps(combined.merge_calibrations(
+                [layout.view_calibration(out, f'v{i}') for i in range(5)],
+                [f'v{i}.tif' for i in range(5)], Path('/src'))))
+            stem_of = {i: f'v{i}' for i in range(5)}
+            pairs = [(a, b) for a in sorted(members) for b in sorted(members)
+                     if a < b]
+            with mock.patch.object(pipeline, 'openmvg') as mvg:
+                pipeline._solve_group(imported, set(members), stem_of, pairs,
+                                      0, out)
+            scene = json.loads(layout.group_scene(out, 0).read_text())
+            pair_ids = [tuple(map(int, line.split())) for line in
+                        layout.group_pairs(out, 0).read_text().splitlines()]
+            pairs_arg = mvg.compute_matches.call_args.kwargs['pairs_file']
+            self.assertEqual(pairs_arg, layout.group_pairs(out, 0))
+            self.residual = mvg.mvg_compute_known.call_args.kwargs.get(
+                'residual_threshold')
+        return scene, pair_ids
+
+    def test_a_gap_in_the_set_is_closed_in_the_group(self):
+        # View 2 did not localize. OpenMVG refuses a pair id that is not below
+        # the scene's view count, which on PHerc118 Cr07 cost every tie point.
+        scene, pair_ids = self.solve({0, 1, 3, 4})
+        views = [v['value']['ptr_wrapper']['data'] for v in scene['views']]
+        self.assertEqual([v['filename'] for v in views],
+                         ['v0.tif', 'v1.tif', 'v3.tif', 'v4.tif'])
+        self.assertEqual([v['key'] for v in scene['views']], [0, 1, 2, 3])
+        self.assertEqual([(v['id_view'], v['id_pose']) for v in views],
+                         [(k, k) for k in range(4)])
+        self.assertTrue(all(a < 4 and b < 4 for a, b in pair_ids))
+        # (1, 3) in the set is (1, 2) here: the same two images.
+        self.assertIn((1, 2), pair_ids)
+        self.assertEqual(len(pair_ids), 6)
+
+    def test_each_view_keeps_its_own_pose(self):
+        scene, _ = self.solve({0, 1, 3, 4})
+        centers = {e['key']: e['value']['center'][0]
+                   for e in scene['extrinsics']}
+        self.assertEqual(centers, {0: 1000.0, 1: 1001.0, 2: 1003.0,
+                                   3: 1004.0})
+
+    def test_triangulation_cut_is_loose(self):
+        # OpenMVG's own 4 px, under mesh-only poses, removed the ties between
+        # exactly the views that disagreed most; adjust cuts strictly later.
+        self.solve({0, 1, 3, 4})
+        self.assertEqual(self.residual, pipeline.TIE_TRIANGULATION_PX)
+        self.assertGreater(self.residual, 4.0)
+
+    def test_every_intrinsic_a_view_names_is_present(self):
+        scene, _ = self.solve({0, 3})
+        named = {v['value']['ptr_wrapper']['data']['id_intrinsic']
+                 for v in scene['views']}
+        self.assertEqual(named, {i['key'] for i in scene['intrinsics']})
+
+
 if __name__ == '__main__':
     unittest.main()
