@@ -1,0 +1,55 @@
+{
+  "status": "complete",
+  "project_type": "brownfield",
+  "current_section": "done",
+  "current_question": 2,
+  "completed_sections": [
+    "product",
+    "guidelines",
+    "tech_stack",
+    "workflow",
+    "styleguides"
+  ],
+  "answers": {
+    "project_name": "PGS Recon",
+    "description": "A Python pipeline that reconstructs textured 3D models from photogrammetry image sets by orchestrating OpenMVG (SfM) and OpenMVS (MVS).",
+    "problem": "Running OpenMVG/OpenMVS by hand is a long, error-prone chain of binaries and flags; there is no reproducible, resumable, recorded way to go from captures to a textured mesh.",
+    "users": "EduceLab internal researchers first (PGS scans and other capture sets, via Docker/Apptainer on workstations and the cluster), with the external cultural-heritage imaging community as secondary users.",
+    "goals": [
+      "Reproducible & resumable: every run is recorded in a manifest and can be resumed or re-planned without silently inheriting stale state.",
+      "Easy deployment: published Docker/Apptainer images run identically on workstations and the cluster."
+    ],
+    "voice": "Concise and direct: short, need-to-know statements; minimal prose.",
+    "principles": [
+      "Thin, honest wrappers",
+      "Measure, don't guess",
+      "Fail loudly"
+    ],
+    "languages": "Python (currently >=3.9, EOL; minimum to be raised) + C++17/C++20 utilities via CMake 3.17+ superbuild. No frontend, backend framework, or database.",
+    "python_min": "3.12 (target; setup.cfg still says >=3.9). Implies Ubuntu 24.04 base image and dropping 22.04.",
+    "infrastructure": "As-is (Docker on ghcr.io amd64+arm64, CPU + CUDA 12.4/12.8 on Ubuntu 22.04, built by GitHub Actions; Apptainer + SLURM; GitLab CI tests) plus planned migration to Ubuntu 24.04 for Python 3.12.",
+    "tdd": "Moderate: tests encouraged, not blocking.",
+    "commits": "Descriptive imperative subjects, no prefix format; one branch + GitLab MR per track.",
+    "review": "Required for non-trivial changes (human or /code-review); trivial fixes may merge after self-review.",
+    "checkpoints": "Manual verification only at track completion.",
+    "styleguides": [
+      "python",
+      "general",
+      "cpp"
+    ],
+    "existing_conventions": "Fresh from templates; recommend adopting ruff and clang-format as a future track."
+  },
+  "files_created": [
+    "conductor/index.md",
+    "conductor/product.md",
+    "conductor/product-guidelines.md",
+    "conductor/tech-stack.md",
+    "conductor/workflow.md",
+    "conductor/tracks.md",
+    "conductor/code_styleguides/general.md",
+    "conductor/code_styleguides/python.md",
+    "conductor/code_styleguides/cpp.md"
+  ],
+  "started_at": "2026-11-18T14:14:33Z",
+  "last_updated": "2026-11-18T14:38:23Z"
+}

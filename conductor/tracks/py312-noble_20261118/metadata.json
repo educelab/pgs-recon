@@ -1,0 +1,10 @@
+{
+  "id": "py312-noble_20261118",
+  "title": "Python 3.12 and Ubuntu 24.04; retire Apptainer definitions",
+  "type": "chore",
+  "status": "pending",
+  "created": "2026-11-18T15:20:53Z",
+  "updated": "2026-11-18T15:20:53Z",
+  "phases": { "total": 4, "completed": 0 },
+  "tasks": { "total": 17, "completed": 0 }
+}

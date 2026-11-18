@@ -1,0 +1,109 @@
+# Specification: Python 3.12 and Ubuntu 24.04; retire Apptainer definitions
+
+**Track ID:** py312-noble_20261118
+**Type:** Chore
+**Created:** 2026-11-18
+**Status:** Draft
+
+## Summary
+
+Raise the Python minimum to 3.12, move every image and CI job to Ubuntu 24.04,
+modernize the Python source to 3.12 idioms, and delete the Apptainer build
+definitions. `.sif` images are built from the published Docker images instead.
+
+## Context
+
+Python 3.9 is EOL. Ubuntu 24.04's system Python is 3.12. Images and CI run on
+22.04 today (Python 3.10). The Apptainer `.def` duplicates the Dockerfile and is
+no longer used: cluster `.sif`s are pulled from `ghcr.io/educelab/pgs-recon`.
+
+## Motivation
+
+- Stop supporting an EOL interpreter. Make one interpreter the image, CI, and
+  `python_requires` all agree on.
+- Remove a second, unmaintained image recipe.
+
+## Scope
+
+1. **Python 3.12 minimum**
+   - `setup.cfg`: `python_requires = >=3.12`.
+   - Full typing modernization across `pgs_recon/` and `tests/`: `X | None`,
+     `X | Y`, builtin generics (`list`, `dict`, `tuple`), `collections.abc` for
+     `Sequence`/`MutableMapping`. Drop the `typing` imports this makes unused.
+   - Update the 3.9/3.10 compat notes (`toolchain._argv_token` docstring,
+     `tests/test_toolchain.py`, `tests/test_openmvg.py`). Keep `_argv_token`
+     itself: it still narrows `bool`.
+2. **Ubuntu 24.04 everywhere**
+   - `Dockerfile` default `BASE_IMAGE=ubuntu:24.04`.
+   - CUDA variants: drop 12.4. Keep 12.8 on `nvidia/cuda:12.8.1-devel-ubuntu24.04`.
+   - `.github/workflows/build_docker.yml`: 24.04 bases, 24.04 runners
+     (`ubuntu-24.04`, `ubuntu-24.04-arm`), no `-cuda12.4` matrix rows. Bump
+     Node-20-era actions in the jobs touched.
+   - `.github/workflows/ci.yml`: Python matrix `3.12`, `3.13`; 24.04 runner.
+   - `.github/workflows/deps-build.yml`: 24.04 runner and package list.
+   - `.gitlab-ci.yml`: `test:unit` on `python:3.12-slim`; `test:python` on
+     `ubuntu:24.04`; `test:dependencies` matrix = `ubuntu:24.04` and
+     `nvidia/cuda:12.8.1-devel-ubuntu24.04`; pip-install check on 24.04 only.
+   - `ci/apt-ubuntu-jammy` → `ci/apt-ubuntu-noble`, with package names verified
+     for noble.
+3. **Retire Apptainer definitions**
+   - Delete `apptainer/pgs-recon.def` and `apptainer/buildargs-cuda12.{4,8}.env`.
+   - Move the SLURM scripts (`submit_recon.sh`, `submit_recon_pipeline.sh`,
+     `submit_unsubmitted.sh`) to `scripts/slurm/`. Fix references in them to the
+     `.def`/build args.
+   - README: replace "Building an Apptainer image" with building a `.sif` from
+     the published image (`apptainer build pgs-recon.sif docker://ghcr.io/educelab/pgs-recon:<tag>`).
+4. **Docs**: README, `CLAUDE.md`, `conductor/tech-stack.md` updated for 3.12,
+   24.04, the CUDA 12.8-only matrix (needs NVIDIA driver ≥ 570), and the new
+   script location.
+
+## Success Criteria
+
+- [ ] `setup.cfg` requires Python ≥ 3.12; no 3.9/3.10/3.11 remains in CI matrices.
+- [ ] No `ubuntu:22.04`, `ubuntu22.04`, `ubuntu-22.04` or `jammy` remains in
+      Dockerfile, workflows, GitLab CI, or `ci/`.
+- [ ] No `cuda12.4` image variant is built or documented.
+- [ ] `apptainer/` is gone. The SLURM scripts live in `scripts/slurm/` and
+      README documents building a `.sif` from the Docker image.
+- [ ] No `typing.Optional/Union/List/Dict/Tuple` left in `pgs_recon/` or
+      `tests/`.
+- [ ] `python3 -m unittest discover -s tests` passes on 3.12, bare and in the
+      newly built 24.04 image.
+- [ ] Docker image builds on 24.04 (CPU, and CUDA 12.8) and its utilities'
+      `--self-test`s pass.
+- [ ] GitLab pipeline green, including `test:in-image` and `test:dependencies`.
+
+## Risks
+
+- **Superbuild on 24.04:** GCC 13 and Boost 1.83 (image carries 1.74 today).
+  GitLab's CPU-only 24.04 `test:dependencies` job already builds, which lowers
+  this risk. The CUDA 12.8 + 24.04 combination is new.
+- **Noble packages:** names in the apt list may differ. The libpng/libtiff
+  both-or-neither rule still applies (`BuildOpenMVG.cmake`).
+- **CUDA driver:** 12.8 needs driver ≥ 570. The cluster is confirmed fine.
+  Document the requirement.
+- **Typing rewrite is broad:** mechanical, but touches ~15 modules. Behaviour
+  must not change. The test suite is the guard.
+
+## Dependencies
+
+None.
+
+## Out of Scope
+
+- Adopting ruff/clang-format (separate track; may use ruff's pyupgrade later).
+- Other Python 3.12 refactors beyond typing (e.g. `match`, `tomllib`).
+- Deleting already-published `-cuda12.4` tags from ghcr.io.
+- Changing what the SLURM scripts do, beyond paths and image references.
+- Historical mentions in ADRs (e.g. ADR 0003's 20.04 → 22.04 note).
+
+## Technical Notes
+
+- `HANDOFF-pipeline-registration.md` mentions `ubuntu:22.04` in a build example.
+  Update it if it's still live, otherwise leave it.
+- `stages.py:732` mentions an "Apptainer mount" as a scenario. That's still
+  valid (runtime, not build) and stays.
+
+---
+
+_Generated by Conductor. Review and edit as needed._
