@@ -51,6 +51,7 @@ class Options(NamedTuple):
     camera: Optional[Path] = None   # starting K: EXIF-derived, board, or prior run
     fix_intrinsic: bool = False     # hold K at ``camera`` (board-calibrated)
     focal_sweep: Optional[str] = None
+    divergence_px: Optional[float] = None  # adjust's gate; None: its default
     mask: Optional[Path] = None     # query pixels never to match (sample square)
     vignette_mask: bool = False     # vote a vignette mask per lens setup
     threads: Optional[int] = None
@@ -748,6 +749,10 @@ def adjust_views(stems: Sequence[str], tie_scenes: Sequence[Path],
               'options': {'path': 'options',
                           'fix_intrinsic': opts.fix_intrinsic,
                           'focal_sweep': opts.focal_sweep}}
+    if opts.divergence_px is not None:
+        # Only when given, so a run made before the option existed, resumed
+        # without it, is still current.
+        inputs['options']['divergence_px'] = opts.divergence_px
     for s in stems:
         inputs[f'calibration:{s}'] = manifest.fingerprint(
             layout.view_calibration(output, s))
@@ -788,7 +793,8 @@ def _run_adjust(stems: Sequence[str], tie_scenes: Sequence[Path],
         report=layout.joint_report(output),
         tie_scenes=list(tie_scenes),
         camera=camera, fix_intrinsic=opts.fix_intrinsic,
-        focal_sweep=opts.focal_sweep, threads=opts.threads)
+        focal_sweep=opts.focal_sweep, divergence_px=opts.divergence_px,
+        threads=opts.threads)
 
 
 # --- Phase 5: QA (Decision 6) -------------------------------------------------

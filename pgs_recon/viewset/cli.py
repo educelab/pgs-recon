@@ -87,6 +87,15 @@ def _parser() -> configargparse.ArgumentParser:
                        help='Hold K at --camera (a board-calibrated camera).')
     solve.add_argument('--focal-sweep', default=None, metavar='lo:hi:steps',
                        help='The focal cost curve\'s range, in pixels.')
+    solve.add_argument('--divergence-px', type=float, default=None,
+                       metavar='px',
+                       help='How much worse, in pixels RMS, a view\'s mesh '
+                            'anchors may reproject under the joint solve than '
+                            'under its own before its mesh-only calibration is '
+                            'emitted instead. Default: pgs-localize-joint\'s '
+                            '(1). The anchors carry the misregistration the '
+                            'tie points correct, so the joint solve fits them '
+                            'worse by design; see ADR 0013 Decision 5.')
     solve.add_argument('--mask', default=None,
                        help='Image whose zero pixels are never matched (the '
                             'sample square).')
@@ -200,6 +209,7 @@ def _main():
         camera=Path(args.camera) if args.camera else None,
         fix_intrinsic=args.fix_intrinsic,
         focal_sweep=args.focal_sweep,
+        divergence_px=args.divergence_px,
         mask=Path(args.mask) if args.mask else None,
         vignette_mask=args.vignette_mask,
         threads=args.threads,

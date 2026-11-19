@@ -295,6 +295,30 @@ Aligning independently moved pieces separately is **out of scope**. If the
 divergence check fires on more than an occasional view, the assumption is wrong
 for that plate and this ADR is reopened, not patched.
 
+*Measured on PHerc118 (Pezzo 2 and Pezzo 7), with tie points working.* The
+check fires on far more than an occasional view: 5-13 views on each of six
+crops (Cr05-Cr10, 22-32 views each), with each view's anchor RMS rising 0.2-3.3 px under
+the joint solve, smoothly, with no second cluster. What it measures is not
+the divergence between two poses but how much worse the anchors fit. The
+anchors carry the misregistration the tie points exist to correct, and fit at
+3.5 px RMS on their own, so the joint solve fits them worse whenever it does its
+job. Pair QA, which is independent of both, says the flagged views'
+joint poses are the better ones. Cr02's 25 localized views, with K held at
+f = 24000 px (`--fix-intrinsic`):
+
+| `--divergence-px` | flagged | pass / review / fail | median | p90 | worst |
+|---|---|---|---|---|---|
+| 1 (default) | 10 | 19 / 33 / 15 | 1.59 | 4.10 | 6.67 |
+| 1000 (off) | 0 | 46 / 18 / 3 | 0.58 | 2.09 | 3.85 |
+
+With K free and the check off, the grades were 43 / 22 / 2, so the gate, not the
+focal, is what left Cr02's seams misregistered. The check therefore does not detect a
+moved fragment at this threshold, and on these plates it removes the
+correction from about a third of the views. `pgs-localize-set --divergence-px`
+now reaches it, and is part of what the adjustment is current against. The
+default stays at 1 until a moved fragment has been measured, because only that
+can set the line between it and this.
+
 ### 6. QA: what is independent and what is circular
 
 Agreement with the IR940 texture is **circular** -- that texture is what the

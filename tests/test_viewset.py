@@ -534,6 +534,16 @@ class TestTools(unittest.TestCase):
             '--output-calibration', 'B.json'])
         self.assertEqual(argv[-1], '--fix-intrinsic')
 
+    def test_adjust_passes_the_divergence_gate(self):
+        argv = self.call(
+            tools.adjust, calibrations=[Path('a.json')],
+            correspondences=[Path('a.npy')],
+            output_calibrations=[Path('A.json')],
+            output_scene=Path('s.json'), output_camera=Path('k.txt'),
+            report=Path('r.json'), divergence_px=4.0)
+        i = argv.index('--divergence-px')
+        self.assertEqual(argv[i + 1], '4.0')
+
     def test_adjust_refuses_mismatched_counts(self):
         with self.assertRaisesRegex(ValueError, 'one each per view'):
             tools.adjust(calibrations=[Path('a')], correspondences=[],
@@ -867,6 +877,48 @@ class TestGroupScene(unittest.TestCase):
         named = {v['value']['ptr_wrapper']['data']['id_intrinsic']
                  for v in scene['views']}
         self.assertEqual(named, {i['key'] for i in scene['intrinsics']})
+
+
+@unittest.skipIf(pipeline is None, 'pgs_recon.viewset.pipeline does not import')
+class TestAdjustViews(unittest.TestCase):
+    """The divergence gate reaches adjust, and only a stated one is part of
+    what the adjustment is current against."""
+
+    def setUp(self):
+        self._d = tempfile.TemporaryDirectory()
+        self.output = Path(self._d.name)
+        self.camera = self.output / 'camera.txt'
+        self.camera.write_text('fx 1\n')
+        for f in (layout.view_calibration(self.output, 'a'),
+                  layout.view_correspondences(self.output, 'a')):
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text('x')
+        self.meta = {'views': {}}
+
+    def tearDown(self):
+        self._d.cleanup()
+
+    def adjust(self, **options):
+        with mock.patch.object(pipeline.tools, 'adjust') as adjust:
+            pipeline.adjust_views(['a'], [], self.camera, self.output,
+                                  pipeline.Options(**options), self.meta,
+                                  self.output / 'manifest.json')
+        return adjust
+
+    def test_a_stated_gate_reaches_adjust(self):
+        adjust = self.adjust(divergence_px=1000.0)
+        self.assertEqual(adjust.call_args.kwargs['divergence_px'], 1000.0)
+
+    def test_an_unstated_gate_leaves_adjusts_default(self):
+        adjust = self.adjust()
+        self.assertIsNone(adjust.call_args.kwargs['divergence_px'])
+        self.assertNotIn('divergence_px', self.meta['joint']['inputs']['options'])
+
+    def test_stating_a_gate_redoes_the_adjustment(self):
+        self.adjust()
+        self.assertEqual(self.adjust().call_count, 0)
+        self.assertEqual(self.adjust(divergence_px=4.0).call_count, 1)
+        self.assertEqual(self.adjust(divergence_px=4.0).call_count, 0)
 
 
 if __name__ == '__main__':
